@@ -1,9 +1,11 @@
 # 🧠 HippoMemory
 
-> 📦 **包名已更名**：`hippo-memory`（npm 已被他人占用）→ **`hippo-memory-core`**。
-> 使用 DSH 的最终用户请安装适配层 [**`dsh-hippo-memory`**](packages/dsh-hippo-memory/README.md)（含 GUI 设置卡片）。
+**受海马体机制启发的 AI Agent 长时记忆** —— 长会话不再忘事、不再幻觉。
 
-**受海马体机制启发的 AI Agent 长时记忆引擎** — 专门针对"长时间工作会话中，上下文过长导致记忆混乱、进而产生幻觉"的问题。
+[![npm](https://img.shields.io/npm/v/hippo-memory-core)](https://www.npmjs.com/package/hippo-memory-core)
+[![npm](https://img.shields.io/npm/v/dsh-hippo-memory)](https://www.npmjs.com/package/dsh-hippo-memory)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D22.5-green)](package.json)
 
 ```
 思考过程是易失的（工作记忆）
@@ -18,11 +20,26 @@
 ```
 
 零外部服务：**SQLite（Node 内置）+ 进程内向量索引 + 可选嵌入模型**。
-带单元测试与**反幻觉评测基准**（对比"纯长上下文"与"本插件"在长会话下的幻觉率）。
+带单元测试与**反幻觉评测基准**（长会话：无记忆 0/8 答对 → 有记忆 8/8 答对，编造率 25% → 0%）。
 
 ---
 
-## 快速开始
+## 📦 本仓库包含两个包
+
+| 包 | 用途 | 安装 |
+|---|---|---|
+| [**`dsh-hippo-memory`**](packages/dsh-hippo-memory/README.md) | **DSH（DeepSeek Runtime）插件** —— 工具 + 自动注入 + 纪律 + GUI 设置卡片 | **DSH 用户装这个**：`dsh plugin --profile web add dsh-hippo-memory` |
+| [**`hippo-memory-core`**](https://www.npmjs.com/package/hippo-memory-core) | 框架无关的记忆引擎（可用在任意 agent 框架） | `npm install hippo-memory-core` |
+
+> 👉 **DSH 用户请直接看 [`dsh-hippo-memory` 说明](packages/dsh-hippo-memory/README.md)（安装 / 设置 / 用法 / FAQ）**，
+> 或完整中文手册 [docs/USER-GUIDE.zh-CN.md](docs/USER-GUIDE.zh-CN.md)。
+
+---
+
+## 🔧 引擎（hippo-memory-core）快速开始
+
+> DSH 用户无需以下步骤——直接 `dsh plugin add dsh-hippo-memory` 即可。
+> 以下面向：想在自己 agent 框架里用记忆引擎的开发者。
 
 ```bash
 npm install
@@ -36,9 +53,9 @@ Node ≥ 22.5（使用内置 `node:sqlite`，无需安装 SQLite）。
 
 ---
 
-## 怎么用（5 步标准用法）
+## 怎么用（引擎 5 步标准用法）
 
-插件不绑定任何 agent 框架——它只负责"记忆库"，你在 agent 主循环的 5 个位置调用它：
+引擎不绑定任何 agent 框架——它只负责"记忆库"，你在 agent 主循环的 5 个位置调用它：
 
 ```
 用户/工具消息
@@ -217,7 +234,7 @@ npm run bench
 
 ## 诚实边界
 
-本插件**根治的是"记忆性幻觉"**（长上下文导致的事实遗忘/混淆/陈旧/编造）。它**不解决**：
+本引擎**根治的是"记忆性幻觉"**（长上下文导致的事实遗忘/混淆/陈旧/编造）。它**不解决**：
 
 - 模型参数知识本身的错误（需要工具/RAG/知识图谱）；
 - 纯解码随机性导致的胡言（需要采样控制）；
