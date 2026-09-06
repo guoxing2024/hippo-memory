@@ -27,3 +27,4 @@ Open, living plan — ordered by expected user impact. PRs welcome on any item.
 - [x] 0.1.1 — npm keywords/repository discoverability; public GitHub repo
 - [x] 0.1.2 — explainable `memory_verify` (`closest`), `memory_maintain list`, optional local embedding model (setting `embedding: auto`, lazy bge-small-zh-v1.5), configurable recall threshold, adapter test suite (28 total), GitHub CI, EN README, ROADMAP + issue templates
 - [x] 0.1.3 — adapter declares `@xenova/transformers` optionalDep so `embedding: auto` resolves after npm install
+- [x] 0.1.3/0.1.4 — engine `ensureEmbeddingMigration()` (hash→model one-shot re-embed, persisted marker); fix transformers.js batch tensor parsing; model download/status visibility (`memory_maintain status`); 31 tests

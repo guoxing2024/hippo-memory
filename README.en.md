@@ -32,9 +32,10 @@ Agents get 4 tools: `memory_remember`, `memory_recall`, `memory_verify`, `memory
 - **Local-first**: SQLite via `node:sqlite`, per-session stores under `~/.dsh/storages/hippo-memory/`. No cloud, no network, no external services.
 - **Conflict versioning**: correcting a stored fact archives the old revision (`history`), never silently overwrites.
 - **Source monitoring**: `memory_verify` returns SUBSTANTIATED / CONTRADICTED / UNSUBSTANTIATED — with the nearest candidate (`closest`) when it can't substantiate, so "why not" is answerable.
-- **Optional real embeddings** (settings → embedding: auto): lazy-loads `Xenova/bge-small-zh-v1.5` (~100MB, cached under the store dir) for strong CJK/paraphrase recall; falls back to the built-in hashing embedder on any failure.
+- **Optional real embeddings** (settings → embedding: auto): lazy-loads `Xenova/bge-small-zh-v1.5` (~24MB quantized, cached under the store dir) for strong CJK/paraphrase recall; falls back to the built-in hashing embedder on any failure.
 - **Adaptive forgetting & consolidation**: `consolidate` abstracts repeated episodes into semantic rules; `forget` decays weak traces with a dry-run preview.
 - **GUI card**: enable/disable live, context limit, shared store, embedding mode, recall threshold.
+- **One-shot migration**: enabling auto re-embeds legacy hash rows with the model automatically (persisted marker, runs once); `memory_maintain status` reports model state.
 
 ## Engine quick start
 
