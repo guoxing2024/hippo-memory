@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.3] — 2026-09-07
+
+### Changed
+- 声明 `@xenova/transformers` 为 optionalDependency（保证 `embedding: auto` 在 npm 安装后可用；不可用时优雅回退哈希）
+
 ## [0.1.2] — 2026-09-07
 
 ### Added
