@@ -1,0 +1,58 @@
+{
+  "name": "hippo-memory-core",
+  "version": "0.1.0",
+  "description": "Hippocampus-inspired long-term memory engine for LLM agents: sparse encoding with pattern separation, cue-driven retrieval, source monitoring, conflict versioning, consolidation, and adaptive forgetting. Zero external services (SQLite + local vector index).",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./memory": {
+      "types": "./dist/memory.d.ts",
+      "import": "./dist/memory.js"
+    },
+    "./schema": {
+      "types": "./dist/schema.d.ts",
+      "import": "./dist/schema.js"
+    },
+    "./vectors": {
+      "types": "./dist/vectors.d.ts",
+      "import": "./dist/vectors.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "pretest": "tsc -p tsconfig.json",
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "bench": "npm run build && node bench/anti-hallucination-bench.mjs"
+  },
+  "keywords": [
+    "memory",
+    "agent",
+    "llm",
+    "hippocampus",
+    "rag",
+    "context-window",
+    "hallucination"
+  ],
+  "license": "MIT",
+  "dependencies": {},
+  "optionalDependencies": {
+    "@xenova/transformers": "^2.17.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}

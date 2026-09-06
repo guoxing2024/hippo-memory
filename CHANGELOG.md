@@ -1,0 +1,23 @@
+# Changelog
+
+## [0.1.0] — 2026-09-07
+
+首个发布版本（曾用名 `hippo-memory`，该名已被占用，改用 `hippo-memory-core`）。
+
+### Added
+- 受海马体机制启发的长时记忆引擎（框架无关）：
+  - 稀疏编码 + 模式分离（DG/CA3 类比），线索驱动召回
+  - 写入冲突处理：同主体新值 → 版本化覆盖（旧值进 `history`），1h 同事件窗口合并
+  - 源监控（`sourceMonitor`）：SUBSTANTIATED / CONTRADICTED / UNSUBSTANTIATED 三态裁决 + 否定句启发
+  - 系统巩固（`consolidate`）：高频 episode → semantic 规则
+  - 自适应遗忘（`forget`）：弱痕迹衰减，dry-run 预览
+  - 零外部服务：Node 内置 `node:sqlite` + 进程内 512 维 FNV 哈希嵌入（可选接真嵌入模型 `setEmbedder`）
+- 反幻觉评测基准（`npm run bench`）：长会话对比 无记忆 0/8 vs 有记忆 8/8 正确
+- 单元测试 19 项（node:test）
+
+### Fixed
+- 相似度阈值 0.4 → 0.32：离线哈希嵌入对短语/中文查询的绝对余弦偏低，0.4 会误杀真实命中（实测同主题中文查询 0.39 被拦）
+
+### Notes
+- 引擎不绑定任何 agent 框架；DSH 用户请安装 `dsh-hippo-memory`（适配层）
+- Node ≥ 22.5（需要内置 `node:sqlite` / `node:zlib` zstd）

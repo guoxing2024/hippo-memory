@@ -1,0 +1,12 @@
+# dsh-hippo-memory bundle patch — registers the memory plugin row into the
+# profile roster. Applied as a profile bundle layer over dsh-base; activate with:
+#
+#   dsh plugin --profile web add link:../hippo-memory/packages/dsh-hippo-memory
+#   (or the absolute path to this package directory)
+#
+# The row is a bare plugin by package name: the node half (exports ".") runs
+# in the host process and registers the memory tools + guidance + dynamic
+# context on the system prompt. No browser half.
+- insert:
+    - id: hippo-memory
+      name: 'dsh-hippo-memory'
