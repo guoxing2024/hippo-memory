@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.5] — 2026-09-07
+
+### Changed
+- 文档同步（README 迁移 API 说明）；CHANGELOG 纳入 npm 包 files
+
 ## [0.1.3] — 2026-09-07
 
 ### Added
