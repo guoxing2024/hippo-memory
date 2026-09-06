@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.2] — 2026-09-07
+
+### Added
+- 设置项 **嵌入模型**（`embedding: off|auto`）：auto = 懒加载本地 bge-small-zh-v1.5，加载失败自动回退哈希
+- 设置项 **召回阈值**（`similarityThreshold` 0.05–0.95，留空用引擎默认）
+- `memory_verify` 返回 `closest`（未命中时给出最接近候选，可解释）
+- `memory_maintain` 新增 `list` action（最新优先的库存浏览）
+- GUI 卡片新增"嵌入模型"下拉与"召回阈值"输入（中英双语）
+- 适配器测试套件（9 项，fake ctx 单测工具注册/schema/语义/隔离）
+
+### Fixed
+- settings 使用 schemastery 方言（`z.union` / `.required(false)`）
+
 ## [0.1.1] — 2026-09-07
 
 ### Changed

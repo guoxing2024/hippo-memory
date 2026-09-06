@@ -1,6 +1,6 @@
 {
   "name": "dsh-hippo-memory",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSH profile bundle: hippocampus-inspired long-term memory for DeepSeek runtime agents (tools + dynamic context + guidance + GUI settings card).",
   "type": "module",
   "main": "lib/index.js",
@@ -19,6 +19,9 @@
     "README.md",
     "CHANGELOG.md"
   ],
+  "scripts": {
+    "test": "node --test \"test/**/*.test.mjs\""
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

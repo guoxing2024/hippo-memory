@@ -33,6 +33,7 @@
 
 > 👉 **DSH 用户请直接看 [`dsh-hippo-memory` 说明](packages/dsh-hippo-memory/README.md)（安装 / 设置 / 用法 / FAQ）**，
 > 或完整中文手册 [docs/USER-GUIDE.zh-CN.md](docs/USER-GUIDE.zh-CN.md)。
+> **English speakers:** see [README.en.md](README.en.md).
 
 ---
 

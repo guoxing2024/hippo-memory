@@ -49,7 +49,11 @@ const SETTINGS_NS = 'hippo-memory';
 const SettingsSchema = z.object({
   enabled: z.boolean().default(true),
   contextLimit: z.number().min(1).max(20).default(6),
-  sharedStore: z.boolean().default(false)
+  sharedStore: z.boolean().default(false),
+  /** 'auto' = lazily load a local embedding model for stronger recall (CJK/paraphrase); 'off' = built-in hashing embedder. */
+  embedding: z.union(['off', 'auto']).default('off'),
+  /** recall similarity floor; lower = more lenient recall, higher = stricter. Leave unset for engine default (0.32). */
+  similarityThreshold: z.number().min(0.05).max(0.95).required(false)
 });
 /** Plugin Config (patch-row layer) — same shape; installed as section base. */
 const Config = SettingsSchema;
@@ -126,7 +130,9 @@ function apply(ctx, config = {}) {
   const entry = {
     enabled: config.enabled !== false,
     contextLimit: config.contextLimit ?? 6,
-    sharedStore: config.sharedStore === true
+    sharedStore: config.sharedStore === true,
+    embedding: config.embedding ?? 'off',
+    similarityThreshold: config.similarityThreshold ?? undefined
   };
 
   // Register the settings namespace when the settings service is present so the
@@ -143,6 +149,15 @@ function apply(ctx, config = {}) {
     sectionScope.watch(() => {
       const next = sectionScope.get();
       setEnabled(next.enabled);
+      // embedding / threshold changes require rebuilt engine instances
+      // (engine options are fixed at construction; DB files persist).
+      const sig = `${next.embedding}:${next.similarityThreshold ?? 'def'}`;
+      if (sig !== lastSig) {
+        lastSig = sig;
+        for (const key of [...stores.keys()]) stores.delete(key);
+        digestCache.clear();
+        void applyStoreSettings();
+      }
     });
   }
 
@@ -152,6 +167,57 @@ function apply(ctx, config = {}) {
   const REFRESH_MS = 1500;
   let enabled = entry.enabled;
   let disposers = [];
+  let lastSig = `${entry.embedding}:${entry.similarityThreshold ?? 'def'}`;
+
+  /** Embedding provider state: 'off' | 'loading' | 'ready' | 'failed' (+ cached provider). */
+  let embedState = 'off';
+  let embedProvider = null;
+  let embedWarned = false;
+
+  const embedderOptions = () => {
+    const opts = {};
+    const cfg = current();
+    if (typeof cfg.similarityThreshold === 'number') opts.similarityThreshold = cfg.similarityThreshold;
+    return opts;
+  };
+
+  /** Load the local embedding model once (lazy). Never throws: any failure
+   *  degrades to the built-in hashing embedder with one log line. */
+  const ensureEmbedder = async () => {
+    if (embedState === 'ready' || embedState === 'loading') return embedProvider;
+    const cfg = current();
+    if (cfg.embedding !== 'auto') {
+      embedState = 'off';
+      return null;
+    }
+    embedState = 'loading';
+    try {
+      const mod = await import('@xenova/transformers');
+      const { env, pipeline } = mod;
+      try {
+        env.cacheDir = join(dshHome(), 'storages', 'hippo-memory', 'models');
+        env.allowLocalModels = false;
+      } catch { /* env fields are best-effort */ }
+      const extractor = await pipeline('feature-extraction', 'Xenova/bge-small-zh-v1.5');
+      embedProvider = {
+        dim: 512,
+        embed: async (texts) => {
+          const out = await extractor(texts, { pooling: 'mean', normalize: true });
+          return Array.isArray(out) ? out.map((t) => Array.from(t.data)) : Array.from(out.data);
+        }
+      };
+      embedState = 'ready';
+      ctx.logger?.info?.('hippo-memory: local embedding model ready (bge-small-zh-v1.5)');
+    } catch (err) {
+      embedState = 'failed';
+      embedProvider = null;
+      if (!embedWarned) {
+        embedWarned = true;
+        ctx.logger?.warn?.(`hippo-memory: embedding model unavailable (${err?.message ?? err}); falling back to hashing embedder`);
+      }
+    }
+    return embedProvider;
+  };
 
   const storeFor = (id) => {
     const key = sanitize(id || 'shared');
@@ -160,11 +226,25 @@ function apply(ctx, config = {}) {
       const cfg = current();
       const dbDir = join(dshHome(), 'storages', 'hippo-memory');
       mkdirSync(dbDir, { recursive: true });
-      const inst = new HippoMemory({ dbPath: join(dbDir, `${cfg.sharedStore ? 'shared' : key}.db`) });
+      const inst = new HippoMemory({
+        dbPath: join(dbDir, `${cfg.sharedStore ? 'shared' : key}.db`),
+        options: embedderOptions()
+      });
       stores.set(key, { inst });
+      if (embedState === 'ready' && embedProvider) inst.setEmbedder(embedProvider);
       return inst;
     }
     return got.inst;
+  };
+
+  /** Apply embedding/阈值 settings to every live store: attach the model when
+   *  ready and available; reset the cache so digest picks the new threshold. */
+  const applyStoreSettings = async () => {
+    await ensureEmbedder();
+    for (const { inst } of stores.values()) {
+      if (embedProvider) inst.setEmbedder(embedProvider);
+    }
+    digestCache.clear();
   };
 
   const latestUserCue = (session) => {
@@ -313,6 +393,7 @@ function apply(ctx, config = {}) {
           contradicted: v.contradicted,
           support: v.support ?? null,
           contradiction: v.contradiction ?? null,
+          closest: v.closest ?? null,
           note: v.note
         });
       },
@@ -321,11 +402,12 @@ function apply(ctx, config = {}) {
 
     reg(defineTool({
       name: 'memory_maintain',
-      description: 'Long-term memory housekeeping. consolidate: abstract well-established episodes into durable semantic rules. forget: decay / soft-delete weak traces (preview with dry_run). stats: store summary. history: show revision history of one memory id.',
+      description: 'Long-term memory housekeeping. consolidate: abstract well-established episodes into durable semantic rules. forget: decay / soft-delete weak traces (preview with dry_run). stats: store summary. list: newest-first inventory of active memories. history: show revision history of one memory id.',
       parameters: {
-        action: { type: 'string', required: true, enum: ['consolidate', 'forget', 'stats', 'history'], description: 'Which maintenance action to run.' },
+        action: { type: 'string', required: true, enum: ['consolidate', 'forget', 'stats', 'list', 'history'], description: 'Which maintenance action to run.' },
         id: { type: 'string', description: 'Memory id (history action).' },
-        dry_run: { type: 'boolean', description: 'forget: preview without mutating (default true).' }
+        dry_run: { type: 'boolean', description: 'forget: preview without mutating (default true).' },
+        limit: { type: 'number', description: 'list: max entries (default 50).' }
       },
       output: outputOf(),
       async execute(args, exec) {
@@ -339,6 +421,22 @@ function apply(ctx, config = {}) {
           return cleanJson({ wouldForget: res.forgotten.length, decayed: res.decayed.length });
         }
         if (args.action === 'stats') return cleanJson(store.stats());
+        if (args.action === 'list') {
+          const items = store.list(Math.min(args.limit ?? 50, 500));
+          return cleanJson({
+            count: items.length,
+            memories: items.map((m) => ({
+              id: m.id,
+              version: m.version,
+              kind: m.kind,
+              summary: m.summary,
+              source: m.source,
+              confidence: m.confidence,
+              updatedAt: m.updatedAt ?? m.occurredAt ?? null,
+              consolidated: !!m.consolidated
+            }))
+          });
+        }
         if (args.action === 'history') {
           if (!args.id) return { error: 'history requires an id' };
           return cleanJson({ history: store.history(args.id) });
@@ -377,7 +475,12 @@ function apply(ctx, config = {}) {
     if (enabled && disposers.length === 0) installRuntime();
   };
 
-  if (enabled) installRuntime();
+  if (enabled) {
+    installRuntime();
+    // Warm up the embedding model in the background when enabled (auto) so the
+    // first recall after a settings save is not the slow one.
+    if (current().embedding === 'auto') void applyStoreSettings();
+  }
 
   // dispose on unload
   ctx.effect?.(

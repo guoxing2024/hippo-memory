@@ -1,6 +1,6 @@
 {
   "name": "hippo-memory-core",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Hippocampus-inspired long-term memory engine for LLM agents: sparse encoding with pattern separation, cue-driven retrieval, source monitoring, conflict versioning, consolidation, and adaptive forgetting. Zero external services (SQLite + local vector index).",
   "type": "module",
   "main": "dist/index.js",
@@ -34,7 +34,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "pretest": "tsc -p tsconfig.json",
-    "test": "node --test \"test/**/*.test.mjs\"",
+    "test": "node --test \"test/**/*.test.mjs\" \"packages/dsh-hippo-memory/test/**/*.test.mjs\"",
     "bench": "npm run build && node bench/anti-hallucination-bench.mjs"
   },
   "keywords": [

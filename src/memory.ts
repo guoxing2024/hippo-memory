@@ -569,13 +569,15 @@ export class HippoMemory {
     contradicted: boolean;
     support?: { id: string; summary: string; source?: string; confidence: string; version: number; score: number };
     contradiction?: { id: string; summary: string; source?: string; confidence: string; version: number; score: number };
+    /** Nearest stored trace when the claim is unsubstantiated (null when store is empty). */
+    closest?: { id: string; summary: string; source?: string; confidence: string; version: number; score: number } | null;
     note: string;
   }> {
     const cueVec = await this.embedOne(claim);
     const claimNegated = NEGATION_RE.test(claim);
     const rows = this.db.allActive();
     let best: { id: string; summary: string; source?: string; confidence: string; version: number; score: number } | undefined;
-    let bestSim = 0;
+    let bestSim = -1;
 
     for (const r of rows) {
       const b = vecFromBlob(r.vec);
@@ -591,6 +593,7 @@ export class HippoMemory {
       return {
         substantiated: false,
         contradicted: false,
+        closest: best ?? null,
         note: `UNSUBSTANTIATED: no stored trace matches this claim (best similarity ${bestSim.toFixed(2)} < ${this.options.similarityThreshold}). Do NOT assert it from memory; answer "I don't know / not in my memory".`
       };
     }
@@ -672,6 +675,15 @@ export class HippoMemory {
       procedures: count('procedure'),
       historyRows: rows.reduce((s, r) => s + r.version - 1, 0)
     };
+  }
+
+  /** Newest-first inventory of active memories (introspection / GUI browsing). */
+  list(limit = 50): StoredMemory[] {
+    return this.db
+      .allActive()
+      .sort((a, b) => (b.updated_at ?? '').localeCompare(a.updated_at ?? ''))
+      .slice(0, Math.max(1, Math.min(500, limit)))
+      .map((r) => rowToMemory(r, false));
   }
 
   get(id: string): StoredMemory | undefined {

@@ -47,6 +47,11 @@ window.__ModuleLoader__.load({
       contextLimitHint: 'Maximum digest items auto-injected into the prompt per assembly (1–20).',
       sharedStoreLabel: 'Shared store',
       sharedStoreHint: 'Use one store shared by all sessions instead of one store per session.',
+      embeddingLabel: 'Embedding model',
+      embeddingHint: 'auto = local model for much stronger recall (CJK / paraphrase); first use downloads ~100MB to ~/.dsh/storages/hippo-memory/models. off = built-in fast hashing.',
+      thresholdLabel: 'Recall threshold',
+      thresholdHint: 'Similarity floor 0.05–0.95 for recall/verify. Leave empty for engine default (0.32). Lower = more recall, higher = stricter.',
+      invalidThreshold: 'enter a number 0.05–0.95',
       overridden: 'overridden',
       reset: 'reset',
       invalidNumber: 'enter a whole number 1–20',
@@ -67,6 +72,11 @@ window.__ModuleLoader__.load({
       contextLimitHint: '每轮装配时自动注入提示词的记忆摘要最大条数（1–20）。',
       sharedStoreLabel: '共享存储',
       sharedStoreHint: '所有会话共享同一个记忆库，而不是每个会话独立一个库。',
+      embeddingLabel: '嵌入模型',
+      embeddingHint: 'auto = 加载本地模型，召回显著增强（中文/同义表达）；首次使用下载约 100MB 到 ~/.dsh/storages/hippo-memory/models。off = 内置快速哈希。',
+      thresholdLabel: '召回阈值',
+      thresholdHint: '召回/验证的相似度下限 0.05–0.95。留空用引擎默认（0.32）。调低=更容易召回，调高=更严格。',
+      invalidThreshold: '请输入 0.05–0.95 的数字',
       overridden: '已覆盖',
       reset: '重置',
       invalidNumber: '请输入 1–20 的整数',
@@ -121,6 +131,14 @@ window.__ModuleLoader__.load({
           sharedStore: {
             text: String(value.sharedStore ?? false),
             overridden: Object.prototype.hasOwnProperty.call(value, 'sharedStore')
+          },
+          embedding: {
+            text: String(value.embedding ?? 'off'),
+            overridden: Object.prototype.hasOwnProperty.call(value, 'embedding')
+          },
+          similarityThreshold: {
+            text: value.similarityThreshold === undefined ? '' : String(value.similarityThreshold),
+            overridden: Object.prototype.hasOwnProperty.call(value, 'similarityThreshold')
           }
         };
         for (const [field, entry] of Object.entries(draft)) {
@@ -144,9 +162,16 @@ window.__ModuleLoader__.load({
 
       const validDraft = () => {
         const d = draft.contextLimit;
-        if (!d || d.clear || d.text === undefined) return true;
-        const n = Number(d.text);
-        return Number.isInteger(n) && n >= 1 && n <= 20;
+        if (d && !d.clear && d.text !== undefined) {
+          const n = Number(d.text);
+          if (!Number.isInteger(n) || n < 1 || n > 20) return false;
+        }
+        const th = draft.similarityThreshold;
+        if (th && !th.clear && th.text !== undefined && th.text.trim() !== '') {
+          const n = Number(th.text);
+          if (!(n >= 0.05 && n <= 0.95)) return false;
+        }
+        return true;
       };
 
       const store = {
@@ -177,8 +202,13 @@ window.__ModuleLoader__.load({
           for (const [field, entry] of Object.entries(draft)) {
             if (entry.clear) ops.push({ op: 'unset', path: [field] });
             else {
-              const raw = field === 'contextLimit' ? Number(entry.text) : entry.text === 'true';
-              ops.push({ op: 'set', path: [field], value: raw });
+              let raw;
+              if (field === 'contextLimit') raw = Number(entry.text);
+              else if (field === 'embedding') raw = entry.text;
+              else if (field === 'similarityThreshold') raw = entry.text.trim() === '' ? undefined : Number(entry.text);
+              else raw = entry.text === 'true';
+              if (raw === undefined) ops.push({ op: 'unset', path: [field] });
+              else ops.push({ op: 'set', path: [field], value: raw });
             }
           }
           if (ops.length === 0) return;
@@ -361,6 +391,52 @@ window.__ModuleLoader__.load({
                 ]
               }),
               fieldRow(t, 'sharedStore', t('sharedStoreLabel'), t('sharedStoreHint'), state.sharedStore !== undefined ? state.sharedStore.text === 'true' : false, !disabled && !state.saving, (checked) => props.toggle('sharedStore', checked)),
+              jsx('div', {
+                className: 'hm-field',
+                children: [
+                  jsx('div', {
+                    className: 'hm-row',
+                    children: [
+                      jsx('label', { className: 'hm-label', htmlFor: 'hm-embedding', children: t('embeddingLabel') }),
+                      jsx('select', {
+                        id: 'hm-embedding',
+                        className: 'hm-input',
+                        style: { width: 'auto' },
+                        disabled,
+                        value: state.embedding ? state.embedding.text : 'off',
+                        onChange: (e) => props.edit('embedding', e.target.value),
+                        children: [
+                          jsx('option', { value: 'off', children: 'off' }),
+                          jsx('option', { value: 'auto', children: 'auto' })
+                        ]
+                      })
+                    ]
+                  }),
+                  jsx('p', { className: 'hm-hint', children: t('embeddingHint') })
+                ]
+              }),
+              jsx('div', {
+                className: 'hm-field',
+                children: [
+                  jsx('div', {
+                    className: 'hm-row',
+                    children: [
+                      jsx('label', { className: 'hm-label', htmlFor: 'hm-threshold', children: t('thresholdLabel') }),
+                      jsx('input', {
+                        id: 'hm-threshold',
+                        className: 'hm-input' + ((state.thresholdInvalid || invalidDraft) ? ' hm-inputInvalid' : ''),
+                        type: 'text',
+                        inputMode: 'decimal',
+                        disabled,
+                        value: state.similarityThreshold ? state.similarityThreshold.text : '',
+                        placeholder: '0.32',
+                        onChange: (e) => props.edit('similarityThreshold', e.target.value)
+                      })
+                    ]
+                  }),
+                  jsx('p', { className: 'hm-hint', children: t('thresholdHint') })
+                ]
+              }),
               state.failed ? jsx('p', { className: 'hm-error', children: t('failed') }) : null,
               jsx('div', {
                 className: 'hm-footer',

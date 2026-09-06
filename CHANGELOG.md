@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.2] — 2026-09-07
+
+### Added
+- `sourceMonitor` 未命中时返回 `closest`（最接近的候选），verify 结果可解释
+- 引擎新增 `list(limit)` 库存 API（最新优先），adapter `memory_maintain` 增加 `list` action
+- 适配器测试套件（`packages/dsh-hippo-memory/test`，9 项）：工具注册、schema 形状、写→查→验证语义、共享/隔离存储
+- GitHub CI（build + 28 tests + bench smoke + 语法检查）、英文 README、ROADMAP、issue 模板
+
+### Changed
+- 根 `npm test` 现在同时跑引擎与适配器测试（28 项）
+
 ## [0.1.1] — 2026-09-07
 
 ### Changed
