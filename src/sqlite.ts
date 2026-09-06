@@ -116,6 +116,19 @@ export class SqliteStore {
     this.db.exec(SCHEMA);
   }
 
+  /* ------------------------- migration markers ------------------------- */
+
+  /** Read the store's migration marker (SQLite PRAGMA user_version). */
+  marker(): number {
+    const r = this.db.prepare('PRAGMA user_version').get() as { user_version: number };
+    return Number(r?.user_version ?? 0);
+  }
+
+  /** Set the store's migration marker. */
+  setMarker(v: number): void {
+    this.db.exec(`PRAGMA user_version = ${Math.trunc(v)};`);
+  }
+
   /* ------------------------- generic helpers ------------------------- */
 
   close(): void {

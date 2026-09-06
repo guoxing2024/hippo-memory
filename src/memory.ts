@@ -93,6 +93,60 @@ export class HippoMemory {
     this.embedder = e;
   }
 
+  /**
+   * One-shot migration to the attached embedder. Uses a persisted marker
+   * (PRAGMA user_version) so it runs at most once per store: re-embeds every
+   * active row with the current embedder and records the migration.
+   * @returns number of rows re-embedded (0 = nothing to do / already done).
+   */
+  async ensureEmbeddingMigration(): Promise<number> {
+    if (!this.embedder) return 0;
+    if (this.db.marker() >= 1) return 0;
+    const rows = this.db.allActive();
+    if (rows.length === 0) {
+      this.db.setMarker(1);
+      return 0;
+    }
+    const texts = rows.map((r) => {
+      const entities = JSON.parse(r.entities_json || '[]') as string[];
+      return [r.summary, r.detail ?? '', r.episode_place ?? '', r.rule ?? '', ...entities].join('\n');
+    });
+    const vecs = await this.embedder.embed(texts);
+    const now = nowIso();
+    let n = 0;
+    for (let i = 0; i < rows.length; i++) {
+      const v = vecs[i];
+      const row = rows[i];
+      if (!v || v.length === 0 || !row) continue;
+      this.db.update({
+        id: row.id,
+        version: row.version,
+        kind: row.kind,
+        summary: row.summary,
+        detail: row.detail,
+        episode_time: row.episode_time,
+        episode_place: row.episode_place,
+        participants_json: row.participants_json,
+        rule: row.rule,
+        entities_json: row.entities_json,
+        tags_json: row.tags_json,
+        occurred_at: row.occurred_at,
+        source: row.source,
+        confidence: row.confidence,
+        importance: row.importance,
+        access_count: row.access_count,
+        last_access_at: row.last_access_at,
+        created_at: row.created_at,
+        updated_at: now,
+        superseded: row.superseded,
+        vec: vecToBlob(v)
+      });
+      n++;
+    }
+    this.db.setMarker(1);
+    return n;
+  }
+
   get embedDim(): number {
     return this.embedder?.dim ?? 512;
   }

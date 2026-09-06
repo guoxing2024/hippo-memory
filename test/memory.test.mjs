@@ -215,3 +215,58 @@ test('stats and close are sane', () => {
   assert.ok(Number.isInteger(s.episodes));
   assert.ok(s.historyRows >= 1, 'versioned updates should leave archived history');
 });
+
+/* -------------------- embedding migration (reembed) -------------------- */
+
+test('ensureEmbeddingMigration re-embeds legacy rows exactly once (persisted marker)', async () => {
+  const dir2 = mkdtempSync(join(tmpdir(), 'hippo-migrate-'));
+  const m = new HippoMemory({ dbPath: join(dir2, 'm.db') });
+
+  // Write with the default (hash) embedder → legacy vectors.
+  await m.remember({ kind: 'semantic', summary: 'migration test target -> value A', source: 'user' });
+  await m.remember({ kind: 'semantic', summary: 'another migration row -> value B', source: 'user' });
+  assert.equal(m.stats().active, 2);
+
+  // Attach a fake 4-d embedder and migrate.
+  let embedCalls = 0;
+  const fake = {
+    dim: 4,
+    embed: async (texts) => {
+      embedCalls += 1;
+      return texts.map((t) => Array.from({ length: 4 }, (_, i) => (t.length + i) / 10));
+    }
+  };
+  m.setEmbedder(fake);
+  const n1 = await m.ensureEmbeddingMigration();
+  assert.equal(n1, 2, 'both legacy rows re-embedded on first call');
+
+  // Second call: marker already set → no-op.
+  const n2 = await m.ensureEmbeddingMigration();
+  assert.equal(n2, 0, 'idempotent via persisted marker');
+
+  // New instance on same db: marker persists → still no-op.
+  const m2 = new HippoMemory({ dbPath: join(dir2, 'm.db') });
+  m2.setEmbedder(fake);
+  const n3 = await m2.ensureEmbeddingMigration();
+  assert.equal(n3, 0, 'marker survives reopen');
+
+  // Rows written after migration carry the model vectors (dim 4 matches).
+  await m2.remember({ kind: 'semantic', summary: 'post migration write -> C', source: 'user' });
+  const r = await m2.recall({ query: 'post migration write -> C' }, 3);
+  assert.ok(r.hits.length >= 1, 'new model-embedded row recallable');
+
+  m.close();
+  m2.close();
+  rmSync(dir2, { recursive: true, force: true });
+});
+
+test('empty store migration marks done without embedding', async () => {
+  const dir2 = mkdtempSync(join(tmpdir(), 'hippo-migrate-empty-'));
+  const m = new HippoMemory({ dbPath: join(dir2, 'e.db') });
+  const fake = { dim: 4, embed: async () => { throw new Error('must not be called'); } };
+  m.setEmbedder(fake);
+  const n = await m.ensureEmbeddingMigration();
+  assert.equal(n, 0);
+  m.close();
+  rmSync(dir2, { recursive: true, force: true });
+});

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.4] — 2026-09-07
+
+### Fixed
+- **嵌入向量维度解析 bug**：transformers.js 返回单一 Tensor（`dims=[batch,512]`），旧实现把整块 buffer 当一条向量（多文本批量时误判为高维、迁移错乱）；现按 batch 正确切分，维度从 probe 动态探测
+- 嵌入模型迁移接入 `ensureEmbeddingMigration()`（引擎 0.1.3）：开启 auto 后旧哈希记忆一次性自动重嵌入（持久标记，仅一次）；storeFor 新建实例同样触发
+
+### Added
+- 模型加载可见性：开始下载/成功（含维度与耗时）/失败均有明确日志；加载中 digest 块附带状态提示；`memory_maintain status` 返回 embedder 状态
+- 适配器测试 +1（status），共 10 项
+
 ## [0.1.3] — 2026-09-07
 
 ### Changed

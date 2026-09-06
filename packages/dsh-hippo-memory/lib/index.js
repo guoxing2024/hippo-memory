@@ -191,6 +191,7 @@ function apply(ctx, config = {}) {
       return null;
     }
     embedState = 'loading';
+    const startedAt = Date.now();
     try {
       const mod = await import('@xenova/transformers');
       const { env, pipeline } = mod;
@@ -198,16 +199,33 @@ function apply(ctx, config = {}) {
         env.cacheDir = join(dshHome(), 'storages', 'hippo-memory', 'models');
         env.allowLocalModels = false;
       } catch { /* env fields are best-effort */ }
+      ctx.logger?.info?.('hippo-memory: embedding model requested (auto). First use downloads ~24MB quantized model to storages/hippo-memory/models — this can take a minute depending on your network.');
       const extractor = await pipeline('feature-extraction', 'Xenova/bge-small-zh-v1.5');
+      // transformers.js returns one Tensor: dims = [batch, hidden]. Split the
+      // flat data by batch — never treat the whole buffer as one vector.
+      const splitRows = (out) => {
+        const data = out?.data;
+        const batch = out?.dims?.[0] ?? 1;
+        if (!data) return [];
+        const rowLen = data.length / batch;
+        const rows = [];
+        for (let i = 0; i < batch; i++) {
+          rows.push(Array.from(data.subarray ? data.subarray(i * rowLen, (i + 1) * rowLen) : data.slice(i * rowLen, (i + 1) * rowLen)));
+        }
+        return rows;
+      };
+      const probe = await extractor(['probe'], { pooling: 'mean', normalize: true });
+      const probeRows = splitRows(probe);
+      const dim = probeRows[0]?.length ?? 512;
       embedProvider = {
-        dim: 512,
+        dim,
         embed: async (texts) => {
           const out = await extractor(texts, { pooling: 'mean', normalize: true });
-          return Array.isArray(out) ? out.map((t) => Array.from(t.data)) : Array.from(out.data);
+          return splitRows(out);
         }
       };
       embedState = 'ready';
-      ctx.logger?.info?.('hippo-memory: local embedding model ready (bge-small-zh-v1.5)');
+      ctx.logger?.info?.(`hippo-memory: local embedding model ready (bge-small-zh-v1.5, ${dim}-d, ${((Date.now() - startedAt) / 1000).toFixed(1)}s)`);
     } catch (err) {
       embedState = 'failed';
       embedProvider = null;
@@ -231,18 +249,34 @@ function apply(ctx, config = {}) {
         options: embedderOptions()
       });
       stores.set(key, { inst });
-      if (embedState === 'ready' && embedProvider) inst.setEmbedder(embedProvider);
+      if (embedState === 'ready' && embedProvider) {
+        inst.setEmbedder(embedProvider);
+        // One-shot migration for stores first opened after the model loaded.
+        void inst.ensureEmbeddingMigration().then((n) => {
+          if (n > 0) ctx.logger?.info?.(`hippo-memory: re-embedded ${n} legacy row(s) in store ${key}`);
+        }).catch(() => {});
+      }
       return inst;
     }
     return got.inst;
   };
 
   /** Apply embedding/阈值 settings to every live store: attach the model when
-   *  ready and available; reset the cache so digest picks the new threshold. */
+   *  ready and available; one-shot re-embed of legacy hash rows (persisted
+   *  marker ensures it runs once); reset the cache so digest picks the new
+   *  threshold. */
   const applyStoreSettings = async () => {
     await ensureEmbedder();
     for (const { inst } of stores.values()) {
-      if (embedProvider) inst.setEmbedder(embedProvider);
+      if (embedProvider) {
+        inst.setEmbedder(embedProvider);
+        try {
+          const n = await inst.ensureEmbeddingMigration();
+          if (n > 0) ctx.logger?.info?.(`hippo-memory: re-embedded ${n} legacy memory row(s) with the embedding model`);
+        } catch (err) {
+          ctx.logger?.warn?.(`hippo-memory: embedding migration failed (${err?.message ?? err}); old rows stay on hashing vectors`);
+        }
+      }
     }
     digestCache.clear();
   };
@@ -286,6 +320,16 @@ function apply(ctx, config = {}) {
         ent.refreshing = undefined;
       });
     digestCache.set(agentKey, ent);
+  };
+
+  /** Human-readable embedder status line for the digest block / status tool. */
+  const embedderStatusText = () => {
+    const want = current().embedding;
+    if (want !== 'auto') return '';
+    if (embedState === 'ready') return '';
+    if (embedState === 'loading') return 'note: local embedding model is loading (first use downloads ~24MB to storages/hippo-memory/models). Until ready, recall uses the built-in hashing embedder.';
+    if (embedState === 'failed') return 'note: embedding model unavailable — recall uses the built-in hashing embedder.';
+    return '';
   };
 
   const invalidateDigest = (agentKey) => {
@@ -402,9 +446,9 @@ function apply(ctx, config = {}) {
 
     reg(defineTool({
       name: 'memory_maintain',
-      description: 'Long-term memory housekeeping. consolidate: abstract well-established episodes into durable semantic rules. forget: decay / soft-delete weak traces (preview with dry_run). stats: store summary. list: newest-first inventory of active memories. history: show revision history of one memory id.',
+      description: 'Long-term memory housekeeping. consolidate: abstract well-established episodes into durable semantic rules. forget: decay / soft-delete weak traces (preview with dry_run). stats: store summary. list: newest-first inventory of active memories. history: show revision history of one memory id. status: embedder/plugin state.',
       parameters: {
-        action: { type: 'string', required: true, enum: ['consolidate', 'forget', 'stats', 'list', 'history'], description: 'Which maintenance action to run.' },
+        action: { type: 'string', required: true, enum: ['consolidate', 'forget', 'stats', 'list', 'history', 'status'], description: 'Which maintenance action to run.' },
         id: { type: 'string', description: 'Memory id (history action).' },
         dry_run: { type: 'boolean', description: 'forget: preview without mutating (default true).' },
         limit: { type: 'number', description: 'list: max entries (default 50).' }
@@ -441,6 +485,15 @@ function apply(ctx, config = {}) {
           if (!args.id) return { error: 'history requires an id' };
           return cleanJson({ history: store.history(args.id) });
         }
+        if (args.action === 'status') {
+          return cleanJson({
+            embeddingSetting: current().embedding,
+            embedderState: embedState, // off | loading | ready | failed
+            dim: embedProvider?.dim ?? null,
+            embedderNote: embedderStatusText(),
+            storeStats: store.stats()
+          });
+        }
         return { error: `unknown action ${args.action}` };
       },
       presentCall: (args) => present('Maintain memory', 'other', args.action)
@@ -463,6 +516,8 @@ function apply(ctx, config = {}) {
         const cue = latestUserCue(agent.session);
         refreshDigest(key, cue.slice(0, 800));
         const digest = digestCache.get(key)?.digest ?? '';
+        const note = embedderStatusText();
+        if (note) return `[hippo-memory digest]\n${note}${digest ? '\n' + digest : ''}`;
         return digest ? `[hippo-memory digest]\n${digest}` : '';
       }
     }));

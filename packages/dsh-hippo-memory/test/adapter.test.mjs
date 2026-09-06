@@ -158,6 +158,13 @@ test('maintain history requires an id and returns version history', async () => 
   assert.ok(h.error, 'missing id errors');
 });
 
+test('maintain status reports plugin + embedder state', async () => {
+  const s = await toolExec('memory_maintain', { action: 'status' });
+  assert.equal(s.embeddingSetting, 'off', 'default embedding setting');
+  assert.ok(['off', 'loading', 'ready', 'failed'].includes(s.embedderState));
+  assert.ok(s.storeStats && typeof s.storeStats.active === 'number');
+});
+
 /* ------------------------- isolation & cleanup ------------------------- */
 
 test('different agents get separate stores by default', async () => {
