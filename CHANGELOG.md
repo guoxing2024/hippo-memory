@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.1] — 2026-09-07
+
+### Changed
+- 补充 `keywords`（dsh / deepseek-runtime / long-term-memory / embedding 等）提升 npm 可发现性
+- package.json 增加 `repository` / `homepage`（指向公开 GitHub 仓库）
+
 ## [0.1.0] — 2026-09-07
 
 首个发布版本（曾用名 `hippo-memory`，该名已被占用，改用 `hippo-memory-core`）。

@@ -1,6 +1,6 @@
 {
   "name": "dsh-hippo-memory",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH profile bundle: hippocampus-inspired long-term memory for DeepSeek runtime agents (tools + dynamic context + guidance + GUI settings card).",
   "type": "module",
   "main": "lib/index.js",
@@ -42,5 +42,23 @@
   "engines": {
     "dsh": ">=0.1.1-rc.1"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guoxing2024/hippo-memory.git"
+  },
+  "homepage": "https://github.com/guoxing2024/hippo-memory#readme",
+  "keywords": [
+    "dsh",
+    "deepseek-runtime",
+    "deepseek",
+    "plugin",
+    "memory",
+    "long-term-memory",
+    "hippocampus",
+    "agent",
+    "llm",
+    "cordis",
+    "bundle"
+  ]
 }
