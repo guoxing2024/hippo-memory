@@ -303,8 +303,11 @@ function apply(ctx, config = {}) {
     const now = Date.now();
     const cached = digestCache.get(agentKey);
     if (cached?.refreshing) return;
-    if (cached?.cue === cue) return;
-    if (cached && now - cached.at < REFRESH_MS) return;
+    // Same-cue skip only when the cached digest is non-empty: an empty result
+    // (e.g. computed while the model was still loading) must be retried on the
+    // next render, otherwise repeated identical cues show nothing forever.
+    if (cached?.cue === cue && cached?.digest) return;
+    if (cached && now - cached.at < REFRESH_MS && cached?.digest) return;
     const ent = cached ?? { digest: '', cue: '', at: 0 };
     ent.cue = cue;
     ent.refreshing = store.inst
@@ -330,6 +333,37 @@ function apply(ctx, config = {}) {
     if (embedState === 'loading') return 'note: local embedding model is loading (first use downloads ~24MB to storages/hippo-memory/models). Until ready, recall uses the built-in hashing embedder.';
     if (embedState === 'failed') return 'note: embedding model unavailable — recall uses the built-in hashing embedder.';
     return '';
+  };
+
+  /** Lazily start loading the embedding model on first actual need (first
+   *  digest render with embedding:auto). Deliberately NOT run at plugin boot:
+   *  importing @xenova/transformers pulls sharp/libvips native libs that slow
+   *  `dsh web` startup and print GLib warnings. First load logs one info line
+   *  and the digest shows a loading note until ready. */
+  let embedderKicked = false;
+  const kickEmbedder = () => {
+    if (embedderKicked) return;
+    if (current().embedding !== 'auto') return;
+    embedderKicked = true;
+    void applyStoreSettings();
+  };
+
+  /** Read-path guarantee: when embedding:auto, ensure the model is ready (or
+   *  has failed fast) before a query runs, so tools never silently query the
+   *  model-vector store with the hashing embedder. Bounded wait: first use may
+   *  download ~24MB; after the timeout the query falls back to hashing (older
+   *  rows stay reachable only after the model is up — the digest note says so). */
+  const embedderReadyForQuery = async () => {
+    if (current().embedding !== 'auto') return;
+    if (embedState === 'ready' || embedState === 'failed') return;
+    kickEmbedder();
+    if (embedState === 'ready' || embedState === 'failed') return;
+    // Model is loading (possibly downloading). Wait up to ~90s, polling.
+    const deadline = Date.now() + 90_000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 250));
+      if (embedState === 'ready' || embedState === 'failed') return;
+    }
   };
 
   const invalidateDigest = (agentKey) => {
@@ -398,6 +432,7 @@ function apply(ctx, config = {}) {
       },
       output: outputOf(),
       async execute(args, exec) {
+        await embedderReadyForQuery();
         const store = storeFor(sanitize(agentIdOf(exec)));
         const res = await store.recall(
           { query: args.query, entities: args.entities, kind: args.kind },
@@ -430,6 +465,7 @@ function apply(ctx, config = {}) {
       },
       output: outputOf(),
       async execute(args, exec) {
+        await embedderReadyForQuery();
         const store = storeFor(sanitize(agentIdOf(exec)));
         const v = await store.sourceMonitor(args.claim);
         return cleanJson({
@@ -446,10 +482,10 @@ function apply(ctx, config = {}) {
 
     reg(defineTool({
       name: 'memory_maintain',
-      description: 'Long-term memory housekeeping. consolidate: abstract well-established episodes into durable semantic rules. forget: decay / soft-delete weak traces (preview with dry_run). stats: store summary. list: newest-first inventory of active memories. history: show revision history of one memory id. status: embedder/plugin state.',
+      description: 'Long-term memory housekeeping. consolidate: abstract well-established episodes into durable semantic rules. forget: decay / soft-delete weak traces (preview with dry_run). stats: store summary. list: newest-first inventory of active memories. history: show revision history of one memory id. delete: permanently remove a memory by id. status: embedder/plugin state.',
       parameters: {
-        action: { type: 'string', required: true, enum: ['consolidate', 'forget', 'stats', 'list', 'history', 'status'], description: 'Which maintenance action to run.' },
-        id: { type: 'string', description: 'Memory id (history action).' },
+        action: { type: 'string', required: true, enum: ['consolidate', 'forget', 'stats', 'list', 'history', 'delete', 'status'], description: 'Which maintenance action to run.' },
+        id: { type: 'string', description: 'Memory id (history/delete action).' },
         dry_run: { type: 'boolean', description: 'forget: preview without mutating (default true).' },
         limit: { type: 'number', description: 'list: max entries (default 50).' }
       },
@@ -485,6 +521,16 @@ function apply(ctx, config = {}) {
           if (!args.id) return { error: 'history requires an id' };
           return cleanJson({ history: store.history(args.id) });
         }
+        if (args.action === 'delete') {
+          if (!args.id) return { error: 'delete requires an id' };
+          try {
+            store.delete(args.id);
+            invalidateDigest(sanitize(agentIdOf(exec)));
+            return cleanJson({ ok: true, deleted: args.id });
+          } catch (err) {
+            return cleanJson({ ok: false, error: err?.message ?? String(err) });
+          }
+        }
         if (args.action === 'status') {
           return cleanJson({
             embeddingSetting: current().embedding,
@@ -512,13 +558,33 @@ function apply(ctx, config = {}) {
         const agent = context?.agent;
         if (!agent) return '';
         const key = sanitize(agent.id);
-        storeFor(key);
+        const inst = storeFor(key);
+        // First render with embedding:auto lazily starts the model load (not at
+        // plugin boot, so `dsh web` startup stays fast and GLib-clean).
+        kickEmbedder();
         const cue = latestUserCue(agent.session);
         refreshDigest(key, cue.slice(0, 800));
-        const digest = digestCache.get(key)?.digest ?? '';
+        const cached = digestCache.get(key);
+        const digest = cached?.digest ?? '';
         const note = embedderStatusText();
-        if (note) return `[hippo-memory digest]\n${note}${digest ? '\n' + digest : ''}`;
-        return digest ? `[hippo-memory digest]\n${digest}` : '';
+        const parts = [];
+        if (note) parts.push(note);
+        if (digest) {
+          // Fresh or stale digest — show it; the refresh above is computing
+          // the current cue's result when stale.
+          parts.push(digest);
+          // B: end-of-turn self-check — attached whenever memory content is
+          // shown (fresh or stale), so agents are nudged without nagging.
+          parts.push('(if this turn produced a durable conclusion not yet stored, write it with memory_remember)');
+        } else {
+          // No computed digest yet (async lag on first renders) — never render
+          // an empty block: give a stable one-line fallback (cheap, no query).
+          const s = inst.stats();
+          parts.push(s.active > 0
+            ? `(${s.active} memories stored; relevant ones will appear here once recalled)`
+            : '(memory store empty — durable conclusions will be written as you work)');
+        }
+        return parts.length ? `[hippo-memory digest]\n${parts.join('\n')}` : '';
       }
     }));
 
@@ -532,9 +598,10 @@ function apply(ctx, config = {}) {
 
   if (enabled) {
     installRuntime();
-    // Warm up the embedding model in the background when enabled (auto) so the
-    // first recall after a settings save is not the slow one.
-    if (current().embedding === 'auto') void applyStoreSettings();
+    // Deliberately NO embedding warm-up here: importing @xenova/transformers
+    // at boot pulls sharp/libvips native libraries that slow `dsh web` startup
+    // and print GLib-GObject warnings. The model loads lazily on first digest
+    // render (kickEmbedder) or when the user flips the setting to auto.
   }
 
   // dispose on unload

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.6] — 2026-09-07
+
+### Changed
+- 启动懒加载：模型预热移出启动路径（`dsh web` 提速、GLib 噪音推迟到首次对话）；digest 首轮渲染触发加载
+- digest 空白修复：同 cue 空结果允许重查；无结果时显示记忆数 fallback（永不空白）；命中时附收尾自提醒
+- 读取保障：recall/verify 先确保模型 ready（超时回退哈希），不再静默空结果
+
+### Added
+- `memory_maintain delete`：按 id 永久删除记忆
+
 ## [0.1.5] — 2026-09-07
 
 ### Changed

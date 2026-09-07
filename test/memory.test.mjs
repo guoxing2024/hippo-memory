@@ -270,3 +270,24 @@ test('empty store migration marks done without embedding', async () => {
   m.close();
   rmSync(dir2, { recursive: true, force: true });
 });
+
+test('delete removes a memory and its history permanently', async () => {
+  const dir2 = mkdtempSync(join(tmpdir(), 'hippo-del-'));
+  const m = new HippoMemory({ dbPath: join(dir2, 'd.db') });
+
+  // Create a memory with a revision history (update archives v1 → history).
+  const r1 = await m.remember({ kind: 'semantic', summary: 'delete me -> original value', source: 'user' });
+  await m.update(r1.memory.id, { summary: 'delete me -> corrected value' });
+  const histBefore = m.history(r1.memory.id);
+  assert.ok(histBefore.length >= 1, 'update archives history');
+  assert.ok(m.stats().active >= 1);
+
+  // Delete it.
+  m.delete(r1.memory.id);
+  assert.ok(m.stats().active === 0, 'row removed');
+  assert.equal(m.history(r1.memory.id).length, 0, 'history purged');
+  assert.throws(() => m.delete(r1.memory.id), /no memory/, 'second delete throws');
+
+  m.close();
+  rmSync(dir2, { recursive: true, force: true });
+});

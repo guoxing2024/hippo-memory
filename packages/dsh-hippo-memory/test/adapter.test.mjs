@@ -165,6 +165,25 @@ test('maintain status reports plugin + embedder state', async () => {
   assert.ok(s.storeStats && typeof s.storeStats.active === 'number');
 });
 
+test('maintain delete removes a memory by id', async () => {
+  // Create a throwaway memory then delete it.
+  const r = await toolExec('memory_remember', { kind: 'semantic', summary: 'delete target -> value', source: 'user' });
+  assert.ok(r.id, 'remember returned an id');
+  const before = await toolExec('memory_maintain', { action: 'list', limit: 100 });
+  assert.ok(before.memories.some((m) => m.id === r.id), 'target present before delete');
+
+  const d = await toolExec('memory_maintain', { action: 'delete', id: r.id });
+  assert.equal(d.ok, true);
+  assert.equal(d.deleted, r.id);
+
+  const after = await toolExec('memory_maintain', { action: 'list', limit: 100 });
+  assert.ok(!after.memories.some((m) => m.id === r.id), 'target gone after delete');
+
+  // Missing id → clean error, not a throw.
+  const bad = await toolExec('memory_maintain', { action: 'delete' });
+  assert.ok(bad.error, 'delete without id errors');
+});
+
 /* ------------------------- isolation & cleanup ------------------------- */
 
 test('different agents get separate stores by default', async () => {

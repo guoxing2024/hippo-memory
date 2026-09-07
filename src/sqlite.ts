@@ -211,6 +211,12 @@ export class SqliteStore {
     this.db.prepare('DELETE FROM memories WHERE id = ?').run(id);
   }
 
+  /** Permanently remove a memory and its full revision history. */
+  deleteWithHistory(id: string): void {
+    this.db.prepare('DELETE FROM memory_history WHERE id = ?').run(id);
+    this.db.prepare('DELETE FROM memories WHERE id = ?').run(id);
+  }
+
   pruneHistory(id: string, keep: number): void {
     this.db
       .prepare(

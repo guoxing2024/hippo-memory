@@ -94,7 +94,7 @@ dsh web
 2. **记忆纪律**（系统提示）——agent 的"使用手册"，教它：
    > 学到持久结论 → 立刻写；涉及旧事实 → 先查再答；断言记忆内容 → 先验证；写错的被纠正 → 旧版本自动存档，不冲突覆盖。
 
-3. **每轮自动摘要**——每轮开工前，引擎自动从记忆库里检索与当前任务**相关**的旧结论，拼成一小块 `[hippo-memory digest]` 塞进上下文，让 agent 一开局就"记得"相关背景。
+3. **每轮自动摘要**——每轮开工前，引擎自动从记忆库里检索与当前任务**相关**的旧结论，拼成一小块 `[hippo-memory digest]` 塞进上下文，让 agent 一开局就"记得"相关背景。命中相关记忆时，digest 末尾还会附一句**收尾自提醒**（"本轮若有尚未存储的持久结论，用 memory_remember 写入"），帮助 agent 减少"该记不记"。
 
 ```
 你: 继续上次的脱壳攻坚（新会话，什么都没说）
@@ -136,7 +136,7 @@ agent: （不用你复述）好，上次冻结在 51/8，我先从 D-284 解冻�
 | memory_remember | kind: `semantic`/`episode`/`procedure`; summary; detail; entities; tags; confidence | "记下：Core.dll 脱壳状态 -> 阻塞中（D-284 攻坚中）" |
 | memory_recall | query; entities; kind; limit | "查一下之前关于 Core.dll 的结论" |
 | memory_verify | claim | "核对我说的'快照重建路线已判死'有没有依据"——返回三态 + 命中记忆详情；未命中时会给出 `closest`（最接近的候选），方便你判断"差一点"的是哪条 |
-| memory_maintain | action: `consolidate`/`forget`/`stats`/`list`/`history`/`status` | "整理记忆 / 看记忆统计 / 列出全部记忆 / 查某条版本史 / 查插件与嵌入模型状态" |
+| memory_maintain | action: `consolidate`/`forget`/`stats`/`list`/`history`/`delete`/`status` | "整理记忆 / 看记忆统计 / 列出全部记忆 / 查某条版本史 / 永久删除某条 / 查插件与嵌入模型状态" |
 
 **写记忆的最佳实践**：summary 用一句话，格式 **"<主体> -> <结论>"**（例如 `billing service db -> postgres`）。这个格式能触发"纠错覆盖"机制：用户后来纠正为 mysql 时，旧记忆自动版本化存档（v1→v2），查到的永远是最新值，且 `history` 可查演变。
 

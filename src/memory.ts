@@ -322,7 +322,6 @@ export class HippoMemory {
     const row = this.db.getById(id);
     if (!row) throw new Error(`update: no memory with id ${id}`);
     const existing = rowToMemory(row, false);
-
     const summary = payload.summary?.trim() ?? existing.summary;
     const contentText = [
       summary,
@@ -425,7 +424,20 @@ export class HippoMemory {
    */
   async recall(cue: RetrievalCue, limit = 5): Promise<RecallBundle> {
     const q = cue.query.trim();
-    if (!q) return { hits: [], warnings: [], scanned: 0 };
+    // Empty cue (e.g. no user message surfaced yet): pattern completion has
+    // nothing to complete — surface the most recently updated traces instead,
+    // so auto-digest contexts never render empty during warm-up renders.
+    if (!q) {
+      const recent = this.db
+        .allActive()
+        .sort((a, b) => (b.updated_at ?? '').localeCompare(a.updated_at ?? ''))
+        .slice(0, Math.min(limit, 5));
+      return {
+        hits: recent.map((r) => ({ ...rowToMemory(r, false), score: 0.5, consolidated: false })),
+        warnings: ['empty cue: showing recently updated memories'],
+        scanned: 0
+      };
+    }
 
     const cueVec = await this.embedOne(q);
     const minImportance = cue.minImportance ?? this.options.minImportance;
@@ -492,6 +504,14 @@ export class HippoMemory {
   }
 
   /* ============================ consolidation ============================ */
+
+  /** Permanently delete a memory by id (row + full revision history).
+   *  Throws when the id does not exist. */
+  delete(id: string): void {
+    const row = this.db.getById(id);
+    if (!row) throw new Error(`delete: no memory with id ${id}`);
+    this.db.deleteWithHistory(id);
+  }
 
   /**
    * Systems consolidation (call offline, e.g. after a session or on a timer).
