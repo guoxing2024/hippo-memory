@@ -1,6 +1,7 @@
 export {
   HippoMemory,
 } from './memory.js';
+export { pruneEmptyStores, SqliteStore } from './sqlite.js';
 export type {
   ConflictOutcome,
   ConsolidationCandidate,

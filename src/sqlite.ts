@@ -9,6 +9,8 @@
  */
 
 import { DatabaseSync } from 'node:sqlite';
+import { existsSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import type { MemoryKind, SourceConfidence } from './schema.js';
 
 /** Row shape exactly as stored (snake_case columns). */
@@ -109,9 +111,40 @@ export interface HistoryRow {
 
 export class SqliteStore {
   private db: DatabaseSync;
+  /** Set while this store has no file on disk yet (lazy mode, empty): reads
+   *  are served from an in-memory schema; the first write materializes it. */
+  private lazyPath: string | null = null;
 
-  constructor(private readonly path: string) {
+  /**
+   * @param path    store file path
+   * @param opts.create  false = do not touch the disk until something is
+   *                     actually written (reads on a missing file are served
+   *                     from an in-memory schema). Defaults to true.
+   */
+  constructor(private readonly path: string, opts: { create?: boolean } = {}) {
+    if (opts.create === false && !existsSync(path)) {
+      this.db = new DatabaseSync(':memory:');
+      this.db.exec(SCHEMA);
+      this.lazyPath = path;
+      return;
+    }
     this.db = new DatabaseSync(path);
+    this.db.exec('PRAGMA journal_mode = WAL;');
+    this.db.exec(SCHEMA);
+  }
+
+  /** True while this store is held in memory because no file exists yet. */
+  isLazy(): boolean {
+    return this.lazyPath !== null;
+  }
+
+  /** Promote a lazy store to a real file (no-op once materialized). */
+  private materialize(): void {
+    if (this.lazyPath === null) return;
+    const target = this.lazyPath;
+    this.lazyPath = null;
+    this.db.close();
+    this.db = new DatabaseSync(target);
     this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec(SCHEMA);
   }
@@ -126,6 +159,7 @@ export class SqliteStore {
 
   /** Set the store's migration marker. */
   setMarker(v: number): void {
+    this.materialize();
     this.db.exec(`PRAGMA user_version = ${Math.trunc(v)};`);
   }
 
@@ -140,9 +174,18 @@ export class SqliteStore {
     return Number(r.c);
   }
 
+  /** True when the store holds no rows at all (active or superseded) and no
+   *  archived history — i.e. the file carries no information worth keeping. */
+  isEmpty(): boolean {
+    const m = this.db.prepare('SELECT COUNT(*) AS c FROM memories').get() as { c: number };
+    const h = this.db.prepare('SELECT COUNT(*) AS c FROM memory_history').get() as { c: number };
+    return Number(m.c) === 0 && Number(h.c) === 0;
+  }
+
   /* --------------------------- insert/update ------------------------- */
 
   insert(row: MemoryRow): void {
+    this.materialize();
     this.db
       .prepare(
         `INSERT INTO memories (
@@ -162,6 +205,7 @@ export class SqliteStore {
   }
 
   update(row: MemoryRow): void {
+    this.materialize();
     this.db
       .prepare(
         `UPDATE memories SET
@@ -183,6 +227,7 @@ export class SqliteStore {
 
   /** Archive the current revision of a row into memory_history. */
   archiveCurrent(id: string, archivedAt: string): void {
+    this.materialize();
     const row = this.getById(id);
     if (!row) return;
     this.db
@@ -204,20 +249,24 @@ export class SqliteStore {
   }
 
   setSuperseded(id: string): void {
+    this.materialize();
     this.db.prepare('UPDATE memories SET superseded = 1 WHERE id = ?').run(id);
   }
 
   hardDelete(id: string): void {
+    this.materialize();
     this.db.prepare('DELETE FROM memories WHERE id = ?').run(id);
   }
 
   /** Permanently remove a memory and its full revision history. */
   deleteWithHistory(id: string): void {
+    this.materialize();
     this.db.prepare('DELETE FROM memory_history WHERE id = ?').run(id);
     this.db.prepare('DELETE FROM memories WHERE id = ?').run(id);
   }
 
   pruneHistory(id: string, keep: number): void {
+    this.materialize();
     this.db
       .prepare(
         `DELETE FROM memory_history WHERE id = ?
@@ -229,6 +278,7 @@ export class SqliteStore {
   }
 
   touchAccess(id: string, accessCount: number, atIso: string): void {
+    this.materialize();
     this.db
       .prepare('UPDATE memories SET access_count = ?, last_access_at = ? WHERE id = ?')
       .run(accessCount, atIso, id);
@@ -254,6 +304,7 @@ export class SqliteStore {
   /* --------------------------- transactions -------------------------- */
 
   transaction<T>(fn: () => T): T {
+    this.materialize();
     this.db.exec('BEGIN');
     try {
       const out = fn();
@@ -264,4 +315,71 @@ export class SqliteStore {
       throw err;
     }
   }
+}
+
+/**
+ * Delete store files that hold no memories and no history.
+ *
+ * Read-only access used to create a file per agent (every digest render, every
+ * recall), which littered the storages directory with empty `.db`/`-wal`/`-shm`
+ * skeletons. This sweeps them: a file is removed only when it opens cleanly and
+ * both tables are empty, so a store with any row (including archived revisions)
+ * is never touched. Locked, unreadable or mid-write files are skipped.
+ *
+ * @param dir         directory holding `*.db` store files
+ * @param opts.minAgeMs  skip files younger than this (default 60s) so a store
+ *                       that is being written right now is never a candidate;
+ *                       pass 0 in tests
+ * @param opts.skip   store keys (file basenames without `.db`) to keep
+ * @returns names of the deleted store files
+ */
+export function pruneEmptyStores(
+  dir: string,
+  opts: { minAgeMs?: number; skip?: Iterable<string> } = {}
+): string[] {
+  const minAgeMs = opts.minAgeMs ?? 60_000;
+  const skip = new Set(opts.skip ?? []);
+  const removed: string[] = [];
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return removed; // directory does not exist yet
+  }
+  const now = Date.now();
+  const names = new Set(entries);
+
+  for (const file of entries.filter((f) => f.endsWith('.db'))) {
+    const key = file.slice(0, -3);
+    if (skip.has(key)) continue;
+    const full = join(dir, file);
+    try {
+      const st = statSync(full);
+      if (now - st.mtimeMs < minAgeMs) continue;
+      const probe = new SqliteStore(full);
+      let empty: boolean;
+      try {
+        empty = probe.isEmpty();
+      } finally {
+        probe.close();
+      }
+      if (!empty) continue;
+      // Drop the WAL/SHM siblings too, else a later open resurrects the rows
+      // of the main file from a stale journal.
+      for (const suffix of ['', '-wal', '-shm']) {
+        const p = full + suffix;
+        if (names.has(file + suffix)) {
+          try {
+            rmSync(p, { force: true });
+          } catch {
+            /* locked — leave it; next sweep retries */
+          }
+        }
+      }
+      removed.push(file);
+    } catch {
+      /* locked / corrupt / not a store — never delete on doubt */
+    }
+  }
+  return removed;
 }

@@ -93,18 +93,37 @@ export interface RetrievalCue {
 }
 
 export interface RetrievedMemory extends StoredMemory {
-  /** Cosine similarity of the encoding vector against the cue embedding. */
+  /** Ranking score: similarity × importance weighting (+ literal-token bonus). */
   score: number;
+  /** Raw cosine similarity (threshold-comparable; same scale as memory_verify). */
+  similarity: number;
+  /** This hit's similarity ÷ the best similarity for this query (1.0 = best). */
+  relativeScore: number;
+  /** Number of shared literal identifier tokens (0x…, D-123, sha, version). */
+  literalMatch?: number;
   /** True when the hit came from the consolidated semantic store. */
   consolidated: boolean;
 }
+
+/** Why a recall returned what it did. */
+export type RecallReason = 'ok' | 'no-candidates' | 'below-threshold' | 'empty-cue';
 
 export interface RecallBundle {
   hits: RetrievedMemory[];
   /** Warnings such as stale-rule overrides that were applied. */
   warnings: string[];
-  /** Number of memory candidates considered before re-ranking (diagnostics). */
+  /** Number of rows whose vector was comparable to the cue (diagnostics). */
   scanned: number;
+  /** Rows passing structural filters (kind/entities/importance/time). */
+  eligible: number;
+  /** Best cosine seen among eligible rows (null when none was comparable). */
+  bestSimilarity: number | null;
+  /** Similarity floor in force for this query. */
+  threshold: number;
+  /** 'ok' | 'no-candidates' (nothing stored/filtered) | 'below-threshold' | 'empty-cue'. */
+  reason: RecallReason;
+  /** Closest sub-threshold rows (best first) so an empty result is explainable. */
+  nearMisses: { id: string; summary: string; similarity: number }[];
 }
 
 export interface ConsolidationCandidate {

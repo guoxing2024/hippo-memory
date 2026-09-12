@@ -34,6 +34,7 @@ import {
   type ConflictOutcome,
   type ConsolidationCandidate,
   type EmbeddingProvider,
+  type MemoryKind,
   type MemoryPayload,
   type RecallBundle,
   type RetrievedMemory,
@@ -83,8 +84,13 @@ export class HippoMemory {
   readonly options: Required<StoreOptions>;
   private embedder: EmbeddingProvider | null = null;
 
-  constructor(opts: { dbPath: string; options?: StoreOptions }) {
-    this.db = new SqliteStore(opts.dbPath);
+  /**
+   * @param opts.createFile  false = open lazily: a store whose file does not
+   *                         exist yet is held in memory until the first write
+   *                         (default true, the historical eager behaviour).
+   */
+  constructor(opts: { dbPath: string; options?: StoreOptions; createFile?: boolean }) {
+    this.db = new SqliteStore(opts.dbPath, { create: opts.createFile !== false });
     this.options = { ...DEFAULT_OPTIONS, ...opts.options };
   }
 
@@ -104,7 +110,11 @@ export class HippoMemory {
     if (this.db.marker() >= 1) return 0;
     const rows = this.db.allActive();
     if (rows.length === 0) {
-      this.db.setMarker(1);
+      // Nothing to migrate. Skip the marker write for a store that has not
+      // materialized yet — writing it would create an empty file on disk,
+      // which is exactly what lazy opening exists to avoid. A later real
+      // write re-runs this check and records the marker then.
+      if (!this.db.isLazy()) this.db.setMarker(1);
       return 0;
     }
     const texts = rows.map((r) => {
@@ -186,7 +196,7 @@ export class HippoMemory {
    *                                            → versioned override (archive old)
    *   4. otherwise                             → new sparse trace
    */
-  async remember(payload: MemoryPayload): Promise<{ outcome: ConflictOutcome; memory: StoredMemory }> {
+  async remember(payload: MemoryPayload): Promise<{ outcome: ConflictOutcome; memory: StoredMemory; superseded?: { id: string; version: number; summary: string } }> {
     const summary = payload.summary.trim();
     if (!summary) throw new Error('remember: summary is required');
 
@@ -228,6 +238,7 @@ export class HippoMemory {
         // claims and same-event episodes get overridden.
         const windowOk = r.kind === 'semantic' || r.kind === 'procedure' || this.sameEventWindowMs(payload, r);
         if (!windowOk) continue;
+        const prior = { id: r.id, version: r.version, summary: r.summary };
         const res = await this.update(r.id, {
           summary,
           detail: payload.detail,
@@ -239,26 +250,32 @@ export class HippoMemory {
           source: payload.source,
           confidence
         });
-        return { outcome: 'override', memory: res.memory };
+        return { outcome: 'override', memory: res.memory, superseded: prior };
       }
     }
 
     // 1. verbatim re-tell of the same claim → rehearsal, strengthen only
+    //    (compare with the wrapper stripped so "FACT: X" counts as a re-tell of X)
     const isRetell =
-      closest !== undefined && normalizeText(closest.r.summary) === normalizeText(summary);
+      closest !== undefined &&
+      normalizeText(stripAbstractPrefix(closest.r.summary)) === normalizeText(stripAbstractPrefix(summary));
     if (closest && isRetell) {
       const imp = Math.min(1, closest.r.importance + 0.03);
       this.db.update({ ...closest.r, importance: imp, updated_at: now });
       return { outcome: 'none', memory: rowToMemory(this.db.getById(closest.r.id)!, false) };
     }
 
-    // 2. cross-kind merge: an episodic re-tell of an existing semantic rule
+    // 2. cross-kind merge: an episodic re-tell of an existing semantic rule.
+    //    Compare with the consolidation wrapper stripped: consolidation writes
+    //    the episode as "FACT: <same text>", so a raw comparison would miss the
+    //    twin and let a duplicate accumulate (observed: 17 such pairs).
     if (payload.kind === 'episode') {
+      const newBody = normalizeText(stripAbstractPrefix(summary));
       const nearSemantic = candidates.find(
         (x) =>
           x.r.kind === 'semantic' &&
           x.sim >= this.options.nearDuplicateThreshold &&
-          normalizeText(x.r.summary) === normalizeText(summary)
+          normalizeText(stripAbstractPrefix(x.r.summary)) === newBody
       );
       if (nearSemantic) {
         const imp = Math.min(1, nearSemantic.r.importance + 0.01);
@@ -279,6 +296,7 @@ export class HippoMemory {
       sharesScope &&
       this.sameEventWindowMs(payload, closest.r)
     ) {
+      const prior = { id: closest.r.id, version: closest.r.version, summary: closest.r.summary };
       const res = await this.update(closest.r.id, {
         summary,
         detail: payload.detail,
@@ -290,7 +308,7 @@ export class HippoMemory {
         source: payload.source,
         confidence
       });
-      return { outcome: 'override', memory: res.memory };
+      return { outcome: 'override', memory: res.memory, superseded: prior };
     }
 
     // 4. new trace
@@ -422,7 +440,7 @@ export class HippoMemory {
    * Every hit keeps its provenance; conflict warnings surface newer revisions
    * of the same scope so the caller does not blindly trust a stale trace.
    */
-  async recall(cue: RetrievalCue, limit = 5): Promise<RecallBundle> {
+  async recall(cue: RetrievalCue, limit = 8): Promise<RecallBundle> {
     const q = cue.query.trim();
     // Empty cue (e.g. no user message surfaced yet): pattern completion has
     // nothing to complete — surface the most recently updated traces instead,
@@ -433,9 +451,14 @@ export class HippoMemory {
         .sort((a, b) => (b.updated_at ?? '').localeCompare(a.updated_at ?? ''))
         .slice(0, Math.min(limit, 5));
       return {
-        hits: recent.map((r) => ({ ...rowToMemory(r, false), score: 0.5, consolidated: false })),
+        hits: recent.map((r) => ({ ...rowToMemory(r, false), score: 0.5, similarity: 0.5, relativeScore: 1, consolidated: false })),
         warnings: ['empty cue: showing recently updated memories'],
-        scanned: 0
+        scanned: 0,
+        eligible: recent.length,
+        bestSimilarity: null,
+        threshold: this.options.similarityThreshold,
+        reason: 'empty-cue',
+        nearMisses: []
       };
     }
 
@@ -450,15 +473,18 @@ export class HippoMemory {
 
     const rows = this.db.allActive();
     const hits: RetrievedMemory[] = [];
-    let scanned = 0;
+    // Candidates that are relevant but fall under the threshold. Kept so an
+    // empty result can be explained ("nothing stored" vs "close but too weak")
+    // and so weak-but-useful traces can still be surfaced as near misses.
+    const below: { mem: StoredMemory; sim: number }[] = [];
+    let scanned = 0; // rows whose vector was comparable (dimension match)
+    let eligible = 0; // rows passing the cheap structural filters
+    let bestSim = -1;
 
     for (const r of rows) {
       const b = vecFromBlob(r.vec);
       if (!b || b.length !== cueVec.length) continue;
-      const sim = cosine(b, cueVec);
-      if (sim < minSim) continue;
       scanned++;
-
       const mem = rowToMemory(r, false);
       if (exclude.has(mem.id)) continue;
       if (cue.kind && mem.kind !== cue.kind) continue;
@@ -466,15 +492,60 @@ export class HippoMemory {
       if (sinceMs && mem.lastAccessAt && Date.parse(mem.lastAccessAt) < sinceMs) continue;
       if (occurredSinceMs && mem.occurredAt && Date.parse(mem.occurredAt) < occurredSinceMs) continue;
       if (entityFilter.length && !entityFilter.every((e) => mem.entities.includes(e))) continue;
+      eligible++;
 
-      hits.push({ ...mem, score: sim, consolidated: mem.kind === 'semantic' });
+      const sim = cosine(b, cueVec);
+      if (sim > bestSim) bestSim = sim;
+      // Literal-token rescue: an exact identifier match (0x212aa5, D-387, a
+      // commit sha) is decisive evidence that cosine underrates, especially for
+      // short CJK queries where embeddings are mushy. Such a row is admitted
+      // even below the similarity floor, but is marked so the caller can tell.
+      const literal = literalOverlap(q, mem.summary);
+      if (sim < minSim && !literal) {
+        below.push({ mem, sim });
+        continue;
+      }
+      hits.push({ ...mem, score: sim, similarity: sim, relativeScore: 0, literalMatch: literal || undefined, consolidated: mem.kind === 'semantic' });
     }
 
-    // Rank: similarity × (0.6 + 0.4·importance)
+    // Rank: similarity × (0.6 + 0.4·importance), plus a literal-identifier
+    // bonus. `similarity` stays the raw cosine (threshold- and verify-
+    // comparable); the bonus only affects ordering among retrieved rows.
+    // Ordering uses the unbounded value, then `score` is clamped into [0,1] so
+    // a boosted hit never reports a nonsensical "1.03".
     const ranked = hits
-      .map((h) => ({ ...h, score: h.score * (0.6 + 0.4 * h.importance) }))
+      .map((h) => ({
+        ...h,
+        score: h.score * (0.6 + 0.4 * h.importance) + (h.literalMatch ? 0.15 * Math.min(h.literalMatch, 2) : 0)
+      }))
       .sort((a, b) => b.score - a.score)
-      .slice(0, limit);
+      .slice(0, limit)
+      .map((h) => ({ ...h, score: Math.min(1, h.score) }));
+
+    // Relative score: this hit's similarity ÷ the best similarity for THIS
+    // query. Cosine is compressed and query-dependent (a 0.45 can be the best
+    // match in the store), so the raw number alone reads as "bad". The relative
+    // score makes "best available" visible without changing ranking.
+    const topSim = ranked.length ? Math.max(...ranked.map((h) => h.similarity)) : 0;
+    for (const h of ranked) {
+      h.relativeScore = topSim > 0 ? Number((h.similarity / topSim).toFixed(3)) : 0;
+    }
+
+    // Near misses: sub-threshold rows, best first, so a caller that got no hits
+    // can see WHAT was close and how close (never silently empty again).
+    const nearMisses = below
+      .sort((a, b) => b.sim - a.sim)
+      .slice(0, 3)
+      .map((x) => ({ id: x.mem.id, summary: x.mem.summary, similarity: Number(x.sim.toFixed(3)) }));
+
+    const reason: RecallBundle['reason'] =
+      ranked.length > 0
+        ? 'ok'
+        : eligible === 0
+          ? 'no-candidates' // nothing to search (empty / filtered out)
+          : below.length > 0
+            ? 'below-threshold' // relevant rows exist but none cleared the floor
+            : 'no-candidates';
 
     // Conflict warnings: any *newer revision* of the same entity scope with a
     // different claim than the top hit? (stale-trace detector)
@@ -500,7 +571,18 @@ export class HippoMemory {
       if (row) this.db.touchAccess(h.id, row.access_count + 1, at);
     }
 
-    return { hits: ranked, warnings, scanned };
+    return {
+      hits: ranked,
+      warnings: ranked.length === 0 && reason === 'below-threshold'
+        ? [...warnings, `no hit cleared the similarity floor ${minSim}; closest was ${bestSim.toFixed(3)} — see nearMisses`]
+        : warnings,
+      scanned,
+      eligible,
+      bestSimilarity: bestSim < 0 ? null : Number(bestSim.toFixed(3)),
+      threshold: minSim,
+      reason,
+      nearMisses
+    };
   }
 
   /* ============================ consolidation ============================ */
@@ -629,6 +711,37 @@ export class HippoMemory {
     this.db.hardDelete(id);
   }
 
+  /**
+   * Report near-duplicate traces (read-only; never deletes).
+   *
+   * Duplicates accumulate from restatements that slip past the write-path
+   * merge: most commonly an episode and the semantic rule abstracted from it,
+   * where the rule carries a "FACT: " wrapper. Comparison strips that wrapper
+   * and ignores case/punctuation, so a cross-kind restatement is recognised.
+   * The write path now folds these automatically; this reports what is already
+   * stored so a caller can review before deleting anything.
+   */
+  duplicates(): { groups: { key: string; memories: { id: string; kind: MemoryKind; version: number; summary: string }[] }[]; scanned: number } {
+    const byKey = new Map<string, StoredMemory[]>();
+    for (const row of this.db.allActive()) {
+      const mem = rowToMemory(row, false);
+      const key = normalizeText(stripAbstractPrefix(mem.summary));
+      if (!key) continue;
+      const list = byKey.get(key);
+      if (list) list.push(mem);
+      else byKey.set(key, [mem]);
+    }
+    const groups = [...byKey.entries()]
+      .filter(([, list]) => list.length > 1)
+      .map(([key, list]) => ({
+        key: key.slice(0, 120),
+        memories: list
+          .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+          .map((m) => ({ id: m.id, kind: m.kind, version: m.version, summary: m.summary }))
+      }));
+    return { groups, scanned: this.db.countActive() };
+  }
+
   /* ============================ source monitoring ============================ */
 
   /**
@@ -722,7 +835,7 @@ export class HippoMemory {
         if (seen.has(r.id)) continue;
         seen.add(r.id);
         const mem = rowToMemory(r, false);
-        items.push({ ...mem, score: 0.5, consolidated: false });
+        items.push({ ...mem, score: 0.5, similarity: 0.5, relativeScore: 0, consolidated: false });
       }
       warnings.push('includeRecent: appended recent traces not directly goal-relevant');
     }
@@ -826,4 +939,31 @@ function claimParts(summary: string): { subject: string; value: string } | null 
   const copula = summary.match(/^\s*(.+?)\s+(?:is|are|uses|runs on|backed by|hosted by|stored in|written in)\s+(?:the\s+|an?\s+)?(.+?)\s*$/i);
   if (copula) return { subject: copula[1]!.trim().toLowerCase(), value: copula[2]!.trim().toLowerCase() };
   return null;
+}
+
+/** Strip the consolidation wrapper so "FACT: X" compares equal to "X". */
+function stripAbstractPrefix(s: string): string {
+  return s.replace(/^\s*(?:fact|rule)\s*:\s*/i, '');
+}
+
+/**
+ * Literal-token overlap between cue and summary. Identifiers (hex addresses,
+ * ticket/decision ids, commit shas, versions) survive verbatim in memory
+ * summaries, and an exact match is far stronger evidence than cosine — which
+ * underrates them, especially for short CJK queries. Returns the count of
+ * distinct identifier tokens shared by both.
+ */
+function literalOverlap(cue: string, summary: string): number {
+  const tokens = (s: string) =>
+    new Set(
+      (s.match(/\b(?:0x[0-9a-f]{3,}|[A-Z]{1,3}-\d{1,5}\b|[0-9a-f]{7,40}\b|v?\d+\.\d+(?:\.\d+)?)\b/gi) ?? []).map((t) =>
+        t.toLowerCase()
+      )
+    );
+  const a = tokens(cue);
+  if (a.size === 0) return 0;
+  const b = tokens(summary);
+  let shared = 0;
+  for (const t of a) if (b.has(t)) shared++;
+  return shared;
 }

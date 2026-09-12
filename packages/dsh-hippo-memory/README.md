@@ -16,6 +16,9 @@
 | 能力 | 说明 | 何时触发 |
 |---|---|---|
 | **4 个记忆工具** | `memory_remember` 写 / `memory_recall` 查 / `memory_verify` 校验 / `memory_maintain` 整理 | agent 自主判断（有纪律提示词引导） |
+| **召回可解释** | `memory_recall` 每个命中给出 `similarity`（原始余弦）/ `score`（含重要性加权）/ `relativeScore`（本次相对分）三个分数 | 需要判断“像不像”时 |
+| **空结果给原因** | 没查到时会说明 `reason`（`below-threshold` 有相关但没过门槛 / `no-candidates` 库里没有或全被筛掉）并列出 `nearMisses` | 每次 `memory_recall` |
+| **重复记忆报告** | `memory_maintain duplicates` 只读列出近似重复（跨类型比对，忽略 `FACT: `前缀），不删任何数据 | 手动整理时 |
 | **自动摘要注入** | 每轮开工前，若记忆库里有与当前任务相关的旧结论，自动注入一条 `[hippo-memory digest]` 参考块 | 引擎自动，命中才耗 token（约 20–40 tok/条） |
 | **使用纪律** | 系统提示里教 agent：何时该记、该查、该验证（WRITE→RECALL→VERIFY→MAINTAIN） | 插件启用即注入 |
 | **GUI 设置卡片** | 设置 → 插件 → 插件配置 → HippoMemory 记忆 | 随时开关、调参 |
@@ -62,6 +65,34 @@ dsh web
 > 💡 **开启 auto 后**：旧记忆自动一次性重嵌入为模型向量（日志出现 `re-embedded N legacy memory row(s)`），无需手动迁移。
 > 用 `memory_maintain` 的 `status` action 可随时查嵌入模型状态（off/loading/ready/failed）。
 
+## 🔬 召回结果怎么看（0.1.8 起）
+
+**三个分数别混着看。** `memory_recall` 的每个命中带三个数：
+
+| 字段 | 含义 |
+|---|---|
+| `similarity` | **原始余弦**。与「召回阈值」、与 `memory_verify` 的分**同口径**，可直接比较——判断“像不像”以它为准 |
+| `score` | 排序分 = `similarity × (0.6 + 0.4 × importance)`，再叠加标识符加成，上限 1.0。**它不等于相似度** |
+| `relativeScore` | `similarity ÷ 本次最高 similarity`（1.0 = 本次最佳）。余弦值被压缩且依赖查询，用它判断“这条算不算本次最相关” |
+
+> 曾有人看到 “`memory_verify` 给 0.604，`memory_recall` 只给 0.449”，以为 recall 更弱。其实是**口径不同**：verify 报原始余弦，recall 报含重要性乘数的 `score`。用 `similarity` 就能对上。
+
+**查到空结果时**，返回里会说明原因，不再是一个空数组：
+
+| 字段 | 含义 |
+|---|---|
+| `reason` | `below-threshold`（有相关记忆但都没过阈值）/ `no-candidates`（库里没有或全被筛掉）/ `empty-cue`（没给 query）/ `ok` |
+| `eligible` / `bestSimilarity` / `threshold` | 通过筛选的条数 / 候选里最高原始余弦 / 本次生效阈值 |
+| `nearMisses` | 最接近的几条（含分值与摘要），一眼看出“差一点”的是哪条 |
+
+**标识符查询（0x… / D-387 / commit sha）为什么能命中**：裸标识符做嵌入查询余弦极低，但精确 token 命中比余弦更可靠，所以这类记忆即使低于阈值也会召回，并标 `literalMatch`（共享 token 数）。
+
+**被覆盖的记忆去哪了**：`memory_remember` 覆盖旧值时返回 `superseded`（含被替换的 id / 版本 / 摘要），旧版进 `history` 存档、**不是静默丢弃**，可用 `memory_maintain history` 查演变。
+
+**重复记忆**：${BT}memory_maintain${BT} 的 action 现在支持 `duplicates`（只读报告，不删除）。重复主要来自整合时生成的 `FACT: ` 规则副本；写入路径已修，不会再生新的。确认后用 `delete` 逐条清理。
+
+---
+
 ## 🔍 常见问题
 
 **Q：旧对话为什么查不到记忆？**
@@ -88,6 +119,12 @@ dsh web
 | 插件设置 | `~/.dsh/settings.yaml`（`hippo-memory:` 节） |
 
 删除对应 `.db` 即清空该记忆（谨慎）。
+
+**Q：memory_recall 只给 0.4 多，是不是没记住？**
+不一定。先看 `similarity`（原始余弦，可与阈值直接比）和 `relativeScore`（1.0 = 本次最佳）。余弦本身被压缩，0.45 也可能是全库最佳。若 `reason` 是 `below-threshold`，看 `nearMisses` 就知道是“真没有”还是“阈值偏高”（可去设置里调低「召回阈值」）。
+
+**Q：怎么知道记忆库有没有垃圾/重复？**
+调 `memory_maintain` + action `stats` 看总量，用 action `duplicates` 看近似重复分组。两个都是只读的；确认后再用 action `delete` 加 id 删除（会连版本历史一起删，不可恢复）。
 
 ## 📄 License
 

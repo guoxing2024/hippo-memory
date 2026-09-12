@@ -32,12 +32,15 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 // (direct link: install of this folder). Try the hoisted name first, then
 // resolve the sibling source package relative to this file.
 let HippoMemory;
+let pruneEmptyStores;
 try {
   ({ HippoMemory } = await import('hippo-memory-core'));
+  ({ pruneEmptyStores } = await import('hippo-memory-core'));
 } catch {
   const here = fileURLToPath(new URL('.', import.meta.url));
   const src = pathToFileURL(join(here, '..', '..', '..', 'dist', 'index.js')).href;
   ({ HippoMemory } = await import(src));
+  ({ pruneEmptyStores } = await import(src));
 }
 
 const name = 'hippo-memory';
@@ -246,7 +249,11 @@ function apply(ctx, config = {}) {
       mkdirSync(dbDir, { recursive: true });
       const inst = new HippoMemory({
         dbPath: join(dbDir, `${cfg.sharedStore ? 'shared' : key}.db`),
-        options: embedderOptions()
+        options: embedderOptions(),
+        // Lazy open: a store that does not exist yet is held in memory, so
+        // read-only traffic (digest renders, recall, list) cannot litter the
+        // storages directory with empty files. The first write materializes it.
+        createFile: false
       });
       stores.set(key, { inst });
       if (embedState === 'ready' && embedProvider) {
@@ -416,7 +423,23 @@ function apply(ctx, config = {}) {
           confidence: args.confidence ?? 'high'
         });
         invalidateDigest(agentKey);
-        return cleanJson({ ok: true, outcome: res.outcome, id: res.memory.id, version: res.memory.version, summary: res.memory.summary });
+        return cleanJson({
+          ok: true,
+          outcome: res.outcome,
+          id: res.memory.id,
+          version: res.memory.version,
+          summary: res.memory.summary,
+          // An override archives the previous revision instead of erasing it.
+          // Say so explicitly: silent versioning reads as data loss.
+          superseded: res.superseded
+            ? {
+                id: res.superseded.id,
+                version: res.superseded.version,
+                summary: res.superseded.summary,
+                note: 'previous revision archived (recoverable via memory_maintain history with this id)'
+              }
+            : undefined
+        });
       },
       presentCall: (args) => present('Remember', 'write', args.summary)
     }));
@@ -428,7 +451,7 @@ function apply(ctx, config = {}) {
         query: { type: 'string', required: true, description: 'The question / retrieval cue, natural language.' },
         entities: { type: 'array', items: { type: 'string' }, description: 'Restrict to memories about these entities.' },
         kind: { type: 'string', enum: ['episode', 'semantic', 'procedure'], description: 'Restrict to one kind.' },
-        limit: { type: 'number', description: 'Max hits (default 5, max 10).' }
+        limit: { type: 'number', description: 'Max hits (default 8, max 20).' }
       },
       output: outputOf(),
       async execute(args, exec) {
@@ -436,7 +459,7 @@ function apply(ctx, config = {}) {
         const store = storeFor(sanitize(agentIdOf(exec)));
         const res = await store.recall(
           { query: args.query, entities: args.entities, kind: args.kind },
-          Math.min(args.limit ?? 5, 10)
+          Math.min(args.limit ?? 8, 20)
         );
         return cleanJson({
           hits: res.hits.map((h) => ({
@@ -448,10 +471,19 @@ function apply(ctx, config = {}) {
             source: h.source,
             occurredAt: h.occurredAt,
             score: Number(h.score.toFixed(3)),
+            similarity: Number(h.similarity.toFixed(3)),
+            relativeScore: h.relativeScore,
+            literalMatch: h.literalMatch,
             consolidated: h.consolidated
           })),
           warnings: res.warnings,
-          scanned: res.scanned
+          scanned: res.scanned,
+          // Explain an empty result instead of leaving the caller guessing.
+          reason: res.reason,
+          eligible: res.eligible,
+          bestSimilarity: res.bestSimilarity,
+          threshold: res.threshold,
+          nearMisses: res.nearMisses
         });
       },
       presentCall: (args) => present('Recall', 'read', args.query)
@@ -482,9 +514,9 @@ function apply(ctx, config = {}) {
 
     reg(defineTool({
       name: 'memory_maintain',
-      description: 'Long-term memory housekeeping. consolidate: abstract well-established episodes into durable semantic rules. forget: decay / soft-delete weak traces (preview with dry_run). stats: store summary. list: newest-first inventory of active memories. history: show revision history of one memory id. delete: permanently remove a memory by id. status: embedder/plugin state.',
+      description: 'Long-term memory housekeeping. consolidate: abstract well-established episodes into durable semantic rules. forget: decay / soft-delete weak traces (preview with dry_run). stats: store summary. list: newest-first inventory of active memories. history: show revision history of one memory id. delete: permanently remove a memory by id. prune: delete store files that hold no memories. status: embedder/plugin state.',
       parameters: {
-        action: { type: 'string', required: true, enum: ['consolidate', 'forget', 'stats', 'list', 'history', 'delete', 'status'], description: 'Which maintenance action to run.' },
+        action: { type: 'string', required: true, enum: ['consolidate', 'forget', 'stats', 'list', 'history', 'delete', 'prune', 'duplicates', 'status'], description: 'Which maintenance action to run. "duplicates" reports near-duplicate restatements (read-only).' },
         id: { type: 'string', description: 'Memory id (history/delete action).' },
         dry_run: { type: 'boolean', description: 'forget: preview without mutating (default true).' },
         limit: { type: 'number', description: 'list: max entries (default 50).' }
@@ -520,6 +552,30 @@ function apply(ctx, config = {}) {
         if (args.action === 'history') {
           if (!args.id) return { error: 'history requires an id' };
           return cleanJson({ history: store.history(args.id) });
+        }
+        if (args.action === 'prune') {
+          // Sweep store files that hold no memories and no history — the
+          // residue of read-only agent stores created before lazy opening.
+          const dbDir = join(dshHome(), 'storages', 'hippo-memory');
+          const live = new Set(stores.keys());
+          const removed = pruneEmptyStores
+            ? pruneEmptyStores(dbDir, { minAgeMs: 0, skip: live })
+            : [];
+          return cleanJson({ pruned: removed.length, files: removed });
+        }
+        if (args.action === 'duplicates') {
+          // Read-only report: near-duplicate restatements (e.g. an episode and
+          // the "FACT: …" rule abstracted from it). Nothing is deleted here.
+          const res = store.duplicates();
+          return cleanJson({
+            scanned: res.scanned,
+            groupCount: res.groups.length,
+            duplicateMemories: res.groups.reduce((n, g) => n + g.memories.length - 1, 0),
+            groups: res.groups,
+            note: res.groups.length
+              ? 'review, then remove redundant ids with action "delete" (history is removed with the row)'
+              : 'no near-duplicate restatements found'
+          });
         }
         if (args.action === 'delete') {
           if (!args.id) return { error: 'delete requires an id' };
@@ -602,6 +658,22 @@ function apply(ctx, config = {}) {
     // at boot pulls sharp/libvips native libraries that slow `dsh web` startup
     // and print GLib-GObject warnings. The model loads lazily on first digest
     // render (kickEmbedder) or when the user flips the setting to auto.
+
+    // Housekeeping: sweep empty store files left by earlier versions (read-only
+    // access used to create one file per agent). Deferred and fully guarded so
+    // it can never delay or break boot.
+    setTimeout(() => {
+      try {
+        if (!pruneEmptyStores) return;
+        const removed = pruneEmptyStores(join(dshHome(), 'storages', 'hippo-memory'), {
+          minAgeMs: 60_000,
+          skip: stores.keys()
+        });
+        if (removed.length) ctx.logger?.info?.(`hippo-memory: pruned ${removed.length} empty store file(s)`);
+      } catch {
+        /* housekeeping only */
+      }
+    }, 5000).unref?.();
   }
 
   // dispose on unload

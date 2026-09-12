@@ -96,7 +96,10 @@ memory_history（每次 update/override 自动归档旧版本 → 可审计、�
    ├─ recall(query, {entities, since, kind, excludeIds})
    │      语义相似 × importance 加权排序
    │      → 命中带 provenance（source/confidence/version/occurredAt）
+   │      → 每个命中三个分数：similarity（原始余弦）/ score（加权）/ relativeScore（本次相对）
+   │      → 标识符精确命中（0x… / D-387 / sha）即使低于阈值也召回，标 literalMatch
    │      → 冲突警告：同实体域存在更新的版本时提示（防陈旧事实）
+   │      → 空结果可解释：reason + eligible + bestSimilarity + threshold + nearMisses
    │
    ├─ sourceMonitor(claim)      ← 断言前的"前额叶检查"
    │      ├─ SUBSTANTIATED（有证据）
@@ -111,6 +114,18 @@ memory_history（每次 update/override 自动归档旧版本 → 可审计、�
 - **recall 负责"把可能相关的找出来"**——召回；
 - **sourceMonitor 负责"这条能不能断言"**——准确性的守门员；
 - **composeContext 负责"现在该把哪几条放进窗口"**——工作记忆门控，防超载。
+
+### 分数口径必须区分（易错点）
+
+两条路径报的数**不是同一个量**，混着比会得出错误结论：
+
+| 路径 | 报的数 | 是否含 importance 加权 |
+|---|---|---|
+| `sourceMonitor(claim)`（= `memory_verify`） | 单条最佳 1-NN 的**原始余弦** | 否 |
+| `recall().hits[].score` | `similarity × (0.6 + 0.4·importance)` | 是 |
+| `recall().hits[].similarity` | **原始余弦** | 否（与第一行同口径） |
+
+因此 `sourceMonitor` **不是**"更强的召回入口"：它只取单条最佳、不做重要性加权、也不返回 provenance 列表。它是断言前的是非裁决，不是检索器。要跨工具比较，用 `similarity`。
 
 ---
 

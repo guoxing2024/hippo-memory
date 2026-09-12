@@ -6,11 +6,27 @@
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { apply, SettingsSchema } from '../lib/index.js';
+// Engine resolved relative to the repo (same file the adapter falls back to).
+const { HippoMemory } = await import(new URL('../../../dist/index.js', import.meta.url).href);
+
+/** Point DSH_HOME at a fresh temp dir; returns the dir and a restore fn. */
+function useTempHome(prefix = 'hippo-adapter-home-') {
+  const prev = process.env.DSH_HOME;
+  const d = mkdtempSync(join(tmpdir(), prefix));
+  process.env.DSH_HOME = d;
+  return {
+    dir: d,
+    restore: () => {
+      if (prev === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = prev;
+    }
+  };
+}
 
 const here = dirname(fileURLToPath(import.meta.url));
 let dir;
@@ -128,6 +144,37 @@ test('remember → recall round-trip in the per-agent store', async () => {
   assert.equal(r.hits[0].summary, 'engine embedder -> configurable');
   assert.equal(typeof r.hits[0].score, 'number');
   assert.ok(r.hits[0].version >= 1);
+  // score transparency: three distinct views of the same hit
+  assert.equal(typeof r.hits[0].similarity, 'number');
+  assert.equal(typeof r.hits[0].relativeScore, 'number');
+  assert.ok(r.hits[0].relativeScore > 0 && r.hits[0].relativeScore <= 1.0001);
+  // diagnostics are always present, so a caller need not guess
+  assert.equal(typeof r.scanned, 'number');
+  assert.equal(typeof r.eligible, 'number');
+  assert.equal(typeof r.threshold, 'number');
+  assert.equal(r.reason, 'ok');
+  assert.ok(Array.isArray(r.nearMisses));
+});
+
+test('recall on an empty result explains the reason and near misses', async () => {
+  const r = await toolExec('memory_recall', { query: 'zzz nothing resembles this at all qqq' });
+  assert.equal(r.hits.length, 0);
+  assert.ok(['below-threshold', 'no-candidates'].includes(r.reason), `reason reported: ${r.reason}`);
+  assert.equal(typeof r.threshold, 'number');
+  assert.ok(Array.isArray(r.nearMisses));
+});
+
+test('remember reports superseded revision on override', async () => {
+  const a = await toolExec('memory_remember', { kind: 'semantic', summary: 'linker -> lld', source: 'user' });
+  assert.equal(a.outcome, 'new');
+  // no revision replaced: cleanJson normalizes the absent field to null.
+  assert.ok(!a.superseded, `nothing superseded yet: ${JSON.stringify(a.superseded)}`);
+  const b = await toolExec('memory_remember', { kind: 'semantic', summary: 'linker -> mold', source: 'user' });
+  assert.equal(b.outcome, 'override');
+  assert.ok(b.superseded, 'override names the replaced revision');
+  assert.equal(b.superseded.id, a.id);
+  assert.ok(b.superseded.version >= 1);
+  assert.ok(b.superseded.note.includes('history'), 'says how to recover it');
 });
 
 /* ------------------------- verify explainability ------------------------- */
@@ -186,6 +233,59 @@ test('maintain delete removes a memory by id', async () => {
 
 /* ------------------------- isolation & cleanup ------------------------- */
 
+test('read-only traffic leaves no store file; first write creates it', async () => {
+  const home = useTempHome('hippo-adapter-lazy-');
+  const mark = disposers.length;
+  try {
+    fakeCtx();
+    const agent = { agent: { id: 'lazy-reader-agent' } };
+    const storePath = join(home.dir, 'storages', 'hippo-memory', 'lazy-reader-agent.db');
+
+    // Pure reads: no file may appear.
+    await toolExec('memory_recall', { query: 'nothing stored yet' }, agent);
+    await toolExec('memory_maintain', { action: 'list' }, agent);
+    await toolExec('memory_maintain', { action: 'stats' }, agent);
+    assert.equal(existsSync(storePath), false, 'reads created no file');
+
+    // First write materializes it.
+    await toolExec('memory_remember', { kind: 'semantic', summary: 'lazy adapter -> file on write', source: 'user' }, agent);
+    assert.equal(existsSync(storePath), true, 'write created the file');
+  } finally {
+    // Disposing closes the temp stores (so the dir is deletable) but also
+    // unregisters their tools — rebuild the shared registry afterwards.
+    for (const dispose of disposers.splice(mark)) dispose();
+    home.restore();
+    fakeCtx();
+  }
+  rmSync(home.dir, { recursive: true, force: true });
+});
+
+test('maintain prune sweeps empty store files', async () => {
+  const home = useTempHome('hippo-adapter-prune-');
+  const mark = disposers.length;
+  try {
+    fakeCtx();
+    // Simulate legacy residue: an empty store file (aged past the guard).
+    const residueDir = join(home.dir, 'storages', 'hippo-memory');
+    mkdirSync(residueDir, { recursive: true });
+    const residue = join(residueDir, 'stale-agent.db');
+    const stale = new HippoMemory({ dbPath: residue });
+    stale.close();
+    const old = new Date(Date.now() - 3600_000);
+    utimesSync(residue, old, old);
+
+    const res = await toolExec('memory_maintain', { action: 'prune' }, { agent: { id: 'pruner' } });
+    assert.ok(res.pruned >= 1, 'at least the residue store pruned');
+    assert.ok(res.files.includes('stale-agent.db'), 'residue named in the result');
+    assert.equal(existsSync(residue), false, 'residue file removed');
+  } finally {
+    for (const dispose of disposers.splice(mark)) dispose();
+    home.restore();
+    fakeCtx(); // restore tool registrations removed by disposal
+  }
+  rmSync(home.dir, { recursive: true, force: true });
+});
+
 test('different agents get separate stores by default', async () => {
   const idA = 'alpha-agent';
   const idB = 'beta-agent';
@@ -196,9 +296,8 @@ test('different agents get separate stores by default', async () => {
 
 test('shared store mode makes memories visible across agents', async () => {
   // Re-apply with sharedStore true through the settings section.
-  const orig = process.env.DSH_HOME;
-  const dir2 = mkdtempSync(join(tmpdir(), 'hippo-adapter-shared-'));
-  process.env.DSH_HOME = dir2;
+  const home = useTempHome('hippo-adapter-shared-');
+  const dir2 = home.dir;
   const effects = [];
   const t2 = new Map();
   const svc = {
@@ -228,6 +327,6 @@ test('shared store mode makes memories visible across agents', async () => {
   const rb = await run('memory_recall', { query: 'shared fact', limit: 5 }, execB);
   assert.ok(rb.hits.length >= 1, 'shared store visible across agents');
   for (const dispose of effects.splice(0)) dispose(); // closes DBs
-  process.env.DSH_HOME = orig;
+  home.restore();
   rmSync(dir2, { recursive: true, force: true });
 });

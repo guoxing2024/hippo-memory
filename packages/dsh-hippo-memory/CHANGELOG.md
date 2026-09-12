@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.1.8] — 2026-09-12
+
+### Added
+- `memory_recall` 可解释性：返回 `reason` / `eligible` / `bestSimilarity` / `threshold` / `nearMisses`，空结果会说明原因（`below-threshold` 有相关记忆但没过门槛 vs `no-candidates` 库里没有或全被筛掉），不再只给一个空数组
+- `memory_recall` 每个命中给出三个分数：`similarity`（原始余弦，与 `threshold`、与 `memory_verify` 同口径，可直接比较）、`score`（含重要性加权 sim × (0.6 + 0.4·importance)，上限 1.0）、`relativeScore`（本次查询内相对分，1.0 = 本次最佳）；`literalMatch` 标记标识符（0x… / D-387 / commit sha）精确命中数
+- `memory_recall` 默认条数 5 → 8（上限 10 → 20）
+- `memory_remember` 覆盖时返回 `superseded`（被替换的 id / 版本 / 摘要 + 恢复方式），版本化覆盖不再静默
+- `memory_maintain duplicates`：只读报告近似重复记忆（跨 kind 比对，自动忽略 `FACT: `前缀与大小写/标点差异），确认后再用 `delete` 清理
+
+### Changed
+- 依赖 `hippo-memory-core` 收紧为 `^0.1.6`（新字段与新动作依赖该版本；此前 `^0.1.0` 会允许装上缺这些 API 的旧核心）
+
+### Fixed
+- 相同事实的 episode 与 `FACT: `规则不再并存（引擎侧合并漏判已修，见 core 0.1.6）
+
+## [0.1.7] — 2026-09-10
+
+### Added
+- `memory_maintain prune`：清理空库文件（返回清理数量与文件名）
+- 启动后台自动清理空库（延迟 5 秒、完全兜底，不影响启动）
+
+### Fixed
+- 存储目录不再堆积空库文件：库改为按需创建——只读访问驻留内存，首次写入才生成 `.db`
+- 说明：此前每渲染一次 digest、每调用一次 recall/list 都会为对应 agent 建一个库文件（实测一天新增 35 个，其中 24 个为空）
+
 ## [0.1.6] — 2026-09-07
 
 ### Changed

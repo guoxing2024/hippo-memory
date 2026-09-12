@@ -134,11 +134,39 @@ agent: （不用你复述）好，上次冻结在 51/8，我先从 D-284 解冻�
 | 工具 | 关键参数 | 示例意图 |
 |---|---|---|
 | memory_remember | kind: `semantic`/`episode`/`procedure`; summary; detail; entities; tags; confidence | "记下：Core.dll 脱壳状态 -> 阻塞中（D-284 攻坚中）" |
-| memory_recall | query; entities; kind; limit | "查一下之前关于 Core.dll 的结论" |
+| memory_recall | query; entities; kind; limit | "查一下之前关于 Core.dll 的结论"——返回 `similarity`（原始余弦）、`score`（含重要性加权）、`relativeScore`（本次查询内的相对分，1.0 = 最佳） |
 | memory_verify | claim | "核对我说的'快照重建路线已判死'有没有依据"——返回三态 + 命中记忆详情；未命中时会给出 `closest`（最接近的候选），方便你判断"差一点"的是哪条 |
-| memory_maintain | action: `consolidate`/`forget`/`stats`/`list`/`history`/`delete`/`status` | "整理记忆 / 看记忆统计 / 列出全部记忆 / 查某条版本史 / 永久删除某条 / 查插件与嵌入模型状态" |
+| memory_maintain | action: `consolidate`/`forget`/`stats`/`list`/`history`/`delete`/`prune`/`duplicates`/`status` | "整理记忆 / 看记忆统计 / 列出全部记忆 / 查某条版本史 / 永久删除某条 / 清理空库文件 / 查重复记忆 / 查插件与嵌入模型状态" |
 
-**写记忆的最佳实践**：summary 用一句话，格式 **"<主体> -> <结论>"**（例如 `billing service db -> postgres`）。这个格式能触发"纠错覆盖"机制：用户后来纠正为 mysql 时，旧记忆自动版本化存档（v1→v2），查到的永远是最新值，且 `history` 可查演变。
+**写记忆的最佳实践**：summary 用一句话，格式 **"<主体> -> <结论>"**（例如 `billing service db -> postgres`）。这个格式能触发"纠错覆盖"机制：用户后来纠正为 mysql 时，旧记忆自动版本化存档（v1→v2），查到的永远是最新值，且 `history` 可查演变。被覆盖时 `memory_remember` 会返回 `superseded`（含被替换的 id / 版本 / 摘要），所以覆盖**不是静默丢数据**，旧版随时可查。
+
+**为什么 recall 空结果也能解释**
+
+检索空手而归时，返回里会明确写出原因，不再是一个空数组让人猜：
+
+| 字段 | 含义 |
+|---|---|
+| `reason` | `ok` / `below-threshold`（有相关记忆但都没过相似度门槛）/ `no-candidates`（库里没有或全被筛掉）/ `empty-cue`（没给 query） |
+| `eligible` | 通过结构筛选（kind / entities / 重要性 / 时间）的条数 |
+| `bestSimilarity` | 这批候选里最高的原始余弦 |
+| `threshold` | 本次生效的相似度门槛 |
+| `nearMisses` | 最接近的几条（含分值与摘要），一眼看出"差一点"的是哪条 |
+
+**三个分数怎么看**
+
+- `similarity`：**原始余弦**，与 `threshold`、与 `memory_verify` 的分**同口径**，可直接比较。判断"像不像"以它为准。
+- `score`：排序用的分数 = `similarity × (0.6 + 0.4 × importance)`，再叠加标识符命中加成，上限 1.0。它**不等于**相似度，所以看起来会比 `similarity` 高或低。
+- `relativeScore`：`similarity ÷ 本次最高 similarity`。余弦值本身被压缩且依赖查询（0.45 也可能是全库最佳），这个字段直接说明"这条是本次最相关的几条之一"，1.0 = 本次最佳。
+
+> 曾有人观察到 "verify 给 0.604，recall 却只给 0.449"——那不是两个工具能力不同，而是**口径不同**：verify 报原始余弦，recall 报含重要性乘数的 `score`。现在 `similarity` 字段让两者可直接对照。
+
+**标识符（0x… / D-387 / commit sha）为什么能命中**
+
+裸标识符做嵌入查询时余弦往往很低（尤其短中文 query），但**精确 token 命中**是比余弦更强的证据。因此当 query 与记忆共享标识符时，该条即使低于门槛也会被召回，命中里标 `literalMatch`（共享 token 数），排序时也有加成。这只影响召回与排序，`similarity` 始终是真实余弦。
+
+**重复记忆怎么查**
+
+`memory_maintain` 的 `duplicates` 动作是**只读报告**，不会删任何东西。重复主要来自整合（consolidate）：episode 被抽象成规则时，规则正文与 episode 完全相同、只多一个 `FACT: ` 前缀，于是两条并存。报告会列出这些组，你确认后再用 `delete` 逐条清理。
 
 ---
 

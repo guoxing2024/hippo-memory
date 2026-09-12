@@ -143,12 +143,28 @@ await mem.remember({
 });
 
 // ── 读取（线索驱动模式完成）
-const { hits, warnings } = await mem.recall(
+const { hits, warnings, reason, nearMisses } = await mem.recall(
   { query: 'billing 服务现在用什么数据库？', entities: ['billing'] },
-  5
+  8
 );
+// 每个命中带三个分数，别再拿 score 当相似度看：
+//   similarity    原始余弦 —— 与 similarityThreshold、与 sourceMonitor 同口径，可直接比较
+//   score         排序分 = similarity × (0.6 + 0.4·importance)，上限 1.0
+//   relativeScore similarity ÷ 本次最高 similarity（1.0 = 本次最佳）
+// hits[0].similarity   // 0.62
+// hits[0].score        // 0.545
+// hits[0].relativeScore// 1
+// hits[0].literalMatch // 命中的标识符 token 数（0x… / D-387 / commit sha）
+
+// 空结果不是黑箱：reason 说明为什么没命中
+if (hits.length === 0) {
+  reason;       // 'below-threshold' 有相关记忆但没过门槛 | 'no-candidates' 库里没有或全被筛掉 | 'empty-cue'
+  nearMisses;   // [{ id, summary, similarity }] 最接近的几条，一眼看出"差一点"的是哪条
+}
 
 // ── 断言前源监控（前额叶）：substantiated / contradicted / unsubstantiated
+// 注意：这里报的是**原始余弦**（单条最佳 1-NN，不含重要性加权），
+// 所以它的分与 recall 的 `similarity` 同口径，而不是 recall 的 `score`。
 const v = await mem.sourceMonitor('billing 服务使用 postgres');
 if (v.contradicted)        /* 记忆里有反证，别这么断言 */;
 if (!v.substantiated)      /* 查无实据 → 回答"不知道"而非编造 */;
@@ -160,6 +176,15 @@ const { context } = await mem.composeContext('修复 billing 迁移后的连接�
 await mem.consolidate();          // 系统巩固：情景 → 语义规则
 mem.forget({ dryRun: true });     // 自适应遗忘（预览）
 mem.history(id);                  // 版本历史（再巩固审计）
+mem.duplicates();                 // 只读报告近似重复（跨 kind，忽略 "FACT: " 前缀），不删除
+```
+
+写入被版本化覆盖时，返回值会说明被替换掉的是哪一条：
+
+```ts
+const res = await mem.remember({ kind: 'semantic', summary: 'build cache -> disabled', entities: [{ name: 'cache' }] });
+res.outcome;     // 'new' | 'none'（复述强化）| 'merge' | 'override'
+res.superseded;  // 仅 override：{ id, version, summary } —— 旧版已存档，mem.history(id) 可查
 ```
 
 ### 选项
@@ -170,7 +195,7 @@ new HippoMemory({
   options: {
     nearDuplicateThreshold: 0.92,   // 余弦高于此 → 视为同一记忆
     contradictionThreshold: 0.86,   // 余弦高于此 → 视为"同事件、异声明"冲突
-    similarityThreshold: 0.4,       // recall 最低余弦
+    similarityThreshold: 0.32,      // recall 最低余弦（默认 0.32；离线哈希嵌入对中文/短语的绝对余弦偏低，0.4 会误杀真实命中）
     minImportance: 0,               // recall 重要度下限
     topK: 20,
     forgetAfterSec: 60*60*24*120,   // 闲置多久可被遗忘
@@ -236,6 +261,61 @@ npm run bench
 | 自适应遗忘 | 突触降标/神经发生 | `forget` 强度衰减 + 软删除 |
 
 完整设计讨论见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
+---
+
+## 召回质量：分数、空结果与重复治理
+
+### 为什么不能把 `score` 当相似度看
+
+早期只暴露一个 `score`，于是出现过"`memory_verify` 给 0.604、`memory_recall` 只给 0.449，是不是 recall 更弱"的误判。其实是**两个口径**：
+
+| 途径 | 报的数 | 含义 |
+|---|---|---|
+| `sourceMonitor(claim)` / `memory_verify` | 原始余弦 | 单条最佳 1-NN，**不含**重要性加权 |
+| `recall().hits[].score` | `sim × (0.6 + 0.4·importance)` | 排序用，天然与余弦不同 |
+| `recall().hits[].similarity` | **原始余弦** | 与上面第一行、与 `similarityThreshold` **同口径**，可直接比较 |
+
+`memory_verify` 不是"更强的召回入口"：它只取单条最佳、不做重要性加权、也不给 provenance 列表——它是**断言前的是非裁决**，不是检索器。要对比就用 `similarity`。
+
+### 空结果一定给得出理由
+
+`recall()` 返回 `reason`，把"没找到"拆成可行动的情况：
+
+| reason | 含义 | 该怎么办 |
+|---|---|---|
+| `ok` | 有命中 | — |
+| `below-threshold` | 有相关记忆，但都没过 `similarityThreshold` | 看 `nearMisses` 判断是"真没有"还是"门槛偏高" |
+| `no-candidates` | 库里没有，或全被结构筛选（kind/entities/重要性/时间）滤掉 | 确认筛选条件是否过严 |
+| `empty-cue` | 没给 query（如首轮渲染） | 返回最近更新记忆兜底 |
+
+配套字段：`eligible`（通过结构筛选的条数）、`bestSimilarity`（这批里最高的原始余弦）、`threshold`（本次生效门槛）、`nearMisses`（最接近的几条，含分值与摘要）。
+
+### 标识符查询：为什么"精确 token 命中"要压过余弦
+
+裸标识符（`0x6070`、`D-387`、commit sha、版本号）做嵌入查询时余弦极低——短中文 query 尤其明显。但**精确 token 命中是比余弦更强的证据**。因此当 query 与记忆共享标识符时，该条即使低于门槛也会被召回，命中里标 `literalMatch`（共享 token 数）并获排序加成。
+
+生产库（167 条记忆）实测，277 条标识符查询：
+
+| | Top-1 命中率 | MRR |
+|---|---|---|
+| 无字面加权 | 10.5% | 0.195 |
+| 有字面加权 | **99.6%** | **0.998** |
+
+`similarity` 始终是真实余弦，加权只影响召回与排序。
+
+### 重复从哪来、怎么清
+
+主要来源是**整合本身**：`consolidate()` 把 episode 抽象成规则时，规则正文可能与 episode 完全相同、只多一个 `FACT: ` 前缀，于是两条并存。写入路径的跨类型合并现已统一剥离该前缀，重述会正确并入原记忆。
+
+已存在的重复用只读报告查看（**不会删任何东西**）：
+
+```ts
+mem.duplicates();
+// { scanned, groups: [{ key, memories: [{ id, kind, version, summary }] }] }
+```
+
+确认后再用 `delete(id)` 逐条清理（注意：会连版本历史一起删，不可恢复）。
 
 ---
 
