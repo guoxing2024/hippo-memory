@@ -34,6 +34,17 @@
 
 ---
 
+## 🆕 0.2.1 —— 引擎支持 Bun（可在 opencode 里直接用）
+
+> `hippo-memory-core` 0.2.1：SQLite 驱动改成**运行时探测**（Node 用 `node:sqlite`，Bun 用 `bun:sqlite`），导入不再因运行时不同而失败。
+> **实测**：在 opencode 1.18.31（内嵌 Bun 1.3.14）里 `import("hippo-memory-core")` → `driver=bun:sqlite`，remember / recall / verify / digest / diagnostics 全部正常，**无需打包、无需垫片**。
+> Node 侧行为与数据格式不变，137→140 项测试全绿。详见 [CHANGELOG](CHANGELOG.md)。
+
+```js
+import { HippoMemory, sqliteDriver } from 'hippo-memory-core';
+console.log(sqliteDriver);   // 'node:sqlite' on Node, 'bun:sqlite' on Bun
+```
+
 ## 🆕 0.2.0 有什么新东西
 
 > 本版是一个大版本：把此前所有未发布的改动合并，并修掉了实测反馈中**唯一会造成数据丢失**的一类事故——无 warning 的静默覆盖。
@@ -74,7 +85,7 @@ npm run bench        # 反幻觉基准：长会话 有/无 记忆对比
 node examples/quickstart.mjs   # 可运行的用法演示
 ```
 
-Node ≥ 22.5（使用内置 `node:sqlite`，无需安装 SQLite）。
+**运行时**：Node ≥ 22.5（内置 `node:sqlite`）**或** Bun（内置 `bun:sqlite`）——两个驱动都由引擎在加载期自动探测，无需配置、无需安装原生模块。也就是说同一个包也能跑在 **opencode** 这类 Bun 宿主里（0.2.1 起），详见下节。
 
 ---
 
@@ -421,7 +432,8 @@ Agent 会读网页，网页里可能有 ignore all previous instructions 这类�
 
 - 模型参数知识本身的错误（需要工具 / RAG / 知识图谱）；
 - 纯解码随机性导致的胡言（需要采样控制）；
-- 需要跨机器共享记忆的场景（当前为单进程 SQLite；共享库文件的并发写已由 busy_timeout 保护，但尚无跨机器同步）。
+- 需要跨机器共享记忆的场景（当前为单进程 SQLite；共享库文件的并发写已由 busy_timeout 保护，但尚无跨机器同步）；
+- **opencode 等非 DSH 宿主目前没有官方适配包**——引擎能在 Bun 上跑（0.2.1 起），但工具 / 自动注入 / 纪律那一层是 DSH 专属的，见 [ROADMAP](ROADMAP.md)。
 
 且与人脑一样，本系统**允许遗忘与重构**——它保证凡断言有据、无据则明说，不保证永不犯错。
 

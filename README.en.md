@@ -19,7 +19,7 @@ Local-first, zero external services: SQLite via Node's built-in `node:sqlite`, o
 | **dsh-hippo-memory** | DSH plugin — memory tools, automatic digest injection, usage guidance, GUI settings card | `dsh plugin --profile web add dsh-hippo-memory` |
 | **hippo-memory-core** | Framework-agnostic engine (use in any agent loop) | `npm install hippo-memory-core` |
 
-Both are at **0.2.0**. Upgrade: `dsh plugin --profile <profile> update dsh-hippo-memory`, then restart the profile. Stores need **no migration**.
+Both packages are at **0.2.0 / 0.2.1 core**. Engine **0.2.1** adds **Bun support**: the SQLite driver is detected at load time (`node:sqlite` on Node, `bun:sqlite` on Bun), so `hippo-memory-core` now imports and runs inside Bun hosts such as **opencode** (verified on opencode 1.18.31 / Bun 1.3.14: remember, recall, verify, digest and diagnostics all work — no bundling, no shims). `sqliteDriver` tells you which driver is active; `setSqliteDriver()` lets you plug your own. Upgrade: `dsh plugin --profile <profile> update dsh-hippo-memory`, then restart the profile. Stores need **no migration**.
 
 ## Quick start (DSH)
 
@@ -65,7 +65,7 @@ const v = await mem.sourceMonitor('billing service database is postgres');
 // v.substantiated ? 'safe to assert' : 'answer: not in my memory'
 ```
 
-Node ≥ 22.5 (built-in `node:sqlite`). Tests: `npm test` (**107 engine + 30 adapter**, all green). Bench: `npm run bench`.
+Runtime: Node ≥ 22.5 (`node:sqlite`) **or** Bun (`bun:sqlite`) — the driver is auto-detected at load time, so the same package also runs inside Bun hosts such as **opencode**. Tests: `npm test` (**140 engine + adapter**, all green). Bench: `npm run bench`.
 
 ## Roadmap & issues
 

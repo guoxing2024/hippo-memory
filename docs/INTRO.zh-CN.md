@@ -51,6 +51,11 @@ dsh web
 **场景三：压低编造率**
 > 告诉 agent："引用旧事实前先用 `memory_verify` 核对，查无实据就明说，不要编。"编造率肉眼可见下降。
 
+## 0.2.1（本版）—— 引擎支持 Bun
+
+> `hippo-memory-core` 现在**运行时探测** SQLite 驱动：Node 用 `node:sqlite`、Bun 用 `bun:sqlite`。这意味着**引擎可以直接跑在 opencode 里**（实测 opencode 1.18.31 / Bun 1.3.14，无需打包无需垫片）。
+> ⚠️ 但 **DSH 插件 `dsh-hippo-memory` 仍然不能装到 opencode** —— 适配层是宿主专属的，opencode 版本（`opencode-hippo-memory`）在计划中。
+
 ## 0.2.0 新东西（一句话版）
 
 - **纠正链**：verify 返回四组邻域证据（反极性行 / 更新的结论 / 被退役的行 / 支持已过期），remember 回显最近邻并支持显式 `supersedes`；

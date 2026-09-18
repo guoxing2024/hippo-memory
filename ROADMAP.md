@@ -14,6 +14,12 @@ Open, living plan — ordered by expected user impact. PRs welcome on any item.
 - [ ] Export/import a store as JSON (backup + migration)
 - [ ] `memory_maintain history` output rendered as a readable version diff
 
+## v0.2.x — other hosts
+
+- [x] **Engine runs on Bun** (core 0.2.1): runtime driver detection (`node:sqlite` / `bun:sqlite`) + lazy loading, so the package imports and runs inside Bun hosts such as opencode — verified end-to-end on opencode 1.18.31 / Bun 1.3.14
+- [ ] **`opencode-hippo-memory`** (in this repo under `packages/`): opencode plugin packaging the 4 memory tools (via `tool()`), digest injection (`experimental.chat.messages.transform` / `experimental.chat.system.transform`), pre-compaction carry-over (`experimental.session.compacting`) and the usage discipline
+- [ ] Adapter tests against a mocked opencode plugin host
+
 ## v0.3.x — semantic memory
 
 - [ ] `scope` field: declare an explicit scope (project / repo / session group) so conflict detection and recall filtering stop guessing from entity overlap — this makes the current heuristic a contract
@@ -38,4 +44,5 @@ Open, living plan — ordered by expected user impact. PRs welcome on any item.
 - [x] 0.1.4/0.1.6 — lazy model load (faster `dsh web` startup), digest blank fix, `memory_maintain delete`, read-path model-ready guard
 - [x] 0.1.5/0.1.6 — docs sync; CHANGELOG shipped in the npm package files
 - [x] core 0.1.6 / adapter 0.1.8 — recall explainability (reason/eligible/bestSimilarity/threshold/nearMisses), three score views (similarity/score/relativeScore), literal identifier matching (Top-1 10.5% → 99.6% on 277 real queries), `memory_maintain duplicates` report, `superseded` on override, FACT:-prefix merge fix, lazy store open + prune empty-store sweep
+- [x] core 0.2.1 — **Bun runtime support**: driver resolved at load time (Node `node:sqlite` / Bun `bun:sqlite`) with lazy builtin loading, `sqliteDriver` + `setSqliteDriver()` exports, store auto-creates its parent directory; 140 engine tests green; verified inside opencode
 - [x] **0.2.0 — the anti-hallucination release (both packages)**: correction chain (verify evidence groups + neighbour echo + explicit `supersedes` edges); evidence / retraction / prospective guards with TTL; two-gate override (content + claim cosine) after the silent-override incident and its recurrence; injection guard on every output path + `[memory data]` frame; spaced repetition (`0.01 + 0.03·log2(1+days)`) + explicit `importance`; shared-store concurrency (WAL + busy_timeout); `diagnostics()` health; `override-audit`; `compress` / `undemote` schema compression; conflict-detection trigger widening (polarity / shared-entity / claimParts channels); 107 engine + 30 adapter tests green

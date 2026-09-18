@@ -8,10 +8,32 @@
  * past, they archive it).
  */
 
-import { DatabaseSync } from 'node:sqlite';
-import { existsSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { openDatabase, sqliteDriver, setSqliteDriver } from './sqlite-runtime.js';
+import type { SqliteDatabaseLike } from './sqlite-runtime.js';
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { join } from 'node:path';
 import type { MemoryKind, SourceConfidence } from './schema.js';
+
+
+/**
+ * Open (and, when needed, create) the store file.
+ *
+ * Both drivers refuse to open a path whose PARENT DIRECTORY does not exist
+ * ("unable to open database file"), which used to make the first run in a
+ * fresh project / profile fail. Creating the directory here makes the store
+ * self-sufficient on every runtime (Node, Bun, or a custom driver).
+ */
+function openStore(path: string): SqliteDatabaseLike {
+  if (path !== ':memory:') {
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+    } catch {
+      /* let the driver report the real error (e.g. permissions) */
+    }
+  }
+  return openDatabase(path);
+}
 
 /** Row shape exactly as stored (snake_case columns). */
 export interface MemoryRow {
@@ -146,7 +168,7 @@ export interface HistoryRow {
 }
 
 export class SqliteStore {
-  private db: DatabaseSync;
+  private db: SqliteDatabaseLike;
   /** Busy-writer timeout kept so a lazy→disk promotion re-applies it. */
   private readonly busyTimeoutMs: number;
   /** Set while this store has no file on disk yet (lazy mode, empty): reads
@@ -178,12 +200,12 @@ export class SqliteStore {
     const busyTimeoutMs = opts.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS;
     this.busyTimeoutMs = busyTimeoutMs;
     if (opts.create === false && !existsSync(path)) {
-      this.db = new DatabaseSync(':memory:');
+      this.db = openStore(':memory:');
       this.db.exec(SCHEMA);
       this.lazyPath = path;
       return;
     }
-    this.db = new DatabaseSync(path);
+    this.db = openStore(path);
     this.db.exec('PRAGMA journal_mode = WAL;');
     // Shared-store deployments have multiple processes writing the same file
     // (recall's access bookkeeping vs. another agent's remember). WAL alone
@@ -206,7 +228,7 @@ export class SqliteStore {
     const target = this.lazyPath;
     this.lazyPath = null;
     this.db.close();
-    this.db = new DatabaseSync(target);
+    this.db = openStore(target);
     this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.trunc(this.busyTimeoutMs))};`);
     this.db.exec(SCHEMA);

@@ -134,6 +134,23 @@ boost = 0.01 + 0.03·log2(1 + 间隔天数)     （上限 0.12）
 
 这是 Bjork"合意困难"（desirable difficulty）的工程化：**集中重复几乎无增益，间隔重复增益大**。读取路径同样参与（提取练习 / 测试效应，boost × 0.5）——被 `recall` 真正命中的记忆小幅升权，被动出现在 digest 里不算。加上 `memory_remember` 的显式 `importance` 参数，重要性从"恒 0.70 的死参数"变成三个通道共同驱动的活信号。
 
+
+### 运行时绑定（0.2.1 起：Node 与 Bun）
+
+`src/sqlite-runtime.ts` 把"用哪个 SQLite 驱动"从**编译期**（静态 import）推迟到**运行时**（探测 + 惰性 require）：
+
+```
+加载期：globalThis.Bun 是否存在？
+  ├─ 无 → node:sqlite   （Node ≥ 22.5）
+  └─ 有 → node:sqlite 能 load 吗？
+          ├─ 能 → node:sqlite （Bun ≥ 1.4 实现了该内置模块）
+          └─ 不能 → bun:sqlite（Bun 1.1–1.3：Database 包装成 DatabaseSync 最小同构面）
+```
+
+为什么必须这样做：静态导入的说明符要在**加载期**解析，`node:sqlite` 在 Bun 1.3 上直接抛 `No such built-in module` —— 这个错误发生在模块图求值阶段，**catch 不到、也没有垫片能介入**（除非先打包 + 别名替换）。惰性加载后，导入任何运行时都不抛错，只有真正 open() 时才会因为缺少驱动而报错，且错误信息给出可执行的建议。
+
+两个驱动在**开库时都会因为父目录不存在而报 `unable to open database file`**，所以 `openStore()` 会先 `mkdir -p` 目标目录——新项目 / 新宿主第一次跑不再需要人工建目录。
+
 ### 4.3 证据、撤回、前瞻
 
 - **证据**：`verify {cmd, expect, artifact}` + `verifyResult` + `verifiedAt`。引擎**从不执行命令**，只存档 + enforcement：数字主张句（箭头 / 系表）无 passing 证据 → 降级存 episode（`downgraded:` 注记）；渲染按 `evidenceTtlSec`（默认 30 天）区分 `[VERIFIED]` / `[ASSERTED]`；新鲜 VERIFIED 是**护盾**（只能被 passing 证据退休）。

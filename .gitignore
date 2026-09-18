@@ -6,6 +6,7 @@ dist/
 *.tsbuildinfo
 
 # test / bench scratch
+.tmp-build/
 bench/.cache/
 .hippo/
 *.tmp

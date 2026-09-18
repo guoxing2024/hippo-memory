@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.2.1] — 2026-09-18
+
+### Added — Bun 运行时支持（引擎现在直接跑在 opencode 里）
+
+- **运行时 SQLite 绑定（新文件 `src/sqlite-runtime.ts`）**：引擎此前静态 `import { DatabaseSync } from 'node:sqlite'`，这在**加载期**就决定了它只能跑在 Node ≥ 22.5 —— 而 opencode 等 Bun 宿主（实测 Bun 1.3.14）里该内置模块尚不存在，报 `No such built-in module: node:sqlite`，连 `import` 都失败、无法 catch。现在驱动在加载期探测（Bun 有 `bun:sqlite`、Node 有 `node:sqlite`），并通过 `createRequire` / `process.getBuiltinModule` **惰性**加载，模块图里不再出现当前运行时无法解析的说明符：**导入永不抛错，只有真正开库时才会报错**（且信息里写清该升级什么）。
+- **导出运行时信息与自定义驱动**：新增 `sqliteDriver`（值为 `'node:sqlite'` / `'bun:sqlite'`）、`setSqliteDriver(ctor)`（自备适配器，例如 `better-sqlite3` 或测试替身）、以及 `SqliteStatementLike` / `SqliteDatabaseLike` / `SqliteDatabaseCtor` 类型。
+- **Bun 侧适配细节**：`bun:sqlite` 的 `Database@ 被包装成 `DatabaseSync` 的最小同构面（`exec` / `prepare` / `close`，语句对象已含 `run` / `get` / `all`，且 `prepare()` 自带语句缓存）。Bun ≥ 1.4 实现了 `node:sqlite`，届时自动优先走 Node 驱动，无需改代码。
+- **store 自建父目录**：两个驱动在**父目录不存在**时都只报 `unable to open database file`（新项目 / 新 profile 首次运行的坑，Bun 上尤其容易撞上）。开库时现在会自动 `mkdir -p` 目标目录。
+
+**实测（opencode 1.18.31 / Bun 1.3.14，真实 npm 包、无打包、无垫片）**：
+
+```
+import("hippo-memory-core") -> driver=bun:sqlite
+remember -> outcome: new / override（旧版归档，warning 指名退役对象）
+recall   -> 命中 mysql（sim 0.733），reason=ok
+verify   -> superseded_matches=[postgres]（旧值可见）
+digest   -> [memory data …] 数据框架正常
+```
+
+### Notes
+
+- **Node 侧零影响**：`sqliteDriver` 在 Node 上仍是 `'node:sqlite'`，137 项测试全绿（新增 1 项运行时绑定测试）；引擎行为、数据格式、阈值全部未变。
+- 数据文件格式不变，**旧库零迁移**。
+
 ## [0.2.0] — 2026-09-18
 
 > **大版本：抗幻觉四件套（证据 / 撤回 / 前瞻 / 值域）+ 纠正链 + 投毒防护 + 可观测性。**

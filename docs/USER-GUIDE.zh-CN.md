@@ -18,6 +18,7 @@
 11. [故障排查 FAQ](#11-故障排查-faq)
 12. [开发者：在自己的 agent 里用引擎](#12-开发者在自己的-agent-里用引擎)
 13. [反馈与贡献](#13-反馈与贡献)
+14. [在 opencode 里用（Bun 宿主）](#14-在-opencode-里用bun-宿主)
 
 ---
 
@@ -635,6 +636,97 @@ mem.setEmbedder({
 });
 await mem.ensureEmbeddingMigration();   // 一次性重嵌入旧行（返回处理行数）
 ```
+
+
+---
+
+## 14. 在 opencode 里用（Bun 宿主）
+
+> 一句话：**引擎（`hippo-memory-core`）0.2.1 起可以直接跑在 opencode 里**（opencode 用的是 Bun 运行时）；但 **DSH 插件 `dsh-hippo-memory` 不能装到 opencode**。两者是不同宿主，适配层不同。
+
+### 14.1 结论先说
+
+| 东西 | opencode 里能用吗 | 说明 |
+|---|---|---|
+| `dsh-hippo-memory`（DSH 插件） | ❌ 不能 | 它是 DSH profile bundle（`cordis.patch.yml` + `dsh-tools` + DSH 设置卡片），opencode 的插件 API 完全另一套 |
+| `hippo-memory-core`（引擎） | ✅ 能（0.2.1 起） | 引擎原先把 SQLite 驱动写死成 Node 的 `node:sqlite`，而 opencode 的 Bun（实测 1.3.14）还没有这个内置模块，连 `import` 都失败；现在改成运行时探测，Bun 上自动用 `bun:sqlite` |
+| 4 个记忆工具 / 自动注入 / 使用纪律 | ⏳ 需要适配包 | 计划中的 `opencode-hippo-memory`（见 [ROADMAP](../ROADMAP.md)） |
+
+### 14.2 为什么之前不行（一个真实的坑）
+
+Bun 直到 1.4 才实现 Node 的内置 `node:sqlite`；opencode 1.18.x 内嵌的是 Bun 1.3.14。于是引擎在 opencode 里报的是**加载期的错**：
+
+```
+No such built-in module: node:sqlite
+```
+
+注意这是 `import` 阶段的错误，**catch 不到、垫片也救不了**（静态导入的说明符必须在加载期就能解析）。0.2.1 的解法是把驱动选择推迟到运行时：Node 用 `node:sqlite`、Bun 用 `bun:sqlite`，通过 `createRequire` / `process.getBuiltinModule` **惰性**加载——模块图里不再出现当前运行时无法解析的说明符。
+
+### 14.3 怎么确认引擎在你的运行时里活着
+
+```js
+import { HippoMemory, sqliteDriver } from 'hippo-memory-core';
+console.log(sqliteDriver);   // 'node:sqlite'（Node）| 'bun:sqlite'（Bun）
+```
+
+opencode 里实测（1.18.31 / Bun 1.3.14，真实 npm 包、无打包、无垫片）：
+
+```
+import("hippo-memory-core") -> driver=bun:sqlite
+remember -> new / override（旧版归档 + 指名警告）
+recall   -> 命中 mysql（sim 0.733）
+verify   -> superseded_matches=[postgres]
+digest   -> [memory data …] 数据框架正常
+```
+
+### 14.4 自己接一个（现在的做法）
+
+把引擎放进 opencode 的插件目录，用 `experimental.chat.messages.transform`（或 `system.transform`）注入记忆片段，用 `tool()` 暴露记忆工具：
+
+```bash
+# 项目级：.opencode/plugins/，全局：~/.config/opencode/plugins/
+# .opencode/package.json 里声明依赖，opencode 启动时会 bun install：
+{ "dependencies": { "hippo-memory-core": "^0.2.1" } }
+```
+
+```ts
+// .opencode/plugins/hippo.ts
+import { HippoMemory } from 'hippo-memory-core';
+import type { Plugin } from '@opencode-ai/plugin';
+
+const mem = new HippoMemory({ dbPath: `${process.env.HOME}/.cache/opencode/hippo/memory.db` });
+
+export const Hippo: Plugin = async () => ({
+  // 每轮把相关记忆注入上下文（⚠️ chat.message 没有 output，改不了消息）
+  "experimental.chat.messages.transform": async (_input, output) => {
+    const cue = JSON.stringify(output.messages ?? []).slice(-1200);
+    const { context } = await mem.composeContext(cue, { limit: 5 });
+    if (context) output.messages.unshift({ role: "system", content: context });
+  },
+  // 压缩前保住关键结论（官方文档支持 output.context.push）
+  "experimental.session.compacting": async (_input, output) => {
+    const { context } = await mem.composeContext('session summary', { limit: 8 });
+    if (context) output.context.push(context);
+  },
+  event: async ({ event }) => {
+    if (event?.type === "session.idle") { /* 可选：收尾自检、写入结论 */ }
+  },
+});
+```
+
+> 上面是**手写版**，能跑；等 `opencode-hippo-memory` 适配包发出来（工具 + digest + 纪律一步到位）再换成一行 `plugin` 配置即可。
+
+### 14.5 opencode 的钩子速查（1.18.x 实测）
+
+| 钩子 | 用途 | 能改内容吗 |
+|---|---|---|
+| `experimental.chat.messages.transform` | 改发给模型的消息列表 | ✅ |
+| `experimental.chat.system.transform` | 改系统提示 | ✅ |
+| `experimental.session.compacting` | 压缩前补充/替换上下文 | ✅（`output.context.push` / `output.prompt`） |
+| `tool.execute.before` / `tool.execute.after` | 拦截/审计工具调用 | ✅（改 `output.args` 等） |
+| `chat.message` | 观察用户消息 | ❌ 只有 input，没有 output |
+| `event` | 订阅 `session.idle` / `session.compacted` 等 | — |
+
 
 ---
 
