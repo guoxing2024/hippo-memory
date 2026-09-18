@@ -8,7 +8,7 @@
 ```
 
 > 引擎（框架无关）是独立包 [`hippo-memory-core`](https://www.npmjs.com/package/hippo-memory-core)；本包是 DSH 适配层：工具 + 自动注入 + 使用纪律 + GUI 设置卡片。
-> 当前版本：**0.2.0**（与引擎 0.2.0 同步）。详细使用说明见 [docs/USER-GUIDE.zh-CN.md](../../docs/USER-GUIDE.zh-CN.md)。
+> 当前版本：**0.2.0**（与引擎 0.2.0 同步）。详细使用说明见 [完整中文使用说明](https://github.com/guoxing2024/hippo-memory/blob/master/docs/USER-GUIDE.zh-CN.md)。
 
 ---
 
