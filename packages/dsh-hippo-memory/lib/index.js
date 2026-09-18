@@ -33,15 +33,23 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 // resolve the sibling source package relative to this file.
 let HippoMemory;
 let pruneEmptyStores;
+let sanitizeMemoryText;
+let looksInjected;
 try {
   ({ HippoMemory } = await import('hippo-memory-core'));
   ({ pruneEmptyStores } = await import('hippo-memory-core'));
+  ({ sanitizeMemoryText, looksInjected } = await import('hippo-memory-core'));
 } catch {
   const here = fileURLToPath(new URL('.', import.meta.url));
   const src = pathToFileURL(join(here, '..', '..', '..', 'dist', 'index.js')).href;
   ({ HippoMemory } = await import(src));
   ({ pruneEmptyStores } = await import(src));
+  ({ sanitizeMemoryText, looksInjected } = await import(src));
 }
+// Older hoisted core (published 0.1.6) predates the guard module: degrade to
+// identity functions so the adapter still works against it.
+if (typeof sanitizeMemoryText !== 'function') sanitizeMemoryText = (t) => String(t ?? '');
+if (typeof looksInjected !== 'function') looksInjected = () => false;
 
 const name = 'hippo-memory';
 const inject = ['systemPrompt', 'tools', 'settings'];
@@ -85,6 +93,109 @@ function sanitize(s) {
 
 function agentIdOf(exec) {
   return exec?.agent?.id ?? exec?.sessionId ?? 'shared';
+}
+
+/**
+ * Extract plain text from a session content value of unknown shape.
+ * Real traffic carries block arrays (e.g. content: [text] or
+ * [text, text, text]); older shapes carry bare strings or
+ * {text|content} objects. Anything else yields '' (depth-capped).
+ */
+function textOf(v, depth = 0) {
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) {
+    if (depth > 3) return '';
+    return v.map((e) => textOf(e, depth + 1)).filter(Boolean).join('\n');
+  }
+  if (v && typeof v === 'object' && depth <= 3) {
+    return textOf(v.text ?? v.content ?? v.data?.content, depth + 1);
+  }
+  return '';
+}
+
+/**
+ * Plugin origins whose nodes are prompt-engineering surface, never the human.
+ * A cue drawn from these poisons recall with template boilerplate (field:
+ * cue carried template 100% of turns). Matched by substring so versioned
+ * package names keep hitting.
+ */
+const INJECTED_PLUGIN_MARKS = ['system-prompt'];
+
+/** True when the node provably comes from prompt plumbing, not the human. */
+function isInjectedNode(node) {
+  const p = node?.source?.plugin ?? node?.plugin;
+  return typeof p === 'string' && INJECTED_PLUGIN_MARKS.some((m) => p.includes(m));
+}
+
+/**
+ * Strip our own digest block out of a cue (suggestion 2). Accumulator nodes
+ * quote prior turns including [hippo-memory digest] … [/memory data]; feeding
+ * that back into recall is a self-loop (field: 72.5% hit, 24.3% closed loop).
+ * Belt-and-braces next to the node whitelist: any accumulator can smuggle one.
+ */
+function stripDigest(text) {
+  return String(text ?? '')
+    .replace(/\[hippo-memory digest\][\s\S]*?\[\/memory data\]/g, ' ')
+    .replace(/[ \t]{2,}/g, ' ');
+}
+
+/**
+ * Newest user-message text for digest recall. Three passes, newest-first:
+ *  1. user node explicitly from the human plugin (or with no source info,
+ *     the pre-source shape), not prompt plumbing, not template boilerplate;
+ *  2. any user node neither provably injected nor boilerplate;
+ *  3. newest user node text regardless (last resort — something beats
+ *     nothing), then session title/goal/topic, else '' (caller uses the
+ *     recency path).
+ * Boilerplate = prompt-plumbing origin, or a long shared prefix with another
+ * user node (templates repeat every turn; human messages don't share 64-char
+ * prefixes). Text is read via textOf and digest-stripped before return.
+ * Exported for unit tests.
+ */
+function latestUserCue(session) {
+  try {
+    const nodes = session?.surface?.nodes;
+    if (nodes && Array.isArray(nodes)) {
+      // Collect user-type nodes newest-first with stripped text.
+      const cands = [];
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        const node = nodes[i];
+        if (node && typeof node === 'object' && node.type && node.type !== 'user/message') continue;
+        const text = stripDigest(textOf(node)).trim();
+        if (text) cands.push({ node, text });
+      }
+      // Template repeats across turns: flag long shared prefixes (R29:
+      // template-led turns 100%, human-led 2.5%).
+      const PREFIX = 64;
+      const headed = (t) => t.length >= PREFIX;
+      for (const c of cands) {
+        c.boiler = headed(c.text) && cands.some((o) => o !== c && headed(o.text) &&
+          (o.text.startsWith(c.text.slice(0, PREFIX)) || c.text.startsWith(o.text.slice(0, PREFIX))));
+      }
+      for (let pass = 1; pass <= 3; pass++) {
+        for (const c of cands) {
+          const plugin = c.node?.source?.plugin ?? c.node?.plugin;
+          if (isInjectedNode(c.node)) continue; // prompt plumbing: never a cue
+          if (pass === 1) {
+            // Whitelist: explicit human origin, or no origin info at all
+            // (pre-source shape) — and not boilerplate.
+            if (c.boiler) continue;
+            if (plugin != null && plugin !== 'user') continue;
+          } else if (pass === 2) {
+            if (c.boiler) continue;
+          }
+          return c.text.slice(0, 800);
+        }
+      }
+    }
+    for (const k of ['title', 'goal', 'topic']) {
+      const v = session?.[k];
+      if (typeof v === 'string' && v.trim()) return stripDigest(v).trim().slice(0, 800) || '';
+    }
+  } catch {
+    /* non-conforming session shape */
+  }
+  return '';
 }
 
 /** Text output contract shared by every tool (render is UI-only). */
@@ -288,22 +399,6 @@ function apply(ctx, config = {}) {
     digestCache.clear();
   };
 
-  const latestUserCue = (session) => {
-    try {
-      const nodes = session?.surface?.nodes;
-      if (!nodes || !Array.isArray(nodes)) return '';
-      for (let i = nodes.length - 1; i >= 0; i--) {
-        const node = nodes[i];
-        if (node?.type !== 'user/message') continue;
-        const text = node?.text ?? node?.content ?? node?.data?.content;
-        if (typeof text === 'string' && text.trim()) return text.trim();
-      }
-    } catch {
-      /* non-conforming session shape */
-    }
-    return '';
-  };
-
   const refreshDigest = (agentKey, cue) => {
     const store = stores.get(agentKey);
     if (!store) return;
@@ -318,7 +413,7 @@ function apply(ctx, config = {}) {
     const ent = cached ?? { digest: '', cue: '', at: 0 };
     ent.cue = cue;
     ent.refreshing = store.inst
-      .composeContext(cue || '', { limit: current().contextLimit })
+      .composeContext(cue || '', { limit: current().contextLimit, includeRecent: true, recentLimit: 2 })
       .then(({ context: digest }) => {
         ent.digest = digest || '';
         ent.at = Date.now();
@@ -397,16 +492,26 @@ function apply(ctx, config = {}) {
     };
     reg(defineTool({
       name: 'memory_remember',
-      description: 'Write a durable fact / event / skill into long-term memory. Re-stating the same fact strengthens it; a changed value for the same subject becomes a versioned override (old revision archived, never silently lost).',
+      description: 'Write a durable fact / event / skill into long-term memory. Re-stating the same fact strengthens it; a changed value for the same subject becomes a versioned override (old revision archived, never silently lost). The response echoes the nearest existing neighbours so you can see what the store already believed; pass supersedes to explicitly retire wrong ids. scope_only_matches lists same-subject-key rows withheld from overwrite for lack of a shared entity (empty means nothing to report, not a skipped check). outcome merge fires only when an episode restates a semantic rule with nothing new. Numeric assertion-shaped semantic claims (arrow/copula) without passing verify_* evidence are stored as episodes; a freshly VERIFIED incumbent is retired only by passing evidence (else both rows are kept with a shielded: warning). Tag a retraction with tags ["retraction"] plus retracts:<id>; tag prospective trigger/action pairs with tags ["guard"] plus guard_trigger/guard_action.',
       parameters: {
         kind: { type: 'string', required: true, enum: ['episode', 'semantic', 'procedure'], description: 'episode = one event; semantic = durable rule/fact; procedure = skill/workflow.' },
         summary: { type: 'string', required: true, description: 'One-sentence memory. For semantic claims prefer "<subject> -> <value>".' },
         detail: { type: 'string', description: 'Verbatim detail kept for deep recall.' },
         entities: { type: 'array', items: { type: 'string' }, description: 'Entity names (filter + conflict scope).' },
-        tags: { type: 'array', items: { type: 'string' }, description: 'Free-form tags.' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Free-form tags. "retraction" marks a do-not-repeat marker (with retracts); "guard" marks a prospective trigger/action pair (with guard_trigger/guard_action).' },
         occurred_at: { type: 'string', description: 'ISO time of the real-world event, if any.' },
         source: { type: 'string', description: "Provenance: 'user' | 'tool' | 'config' | 'inference' | ..." },
-        confidence: { type: 'string', enum: ['high', 'medium', 'low', 'speculative'], description: 'Writer confidence (default high).' }
+        confidence: { type: 'string', enum: ['high', 'medium', 'low', 'speculative'], description: 'Writer confidence (default high).' },
+        importance: { type: 'number', description: 'Salience 0..1 — how much this memory should matter for future retrieval/ranking. Omit to derive from confidence (high=0.7, medium=0.5, low=0.35, speculative=0.2). Set explicitly for durable user preferences (0.9+), project-critical facts (0.8+), or minor observations (<0.4).' },
+        verify_cmd: { type: 'string', description: 'How to re-run this claim (command). The plugin never executes it; run it yourself and report via verify_result.' },
+        verify_expect: { type: 'string', description: 'Expected re-run output.' },
+        verify_artifact: { type: 'string', description: 'Artifact the re-run reads.' },
+        verify_result: { type: 'string', enum: ['pass', 'fail'], description: 'Outcome of running verify_cmd (never self-assessed). Only passing evidence can retire a VERIFIED row.' },
+        verified_at: { type: 'string', description: 'ISO time the evidence was executed.' },
+        retracts: { type: 'string', description: 'Id this write retracts (use with tags ["retraction"]).' },
+        guard_trigger: { type: 'string', description: 'Future situation this guards (use with tags ["guard"]).' },
+        guard_action: { type: 'string', description: 'What to do when guard_trigger matches.' },
+        supersedes: { type: 'array', items: { type: 'string' }, description: 'Ids of existing memories this write corrects/retires. Use when you verified a stored claim is wrong and are writing the replacement: the listed rows get superseded (kept for audit, excluded from recall), and verify/recall surface the newer conclusion instead.' }
       },
       output: outputOf(),
       async execute(args, exec) {
@@ -420,7 +525,16 @@ function apply(ctx, config = {}) {
           tags: args.tags,
           occurredAt: args.occurred_at,
           source: args.source ?? 'agent',
-          confidence: args.confidence ?? 'high'
+          confidence: args.confidence ?? 'high',
+          importance: typeof args.importance === 'number' && args.importance >= 0 && args.importance <= 1 ? args.importance : undefined,
+          verify: args.verify_cmd || args.verify_expect || args.verify_artifact
+            ? { cmd: args.verify_cmd, expect: args.verify_expect, artifact: args.verify_artifact }
+            : undefined,
+          verifyResult: args.verify_result === 'pass' || args.verify_result === 'fail' ? args.verify_result : undefined,
+          verifiedAt: args.verified_at,
+          retracts: args.retracts,
+          guard: args.guard_trigger && args.guard_action ? { trigger: args.guard_trigger, action: args.guard_action } : undefined,
+          supersedes: Array.isArray(args.supersedes) ? args.supersedes : undefined
         });
         invalidateDigest(agentKey);
         return cleanJson({
@@ -428,6 +542,7 @@ function apply(ctx, config = {}) {
           outcome: res.outcome,
           id: res.memory.id,
           version: res.memory.version,
+          kind: res.memory.kind,
           summary: res.memory.summary,
           // An override archives the previous revision instead of erasing it.
           // Say so explicitly: silent versioning reads as data loss.
@@ -438,10 +553,29 @@ function apply(ctx, config = {}) {
                 summary: res.superseded.summary,
                 note: 'previous revision archived (recoverable via memory_maintain history with this id)'
               }
-            : undefined
+            : undefined,
+          // Explicit correction edges applied by this write.
+          superseded_traces: res.superseded_traces,
+          // P0-2: nearest neighbours echoed back — what the store already
+          // believed around this write, so a correction is never blind.
+          neighbours: (res.neighbours ?? []).map((n) => ({
+            id: n.id,
+            kind: n.kind,
+            summary: n.summary,
+            confidence: n.confidence,
+            version: n.version,
+            similarity: Number(n.similarity.toFixed(3)),
+            suspectedConflict: n.suspectedConflict
+          })),
+          suspected_conflict: res.suspected_conflict === true ? true : undefined,
+          // An override retires an existing trace, so it is never silent
+          // (field report BUG-1 (c)).
+          warning: res.warning,
+          // Same subject key but no shared entity: reported instead of
+          // overwritten (field report BUG-1 (a)/(b)).
+          scope_only_matches: res.scope_only_matches ?? []
         });
-      },
-      presentCall: (args) => present('Remember', 'write', args.summary)
+      },presentCall: (args) => present('Remember', 'write', args.summary)
     }));
 
     reg(defineTool({
@@ -451,14 +585,15 @@ function apply(ctx, config = {}) {
         query: { type: 'string', required: true, description: 'The question / retrieval cue, natural language.' },
         entities: { type: 'array', items: { type: 'string' }, description: 'Restrict to memories about these entities.' },
         kind: { type: 'string', enum: ['episode', 'semantic', 'procedure'], description: 'Restrict to one kind.' },
-        limit: { type: 'number', description: 'Max hits (default 8, max 20).' }
+        limit: { type: 'number', description: 'Max hits (default 8, max 20).' },
+        include_demoted: { type: 'boolean', description: 'Also surface compress-folded rows (default false: their invariant covers them).' }
       },
       output: outputOf(),
       async execute(args, exec) {
         await embedderReadyForQuery();
         const store = storeFor(sanitize(agentIdOf(exec)));
         const res = await store.recall(
-          { query: args.query, entities: args.entities, kind: args.kind },
+          { query: args.query, entities: args.entities, kind: args.kind, includeDemoted: args.include_demoted === true },
           Math.min(args.limit ?? 8, 20)
         );
         return cleanJson({
@@ -467,9 +602,20 @@ function apply(ctx, config = {}) {
             version: h.version,
             kind: h.kind,
             summary: h.summary,
+            detail: h.detail ?? null,
+            entities: h.entities ?? [],
+            tags: h.tags ?? [],
             confidence: h.confidence,
             source: h.source,
             occurredAt: h.occurredAt,
+            verify: h.verify ?? null,
+            verify_result: h.verifyResult ?? null,
+            verified_at: h.verifiedAt ?? null,
+            guard: h.guard ?? null,
+            retracts: h.retracts ?? null,
+            retracted: h.retracted ?? null,
+            recent: h.recent === true ? true : undefined,
+            demoted: h.demoted === true ? true : undefined,
             score: Number(h.score.toFixed(3)),
             similarity: Number(h.similarity.toFixed(3)),
             relativeScore: h.relativeScore,
@@ -483,7 +629,11 @@ function apply(ctx, config = {}) {
           eligible: res.eligible,
           bestSimilarity: res.bestSimilarity,
           threshold: res.threshold,
-          nearMisses: res.nearMisses
+          nearMisses: res.nearMisses,
+          // Non-conflicting overlap with the top hit (newer/older siblings on
+          // the same topic). Kept OUT of warnings on purpose: a warning must
+          // mean "check before asserting", so temporal neighbours live here.
+          nearDuplicates: res.nearDuplicates ?? []
         });
       },
       presentCall: (args) => present('Recall', 'read', args.query)
@@ -506,6 +656,10 @@ function apply(ctx, config = {}) {
           support: v.support ?? null,
           contradiction: v.contradiction ?? null,
           closest: v.closest ?? null,
+          contradicting: v.contradicting ?? [],
+          newer_related: v.newer_related ?? [],
+          superseded_matches: v.superseded_matches ?? [],
+          stale_support: v.stale_support ?? false,
           note: v.note
         });
       },
@@ -514,12 +668,14 @@ function apply(ctx, config = {}) {
 
     reg(defineTool({
       name: 'memory_maintain',
-      description: 'Long-term memory housekeeping. consolidate: abstract well-established episodes into durable semantic rules. forget: decay / soft-delete weak traces (preview with dry_run). stats: store summary. list: newest-first inventory of active memories. history: show revision history of one memory id. delete: permanently remove a memory by id. prune: delete store files that hold no memories. status: embedder/plugin state.',
+      description: 'Long-term memory housekeeping. consolidate: abstract well-established episodes into durable semantic rules. compress: fold N same-scope traces into 1 caller-authored invariant + K representatives (dry_run previews groups; apply with plan_json; undemote restores). forget: decay / soft-delete weak traces (preview with dry_run). stats: store summary. list: newest-first inventory of active memories. history: show revision history of one memory id. delete: permanently remove a memory by id. prune: delete store files that hold no memories. status: embedder/plugin state.',
       parameters: {
-        action: { type: 'string', required: true, enum: ['consolidate', 'forget', 'stats', 'list', 'history', 'delete', 'prune', 'duplicates', 'status'], description: 'Which maintenance action to run. "duplicates" reports near-duplicate restatements (read-only).' },
+        action: { type: 'string', required: true, enum: ['consolidate', 'compress', 'undemote', 'forget', 'stats', 'list', 'history', 'delete', 'prune', 'duplicates', 'override-audit', 'status'], description: 'Which maintenance action to run. "duplicates" reports near-duplicate restatements (read-only). "override-audit" screens overridden rows whose archived text shares little with the live text — the signature of an unrelated memory retired by an override (read-only). "compress" with dry_run (default) proposes foldable groups; with dry_run:false plus plan_json it folds.' },
         id: { type: 'string', description: 'Memory id (history/delete action).' },
-        dry_run: { type: 'boolean', description: 'forget: preview without mutating (default true).' },
-        limit: { type: 'number', description: 'list: max entries (default 50).' }
+        ids: { type: 'array', items: { type: 'string' }, description: 'Memory ids (undemote action).' },
+        dry_run: { type: 'boolean', description: 'forget/compress: preview without mutating (default true).' },
+        limit: { type: 'number', description: 'list: max entries (default 50).' },
+        plan_json: { type: 'string', description: 'compress apply: JSON-encoded {invariant:{summary,detail?,entities?},members:[ids],representatives:[ids]} (engine validates, never authors the invariant).' }
       },
       output: outputOf(),
       async execute(args, exec) {
@@ -528,30 +684,73 @@ function apply(ctx, config = {}) {
           const made = await store.consolidate();
           return { consolidated: made.length, rules: made.map((x) => x.summary) };
         }
+        if (args.action === 'compress') {
+          if (args.dry_run !== false) {
+            const groups = store.proposeCompressions();
+            return cleanJson({
+              groupCount: groups.length,
+              groups,
+              note: 'preview only — author each invariant and pass dry_run:false plus plan_json to fold (engine validates, never authors)'
+            });
+          }
+          let plan;
+          try {
+            plan = JSON.parse(String(args.plan_json ?? ''));
+          } catch {
+            return { ok: false, error: 'compress apply requires plan_json (JSON object or array of objects)' };
+          }
+          try {
+            const plans = Array.isArray(plan) ? plan : [plan];
+            const applied = [];
+            for (const p of plans) applied.push(await store.compress(p));
+            invalidateDigest(sanitize(agentIdOf(exec)));
+            return cleanJson({ ok: true, applied });
+          } catch (err) {
+            return cleanJson({ ok: false, error: err?.message ?? String(err) });
+          }
+        }
+        if (args.action === 'undemote') {
+          const res = store.undemote(Array.isArray(args.ids) ? args.ids : []);
+          invalidateDigest(sanitize(agentIdOf(exec)));
+          return cleanJson({ restored: res.restored });
+        }
         if (args.action === 'forget') {
-          const res = store.forget({ dryRun: args.dry_run !== false });
-          return cleanJson({ wouldForget: res.forgotten.length, decayed: res.decayed.length });
+          const preview = args.dry_run !== false;
+          const res = store.forget({ dryRun: preview });
+          return cleanJson(preview
+            ? { wouldForget: res.forgotten.length, decayed: res.decayed.length, note: 'preview only — pass dry_run:false to apply' }
+            : { forgotten: res.forgotten, decayed: res.decayed });
         }
         if (args.action === 'stats') return cleanJson(store.stats());
         if (args.action === 'list') {
           const items = store.list(Math.min(args.limit ?? 50, 500));
+          const infected = items.filter((m) => looksInjected(m.summary));
           return cleanJson({
             count: items.length,
             memories: items.map((m) => ({
               id: m.id,
               version: m.version,
               kind: m.kind,
-              summary: m.summary,
-              source: m.source,
+              summary: sanitizeMemoryText(m.summary),
+              detail: m.detail ? sanitizeMemoryText(m.detail) : null,
+              entities: m.entities ?? [],
+              tags: m.tags ?? [],
+              source: sanitizeMemoryText(m.source),
               confidence: m.confidence,
+              verify_result: m.verifyResult ?? null,
+              verified_at: m.verifiedAt ?? null,
+              retracts: m.retracts ?? null,
               updatedAt: m.updatedAt ?? m.occurredAt ?? null,
               consolidated: !!m.consolidated
-            }))
+            })),
+            ...(infected.length
+              ? { injectionWarnings: [`${infected.length} stored memor${infected.length === 1 ? 'y' : 'ies'} contain instruction-shaped text (${infected.map((m) => m.id).join(', ')}) — review with action "history", consider action "delete"`] }
+              : {})
           });
         }
         if (args.action === 'history') {
           if (!args.id) return { error: 'history requires an id' };
-          return cleanJson({ history: store.history(args.id) });
+          return cleanJson({ history: store.history(args.id).map((h) => ({ ...h, summary: sanitizeMemoryText(h.summary), detail: h.detail ? sanitizeMemoryText(h.detail) : null, verify_result: h.verifyResult ?? null })) });
         }
         if (args.action === 'prune') {
           // Sweep store files that hold no memories and no history — the
@@ -563,6 +762,21 @@ function apply(ctx, config = {}) {
             : [];
           return cleanJson({ pruned: removed.length, files: removed });
         }
+        if (args.action === 'override-audit') {
+          // Read-only screen for the damaging case duplicates() cannot see: an
+          // override archives the old row, so no live pair remains to compare.
+          const res = store.overrideAudit({ limit: args.limit ?? 50 });
+          return cleanJson({
+            scannedOverridden: res.scannedOverridden,
+            suspiciousCount: res.suspicious.length,
+            suspicious: res.suspicious.map((x) => ({
+              ...x,
+              liveSummary: sanitizeMemoryText(x.liveSummary),
+              archived: { ...x.archived, summary: sanitizeMemoryText(x.archived.summary) }
+            })),
+            note: res.note
+          });
+        }
         if (args.action === 'duplicates') {
           // Read-only report: near-duplicate restatements (e.g. an episode and
           // the "FACT: …" rule abstracted from it). Nothing is deleted here.
@@ -571,7 +785,10 @@ function apply(ctx, config = {}) {
             scanned: res.scanned,
             groupCount: res.groups.length,
             duplicateMemories: res.groups.reduce((n, g) => n + g.memories.length - 1, 0),
-            groups: res.groups,
+            groups: res.groups.map((g) => ({
+              ...g,
+              memories: g.memories.map((m) => ({ ...m, summary: sanitizeMemoryText(m.summary) }))
+            })),
             note: res.groups.length
               ? 'review, then remove redundant ids with action "delete" (history is removed with the row)'
               : 'no near-duplicate restatements found'
@@ -588,12 +805,22 @@ function apply(ctx, config = {}) {
           }
         }
         if (args.action === 'status') {
+          const diag = store.diagnostics();
           return cleanJson({
             embeddingSetting: current().embedding,
             embedderState: embedState, // off | loading | ready | failed
             dim: embedProvider?.dim ?? null,
             embedderNote: embedderStatusText(),
-            storeStats: store.stats()
+            storeStats: store.stats(),
+            // P0-3: deep observability — the silent killer is an embedder
+            // mismatch (model-vector store queried by the hashing fallback:
+            // garbage cosines, zero hits, nothing in the counts looks wrong).
+            diagnostics: diag,
+            health: diag.suspicious.possibleEmbedderMismatch
+              ? 'WARN: stored vector dims do not match the active embedder — recall is likely broken for this store (re-migrate or check embedder setting)'
+              : diag.suspicious.neverAccessedRatio > 0.8 && diag.activity.totalAccess > 0
+                ? 'WARN: most memories were never recalled — check cue phrasing / thresholds'
+                : 'ok'
           });
         }
         return { error: `unknown action ${args.action}` };
@@ -627,7 +854,9 @@ function apply(ctx, config = {}) {
         if (note) parts.push(note);
         if (digest) {
           // Fresh or stale digest — show it; the refresh above is computing
-          // the current cue's result when stale.
+          // the current cue's result when stale. composeContext already
+          // sanitized each line and wrapped the block in a data frame
+          // (memory text is quoted data, never instructions).
           parts.push(digest);
           // B: end-of-turn self-check — attached whenever memory content is
           // shown (fresh or stale), so agents are nudged without nagging.
@@ -694,4 +923,4 @@ function apply(ctx, config = {}) {
   );
 }
 
-export { Config, GUIDANCE, SETTINGS_NS, SettingsSchema, apply, inject, name };
+export { Config, GUIDANCE, SETTINGS_NS, SettingsSchema, apply, inject, latestUserCue, name };

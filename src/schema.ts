@@ -50,6 +50,39 @@ export interface MemoryPayload {
   confidence?: SourceConfidence;
   /** Salience 0..1 (defaults from confidence when omitted). */
   importance?: number;
+  /**
+   * Recheckable provenance (source monitoring): how to RE-RUN the claim.
+   * The engine never executes `cmd` — the agent runs it and reports back
+   * via `verifyResult`. Stored verbatim and rendered as [VERIFIED] when the
+   * reported result passes.
+   */
+  verify?: { cmd?: string; expect?: string; artifact?: string };
+  /** Agent-reported outcome of running `verify` (never self-assessed). */
+  verifyResult?: 'pass' | 'fail';
+  /** ISO time the evidence was last executed. */
+  verifiedAt?: string;
+  /**
+   * Retraction pointer: id of the memory this write retracts. Retractions
+   * are conventionally tagged `retraction`; retraction rows can never be
+   * overridden (only appended after), and hits on a retracted id render
+   * with a [retracted] marker.
+   */
+  retracts?: string;
+  /**
+   * Prospective memory (implementation intention): `trigger` is the future
+   * situation, `action` what to do there. Conventionally tagged `guard`;
+   * matched cue-side and boosted at recall.
+   */
+  guard?: { trigger: string; action: string };
+  /**
+   * Explicit correction edges: ids of existing memories this write supersedes.
+   * The listed rows get superseded = 1 (retired, kept for audit) and a
+   * superseded_by pointer to this new row; verify/recall surface the newer
+   * conclusion instead of the retired one. This is the escape hatch for
+   * corrections whose wording differs too much for cosine-based conflict
+   * detection to catch (measured: ~0.60 similarity vs. the 0.86 bar).
+   */
+  supersedes?: string[];
 }
 
 export interface StoredMemory {
@@ -73,6 +106,22 @@ export interface StoredMemory {
   embedding?: number[]; // filled only when requested
   /** Whether this row represents a superseded/retired revision. */
   superseded: boolean;
+  /** Id of the row that explicitly retired this one (explicit supersedes edge). */
+  supersededBy?: string;
+  /** Recheckable provenance: how to re-run the claim (see MemoryPayload). */
+  verify?: { cmd?: string; expect?: string; artifact?: string };
+  /** Agent-reported evidence outcome (never self-assessed). */
+  verifyResult?: 'pass' | 'fail';
+  /** ISO time the evidence was last executed. */
+  verifiedAt?: string;
+  /** Id of the memory this row retracts (retraction rows). */
+  retracts?: string;
+  /** Prospective trigger/action pair (guard rows). */
+  guard?: { trigger: string; action: string };
+  /** Folded into an invariant (hidden from default recall, still live). */
+  demoted: boolean;
+  /** Invariant row this trace was folded into. */
+  demotedTo?: string;
 }
 
 export interface RetrievalCue {
@@ -90,6 +139,8 @@ export interface RetrievalCue {
   excludeIds?: string[];
   /** Caller-specified importance floor [0..1] (defaults to the store threshold). */
   minImportance?: number;
+  /** Include compress-demoted rows (default false: invariant covers them). */
+  includeDemoted?: boolean;
 }
 
 export interface RetrievedMemory extends StoredMemory {
@@ -103,14 +154,40 @@ export interface RetrievedMemory extends StoredMemory {
   literalMatch?: number;
   /** True when the hit came from the consolidated semantic store. */
   consolidated: boolean;
+  /** True when this hit came from the recency buffer, not goal-relevance. */
+  recent?: boolean;
+  /** Set when a live retraction targets this hit (do-not-repeat flag). */
+  retracted?: { by: string; criterion: string };
 }
 
 /** Why a recall returned what it did. */
 export type RecallReason = 'ok' | 'no-candidates' | 'below-threshold' | 'empty-cue';
 
+/** A related trace surfaced by verify for the caller to weigh. */
+export interface RelatedTrace {
+  id: string;
+  summary: string;
+  /** Verbatim detail when the stored row carries one (deep-recall payload). */
+  detail?: string;
+  source?: string;
+  confidence: SourceConfidence;
+  version: number;
+  updatedAt: string;
+  entities: string[];
+  /** Raw cosine similarity to the claim / new memory. */
+  similarity: number;
+  /** Agent-reported evidence outcome, when the row carries any. */
+  verifyResult?: 'pass' | 'fail';
+}
+
 export interface RecallBundle {
   hits: RetrievedMemory[];
-  /** Warnings such as stale-rule overrides that were applied. */
+  /**
+   * Problems with the RETRIEVED SET the caller must check before asserting:
+   * a retrieved trace that disagrees with the top hit on an established
+   * scope-key, or a hit whose text was injection-sanitized. Not a general
+   * "these rows are related" channel — that is `nearDuplicates`.
+   */
   warnings: string[];
   /** Number of rows whose vector was comparable to the cue (diagnostics). */
   scanned: number;
@@ -124,6 +201,18 @@ export interface RecallBundle {
   reason: RecallReason;
   /** Closest sub-threshold rows (best first) so an empty result is explainable. */
   nearMisses: { id: string; summary: string; similarity: number }[];
+  /**
+   * Retrieved rows that are NOT conflicts but overlap the top hit.
+   *
+   * Boundary (field report, 5th round — this field was ambiguous and twice
+   * mis-sized): it answers "does another RETRIEVED row say the SAME THING as
+   * the top hit for this cue?", i.e. near-identical restatements inside the
+   * current result set. It is NOT "near-duplicates anywhere in the store"
+   * (use `duplicates()` for that) and NOT "rows related to the cue" (that is
+   * what `hits` already is). The gate compares rows to each other at
+   * nearDuplicateThreshold; rows that merely share a topic are excluded.
+   */
+  nearDuplicates: { id: string; summary: string; similarity: number; reason: string }[];
 }
 
 export interface ConsolidationCandidate {
@@ -137,7 +226,51 @@ export interface ConsolidationCandidate {
   ageMs: number;
 }
 
-export type ConflictOutcome = 'none' | 'new' | 'override' | 'merge';
+/**
+ * Caller-authored compression plan (S5): fold N same-scope traces into one
+ * invariant. The engine validates (members exist, live, unfoldable;
+ * representatives ⊆ members) and applies — it never authors the invariant
+ * text itself (plugin exposes, downstream judges).
+ */
+export interface CompressPlan {
+  invariant: {
+    summary: string;
+    detail?: string;
+    entities?: EntityRef[];
+    tags?: string[];
+    source?: string;
+  };
+  /** Live, non-demoted, non-retired member ids to fold. */
+  members: string[];
+  /** Members that stay visible (must be a subset of members). */
+  representatives?: string[];
+}
+
+/** One applied compression: what was folded where. */
+export interface CompressResult {
+  invariantId: string;
+  summary: string;
+  /** Members left visible. */
+  kept: string[];
+  /** Members folded (hidden from default recall, expandable). */
+  demoted: string[];
+}
+
+export type ConflictOutcome = 'none' | 'new' | 'override' | 'merge' | 'supersede';
+
+/** A neighbour of the just-written memory, echoed back for the caller. */
+export interface WriteNeighbour {
+  id: string;
+  kind: MemoryKind;
+  summary: string;
+  confidence: SourceConfidence;
+  version: number;
+  updatedAt: string;
+  /** Raw cosine similarity to the written content. */
+  similarity: number;
+  /** True when this neighbour plausibly asserts the OPPOSITE of the new memory. */
+  suspectedConflict: boolean;
+}
 
 export interface StoreOptions {
   /** Cosine threshold above which two vectors are considered near-duplicates. */
@@ -147,6 +280,15 @@ export interface StoreOptions {
    * (same scope, different claim). Must be >= similarityThreshold.
    */
   contradictionThreshold?: number;
+  /**
+   * Claim-level bar for path-3 overrides (R31): the SUMMARY-to-SUMMARY cosine
+   * must also clear this. Deliberately lower than contradictionThreshold —
+   * summaries are short, so a one-word negation costs more cosine there than
+   * in the detail-dominated contentText vector. Grounding (hashing / bge):
+   * true negations measured 0.80 / ~0.95, topical-but-compatible pairs 0.00
+   * / 0.6995 — 0.75 separates all four.
+   */
+  claimThreshold?: number;
   /** Cosine threshold for scoring candidate memories in recall. */
   similarityThreshold?: number;
   /** Default importance floor applied to recall when the cue has none. */
@@ -157,6 +299,12 @@ export interface StoreOptions {
   forgetAfterSec?: number;
   /** Max size of the version history kept per memory id. */
   maxVersionsPerId?: number;
+  /**
+   * Seconds passing evidence stays fresh. A VERIFIED row older than this no
+   * longer shields against retirement and renders [ASSERTED] until re-run
+   * (evidence rots; re-run the check and refresh verifiedAt).
+   */
+  evidenceTtlSec?: number;
 }
 
 /** Embedding provider contract: anything that maps text to a float vector. */
@@ -168,6 +316,7 @@ export interface EmbeddingProvider {
 export const DEFAULT_OPTIONS: Required<StoreOptions> = {
   nearDuplicateThreshold: 0.92,
   contradictionThreshold: 0.86,
+  claimThreshold: 0.75,
   // 0.4 → 0.32: the offline hashing embedder yields lower absolute cosines
   // than a real model (esp. for CJK, now tokenized per character); 0.4 was
   // rejecting legitimate hits (measured 0.39 for a same-topic Chinese recall).
@@ -175,7 +324,8 @@ export const DEFAULT_OPTIONS: Required<StoreOptions> = {
   minImportance: 0,
   topK: 20,
   forgetAfterSec: 60 * 60 * 24 * 120, // 120 days
-  maxVersionsPerId: 8
+  maxVersionsPerId: 8,
+  evidenceTtlSec: 60 * 60 * 24 * 30 // 30 days: passing evidence older than this is stale
 };
 
 /** Small branded-ish helper used across modules. */

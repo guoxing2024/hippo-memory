@@ -1,6 +1,6 @@
 {
   "name": "hippo-memory-core",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "Hippocampus-inspired long-term memory engine for LLM agents: sparse encoding with pattern separation, cue-driven retrieval, source monitoring, conflict versioning, consolidation, and adaptive forgetting. Zero external services (SQLite + local vector index).",
   "type": "module",
   "main": "dist/index.js",
@@ -21,6 +21,10 @@
     "./vectors": {
       "types": "./dist/vectors.d.ts",
       "import": "./dist/vectors.js"
+    },
+    "./guard": {
+      "types": "./dist/guard.d.ts",
+      "import": "./dist/guard.js"
     }
   },
   "files": [

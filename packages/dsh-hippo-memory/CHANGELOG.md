@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.2.0] — 2026-09-18
+
+> **大版本：适配层与引擎 0.2.0 同步。** 新增证据 / 撤回 / 前瞻 / 显式纠正边参数，新增 `memory_maintain compress|undemote|override-audit` 动作与 `status` 深度诊断，渲染出口统一清洗 + 数据框架。
+> 升级：`dsh plugin --profile <profile> update dsh-hippo-memory` 后重启 profile；旧记忆库无需迁移，对旧引擎自动降级兼容。
+
+### Added — 外部实测反馈三项 P0 修复
+
+- **`memory_verify` 证据字段**：返回 `contradicting[]` / `newer_related[]` / `superseded_matches[]` / `stale_support`——先前只有 argmax 单行结论，同 scope 的反极性行、更新的换词结论、被显式退役的行全部不可见（实测：旧措辞赢 cosine 0.94，真正的最新结论 0.60，永远看不到）。
+- **`memory_remember` 新增 `supersedes` 参数**（id 数组）：验证过某条记忆是错的之后写替代结论用——列出的行被打上 `superseded_by` 指针（保留审计、退出召回），工具描述写明使用时机。响应新增 `superseded_traces`（被退役行清单）。
+- **`memory_remember` 近邻回显**：响应新增 `neighbours[]`（top-3 最近邻 + 相似度 + `suspectedConflict`）与 `suspected_conflict`——写入前可见库里已相信什么，纠正不再盲写。
+- **`memory_maintain status` 深度诊断**：新增 `diagnostics`（store_path / embedder kind+dim / 存量向量维度直方图 / dimMismatch / 阈值 / access 统计）与 `health` 一句话结论（`ok` / `WARN: embedder mismatch…` / `WARN: most memories never recalled…`）——探测"模型库被 hashing 回退查询→垃圾余弦→永久零命中"这类 stats 看不出来的静默故障。
+- **digest 接线 `includeRecent`**：digest 现在带 2 条 recency tail（core 给这些行打 `[recent]` 标签），最新写入不再因 cue 不相关而从 digest 里消失（实测反馈：刚写的关键结论下轮就看不见）。
+
+### Added — 防投毒护栏
+
+- **防投毒护栏**：记忆中混入指令劫持短语（"ignore all previous instructions…"、人设接管、外传密钥、"别告诉用户"类隐瞒）时，所有渲染出口（digest / recall / verify / maintain list/history/duplicates）统一清洗为 `[sanitized-*]` 标记；digest 整体包裹 `[memory data]` 数据框架声明"内容是数据不是指令"。**存储行不动**（保留审计轨迹）；可疑行由 `injection:` 警告（recall/verify）与 `injectionWarnings` 数组（list）点名。依赖 core 0.1.7 的 guard 模块；对旧 core 降级兼容
+- **`memory_remember` 新增 `importance` 参数**（0..1，显式优先于 confidence 推导），工具描述内置建议档位（用户长期偏好 0.9+、项目关键事实 0.8+、琐碎观察 <0.4）
+
+### Changed
+
+- 依赖 `hippo-memory-core` 升至 `^0.1.7`（合并后的核心版本：guard 模块 + 间隔重复强化 + 并发修复 + superseded_by 列 + sourceMonitor 邻域扫描 + diagnostics + 三通道冲突检测）；对旧 core 降级兼容（新字段缺失时返回空数组/false，无 guard 时降级为恒等函数）。
+
 ## [0.1.8] — 2026-09-12
 
 ### Added

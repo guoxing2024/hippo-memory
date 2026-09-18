@@ -35,6 +35,24 @@ export interface MemoryRow {
   created_at: string;
   updated_at: string;
   superseded: number;
+  /** Id of the row that explicitly retired this one (nullable). */
+  superseded_by: string | null;
+  /** Recheckable provenance JSON {cmd,expect,artifact} (nullable). */
+  verify_json: string | null;
+  /** Agent-reported evidence outcome (nullable). */
+  verify_result: string | null;
+  /** ISO time the evidence was last executed (nullable). */
+  verified_at: string | null;
+  /** Id of the memory this row retracts (nullable). */
+  retracts: string | null;
+  /** Prospective trigger/action JSON {trigger,action} (nullable). */
+  guard_json: string | null;
+  /** Folded into an invariant by compress (1 = hidden from default recall). */
+  demoted: number;
+  /** Invariant row this trace was folded into (nullable). */
+  demoted_to: string | null;
+  /** ISO time of the demotion (nullable, audit only). */
+  demoted_at: string | null;
   vec: Uint8Array | null;
 }
 
@@ -42,6 +60,9 @@ export function vecToBlob(v: number[]): Uint8Array {
   const f = new Float32Array(v);
   return new Uint8Array(f.buffer, f.byteOffset, f.byteLength);
 }
+
+/** Default writer wait when the shared store file is locked (ms). */
+const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 
 export function vecFromBlob(b: Uint8Array | null): number[] | null {
   if (!b || b.byteLength === 0) return null;
@@ -71,6 +92,15 @@ CREATE TABLE IF NOT EXISTS memories (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   superseded INTEGER NOT NULL DEFAULT 0,
+  superseded_by TEXT,
+  verify_json TEXT,
+  verify_result TEXT,
+  verified_at TEXT,
+  retracts TEXT,
+  guard_json TEXT,
+  demoted INTEGER NOT NULL DEFAULT 0,
+  demoted_to TEXT,
+  demoted_at TEXT,
   vec BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind);
@@ -98,6 +128,11 @@ CREATE TABLE IF NOT EXISTS memory_history (
   created_at TEXT,
   updated_at TEXT,
   archived_at TEXT NOT NULL,
+  verify_json TEXT,
+  verify_result TEXT,
+  verified_at TEXT,
+  retracts TEXT,
+  guard_json TEXT,
   PRIMARY KEY (id, version)
 );
 `;
@@ -105,12 +140,15 @@ CREATE TABLE IF NOT EXISTS memory_history (
 export interface HistoryRow {
   version: number;
   summary: string;
-  archived_at: string;
+  archived_at: string | null;
+  entities_json?: string;
   [k: string]: unknown;
 }
 
 export class SqliteStore {
   private db: DatabaseSync;
+  /** Busy-writer timeout kept so a lazy→disk promotion re-applies it. */
+  private readonly busyTimeoutMs: number;
   /** Set while this store has no file on disk yet (lazy mode, empty): reads
    *  are served from an in-memory schema; the first write materializes it. */
   private lazyPath: string | null = null;
@@ -121,7 +159,24 @@ export class SqliteStore {
    *                     actually written (reads on a missing file are served
    *                     from an in-memory schema). Defaults to true.
    */
-  constructor(private readonly path: string, opts: { create?: boolean } = {}) {
+  /** Light column migration: stores created before superseded_by existed. */
+  private ensureColumns(): void {
+    const cols = this.db.prepare('PRAGMA table_info(memories)').all() as { name: string }[];
+    const have = new Set(cols.map((c) => c.name));
+    for (const col of ['superseded_by', 'verify_json', 'verify_result', 'verified_at', 'retracts', 'guard_json', 'demoted_to', 'demoted_at']) {
+      if (!have.has(col)) this.db.exec(`ALTER TABLE memories ADD COLUMN ${col} TEXT;`);
+    }
+    if (!have.has('demoted')) this.db.exec('ALTER TABLE memories ADD COLUMN demoted INTEGER NOT NULL DEFAULT 0;');
+    const hcols = this.db.prepare('PRAGMA table_info(memory_history)').all() as { name: string }[];
+    const hhave = new Set(hcols.map((c) => c.name));
+    for (const col of ['verify_json', 'verify_result', 'verified_at', 'retracts', 'guard_json']) {
+      if (!hhave.has(col)) this.db.exec(`ALTER TABLE memory_history ADD COLUMN ${col} TEXT;`);
+    }
+  }
+
+  constructor(private readonly path: string, opts: { create?: boolean; busyTimeoutMs?: number } = {}) {
+    const busyTimeoutMs = opts.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS;
+    this.busyTimeoutMs = busyTimeoutMs;
     if (opts.create === false && !existsSync(path)) {
       this.db = new DatabaseSync(':memory:');
       this.db.exec(SCHEMA);
@@ -130,7 +185,14 @@ export class SqliteStore {
     }
     this.db = new DatabaseSync(path);
     this.db.exec('PRAGMA journal_mode = WAL;');
+    // Shared-store deployments have multiple processes writing the same file
+    // (recall's access bookkeeping vs. another agent's remember). WAL alone
+    // does not serialize writers: without a busy timeout a colliding write
+    // throws SQLITE_BUSY immediately. A bounded wait lets the loser retry
+    // transparently; transactions keep each write short.
+    this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.trunc(busyTimeoutMs))};`);
     this.db.exec(SCHEMA);
+    this.ensureColumns();
   }
 
   /** True while this store is held in memory because no file exists yet. */
@@ -146,7 +208,9 @@ export class SqliteStore {
     this.db.close();
     this.db = new DatabaseSync(target);
     this.db.exec('PRAGMA journal_mode = WAL;');
+    this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.trunc(this.busyTimeoutMs))};`);
     this.db.exec(SCHEMA);
+    this.ensureColumns();
   }
 
   /* ------------------------- migration markers ------------------------- */
@@ -174,6 +238,16 @@ export class SqliteStore {
     return Number(r.c);
   }
 
+  /** Rows retired by an explicit supersedes edge (superseded = 1 AND an outbound
+   *  pointer). Superseded rows are excluded from allActive() by definition, so
+   *  this cannot be derived from that view. */
+  countSupersededEdges(): number {
+    const r = this.db
+      .prepare('SELECT COUNT(*) AS c FROM memories WHERE superseded = 1 AND superseded_by IS NOT NULL')
+      .get() as { c: number };
+    return Number(r.c);
+  }
+
   /** True when the store holds no rows at all (active or superseded) and no
    *  archived history — i.e. the file carries no information worth keeping. */
   isEmpty(): boolean {
@@ -192,15 +266,20 @@ export class SqliteStore {
           id, version, kind, summary, detail, episode_time, episode_place,
           participants_json, rule, entities_json, tags_json, occurred_at,
           source, confidence, importance, access_count, last_access_at,
-          created_at, updated_at, superseded, vec
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+          created_at, updated_at, superseded, superseded_by, verify_json,
+          verify_result, verified_at, retracts, guard_json, demoted,
+          demoted_to, demoted_at, vec
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
         row.id, row.version, row.kind, row.summary, row.detail,
         row.episode_time, row.episode_place, row.participants_json, row.rule,
         row.entities_json, row.tags_json, row.occurred_at, row.source,
         row.confidence, row.importance, row.access_count, row.last_access_at,
-        row.created_at, row.updated_at, row.superseded, row.vec
+        row.created_at, row.updated_at, row.superseded, row.superseded_by ?? null,
+        row.verify_json, row.verify_result, row.verified_at, row.retracts,
+        row.guard_json, row.demoted, row.demoted_to ?? null, row.demoted_at ?? null,
+        row.vec
       );
   }
 
@@ -213,7 +292,9 @@ export class SqliteStore {
           episode_place = ?, participants_json = ?, rule = ?, entities_json = ?,
           tags_json = ?, occurred_at = ?, source = ?, confidence = ?,
           importance = ?, access_count = ?, last_access_at = ?, updated_at = ?,
-          superseded = ?, vec = ?
+          superseded = ?, superseded_by = ?, verify_json = ?, verify_result = ?,
+          verified_at = ?, retracts = ?, guard_json = ?, demoted = ?,
+          demoted_to = ?, demoted_at = ?, vec = ?
          WHERE id = ?`
       )
       .run(
@@ -221,7 +302,10 @@ export class SqliteStore {
         row.episode_place, row.participants_json, row.rule, row.entities_json,
         row.tags_json, row.occurred_at, row.source, row.confidence,
         row.importance, row.access_count, row.last_access_at, row.updated_at,
-        row.superseded, row.vec, row.id
+        row.superseded, row.superseded_by ?? null, row.verify_json,
+        row.verify_result, row.verified_at, row.retracts, row.guard_json,
+        row.demoted, row.demoted_to ?? null, row.demoted_at ?? null,
+        row.vec, row.id
       );
   }
 
@@ -236,21 +320,34 @@ export class SqliteStore {
           id, version, kind, summary, detail, episode_time, episode_place,
           participants_json, rule, entities_json, tags_json, occurred_at,
           source, confidence, importance, access_count, last_access_at,
-          created_at, updated_at, archived_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+          created_at, updated_at, archived_at, verify_json, verify_result,
+          verified_at, retracts, guard_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
         row.id, row.version, row.kind, row.summary, row.detail,
         row.episode_time, row.episode_place, row.participants_json, row.rule,
         row.entities_json, row.tags_json, row.occurred_at, row.source,
         row.confidence, row.importance, row.access_count, row.last_access_at,
-        row.created_at, row.updated_at, archivedAt
+        row.created_at, row.updated_at, archivedAt, row.verify_json,
+        row.verify_result, row.verified_at, row.retracts, row.guard_json
       );
   }
 
-  setSuperseded(id: string): void {
+  setSuperseded(id: string, supersededBy?: string): void {
     this.materialize();
-    this.db.prepare('UPDATE memories SET superseded = 1 WHERE id = ?').run(id);
+    this.db
+      .prepare('UPDATE memories SET superseded = 1, superseded_by = ? WHERE id = ?')
+      .run(supersededBy ?? null, id);
+  }
+
+  /** Fold a row into an invariant (compress): hidden from default recall,
+   *  still live — version history untouched. Pass null to restore. */
+  setDemoted(id: string, to: string | null, atIso?: string): void {
+    this.materialize();
+    this.db
+      .prepare('UPDATE memories SET demoted = ?, demoted_to = ?, demoted_at = ? WHERE id = ?')
+      .run(to ? 1 : 0, to, to ? (atIso ?? new Date().toISOString()) : null, id);
   }
 
   hardDelete(id: string): void {
@@ -291,13 +388,22 @@ export class SqliteStore {
     return r;
   }
 
+  /** Rows retired by an explicit supersedes edge (verification path). */
+  supersededBy(id: string): MemoryRow[] {
+    return this.db
+      .prepare('SELECT * FROM memories WHERE superseded = 1 AND superseded_by = ?')
+      .all(id) as unknown as MemoryRow[];
+  }
+
   allActive(): MemoryRow[] {
     return this.db.prepare('SELECT * FROM memories WHERE superseded = 0').all() as unknown as MemoryRow[];
   }
 
   historyOf(id: string): HistoryRow[] {
     return this.db
-      .prepare('SELECT version, summary, archived_at, detail FROM memory_history WHERE id = ? ORDER BY version DESC')
+      .prepare(
+        'SELECT version, summary, archived_at, detail, entities_json, verify_result FROM memory_history WHERE id = ? ORDER BY version DESC'
+      )
       .all(id) as unknown as HistoryRow[];
   }
 
