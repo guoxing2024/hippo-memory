@@ -1,5 +1,40 @@
 # Changelog
 
+## [Unreleased] — 需要引擎支持 `scope`（版本号待定）
+
+### Added — 前提作用域透传到工具面
+
+- **`memory_remember` 新增 `scope` 参数**：`key=value; key=value` 形式声明这条结论在什么条件下成立（`population=…` / `comparator=…` / `release=…`）。响应回显 `scope`（未写为 `null`）；前提与更近的存量行对不上时**不会覆盖它**，各存一条并带 `different-scope:` 警告。
+- **`memory_verify` 新增 `scope` 参数 + `out_of_scope` 返回**：带着前提去问，库里属于别的前提的那条会答 `OUT_OF_SCOPE`（`substantiated` 与 `contradicted` 都为 `false`）而不是被盖章支持；支持行带前提而提问没给时，note 出现 `CONDITIONAL SCOPE` 并说明该前提未被核对。工具描述里补上了这第四种结局。
+- **`memory_recall` 命中带 `scope`**：同一主题在不同前提下各有一行时，靠这个字段分辨 agent 看到的是哪一条。
+- **`memory_maintain list` / `history` 透出 `scope`**（与其它文本同样过注入清洗），审查"这条是在什么口径下测的"不用回到对话里翻。
+- **注入的记忆纪律更新**：第 1 条要求"只在条件下成立的结论要带 `scope`"，第 3 条要求"带 scope 去 verify，`out_of_scope` 时不得把那个答案搬到当前前提下"。
+
+> `scope` / `out_of_scope` 依赖引擎带该字段的新版本。配旧引擎不会报错：`scope` 被忽略、`out_of_scope` 恒为 `false`，其余行为与本版之前一致。**发布时需把 `hippo-memory-core` 的依赖下限提到带 `scope` 的版本**（当前为 `^0.2.0`）。
+
+### Added — ② 重复可以合并：`memory_maintain merge`
+
+- **`memory_maintain` 从 12 个动作变 13 个**：新增 `merge`。`{ action: "merge", ids: [一个 duplicates 组的 id] }` 默认**预览**（`dry_run` 未给即为 true，返回谁留下、谁被折、`carried[]` 结转了什么、`blocked[]` 因何不动），`dry_run: false` 才落地。参数表补 `into`（点名要留的 id，必须是 `ids` 之一）与 `dry_run` 说明。
+- **为什么不该再用 `delete` 清重复**：`delete` 连版本历史一起消失，`merge` 只把多余行折叠（`demoted`）——行还在库里、默认召回不再出现、`undemote` 随时恢复。`duplicates` 的提示语现在把这条路写清楚（"review, then merge a group you confirmed… or remove ids with action delete (history is removed with the row)"）。
+- **`duplicates` 报告变宽**：每行带 `scope`，组级带 `mixedPremises`（组里至少有一对行前提互斥即为 true）。提示语据此写明：这类组**不是整组作废**，与幸存行前提相符的行照常折叠，冲突的行留在 `blocked[]`。
+- **`list` 新增 `demoted` 字段**：合并 / 压缩过的行本来就一直出现在清单里，但此前没有任何标记，agent 分不清哪条是被折的、也就拿不到 `undemote` 要用的 id。现在每行带 `demoted: true/false`。
+
+### Added — ③ 门槛没过时 digest 不再空白（本适配层无代码改动）
+
+召回全部低于门槛时，digest 第 1 行是引擎给的最接近痕迹并带 `[low-confidence sim … < floor …: the closest trace, not a memory — verify before asserting]`；零命中时不再回填 `[recent]` 近况。适配层的渲染不变（digest 整体来自引擎），但**使用纪律补了一句解释**：见下面的 GUIDANCE 变更。
+
+### Added — ④ `status` 看得见隔壁那个库
+
+- **`status` 新增 `path_rule`**：一句"本宿主的库文件名是怎么来的"——开 `sharedStore` 时说明所有 agent 共用一个文件，否则说明"每个 agent id 一个文件，别的 agent 记的东西在这里看不到（要合并请开 sharedStore）"。
+- **`diagnostics` 整体透出**，因此引擎新增的 `sibling_stores`（同目录每个 `.db` 的 `rows` / `demoted` / `lastWrite` / `current`）、`scope_rule`（"记忆不跨库文件流动"这条契约）与 `coverage`（本进程 digest 的 `turns` / `misses` / `guesses`）在 `status` 里直接可读，不需要改渲染层。
+- **`health` 判定顺序改为"先看库分裂"**：本库 0 行而隔壁有货 → 直接说"这条记忆写在另一个库里"（点名 agent 维度），其次才是嵌入器不匹配。DSH 按 agent id 分库，所以"没记住"与"记在另一个文件"在工具输出里过去完全同形。
+
+### Changed — 注入的使用纪律（模型能不能看见这些能力）
+
+- `GUIDANCE` 第 4 条（MAINTAIN）现在**点名** `status` / `duplicates` / `merge` / `undemote`，并写明 `mixedPremises` 组的读法和"`delete` 会连版本历史一起删"。一条工具如果纪律里不提，模型基本不会想到去用——这是本批唯一让 `merge` 真正可达的改动。
+- `GUIDANCE` 第 5 条补一句：digest 里 `[low-confidence …]` 那行是**门槛以下的猜测**，不是记忆，断言前须复查、不得当成已存事实复述。
+- 新增测试锁住这段文案（纪律里必须出现 `duplicates` / `merge` / `low-confidence`），避免以后改提示词时把可达性悄悄改掉。
+
 ## [0.2.1] — 2026-09-18
 
 ### Fixed

@@ -8,11 +8,10 @@
  * past, they archive it).
  */
 
-import { openDatabase, sqliteDriver, setSqliteDriver } from './sqlite-runtime.js';
+import { openDatabase } from './sqlite-runtime.js';
 import type { SqliteDatabaseLike } from './sqlite-runtime.js';
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
-import { dirname } from 'node:path';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import type { MemoryKind, SourceConfidence } from './schema.js';
 
 
@@ -69,6 +68,8 @@ export interface MemoryRow {
   retracts: string | null;
   /** Prospective trigger/action JSON {trigger,action} (nullable). */
   guard_json: string | null;
+  /** Stated premises this summary holds under, free text (nullable). */
+  scope: string | null;
   /** Folded into an invariant by compress (1 = hidden from default recall). */
   demoted: number;
   /** Invariant row this trace was folded into (nullable). */
@@ -120,6 +121,7 @@ CREATE TABLE IF NOT EXISTS memories (
   verified_at TEXT,
   retracts TEXT,
   guard_json TEXT,
+  scope TEXT,
   demoted INTEGER NOT NULL DEFAULT 0,
   demoted_to TEXT,
   demoted_at TEXT,
@@ -155,6 +157,7 @@ CREATE TABLE IF NOT EXISTS memory_history (
   verified_at TEXT,
   retracts TEXT,
   guard_json TEXT,
+  scope TEXT,
   PRIMARY KEY (id, version)
 );
 `;
@@ -185,13 +188,13 @@ export class SqliteStore {
   private ensureColumns(): void {
     const cols = this.db.prepare('PRAGMA table_info(memories)').all() as { name: string }[];
     const have = new Set(cols.map((c) => c.name));
-    for (const col of ['superseded_by', 'verify_json', 'verify_result', 'verified_at', 'retracts', 'guard_json', 'demoted_to', 'demoted_at']) {
+    for (const col of ['superseded_by', 'verify_json', 'verify_result', 'verified_at', 'retracts', 'guard_json', 'demoted_to', 'demoted_at', 'scope']) {
       if (!have.has(col)) this.db.exec(`ALTER TABLE memories ADD COLUMN ${col} TEXT;`);
     }
     if (!have.has('demoted')) this.db.exec('ALTER TABLE memories ADD COLUMN demoted INTEGER NOT NULL DEFAULT 0;');
     const hcols = this.db.prepare('PRAGMA table_info(memory_history)').all() as { name: string }[];
     const hhave = new Set(hcols.map((c) => c.name));
-    for (const col of ['verify_json', 'verify_result', 'verified_at', 'retracts', 'guard_json']) {
+    for (const col of ['verify_json', 'verify_result', 'verified_at', 'retracts', 'guard_json', 'scope']) {
       if (!hhave.has(col)) this.db.exec(`ALTER TABLE memory_history ADD COLUMN ${col} TEXT;`);
     }
   }
@@ -206,15 +209,27 @@ export class SqliteStore {
       return;
     }
     this.db = openStore(path);
-    this.db.exec('PRAGMA journal_mode = WAL;');
-    // Shared-store deployments have multiple processes writing the same file
-    // (recall's access bookkeeping vs. another agent's remember). WAL alone
-    // does not serialize writers: without a busy timeout a colliding write
-    // throws SQLITE_BUSY immediately. A bounded wait lets the loser retry
-    // transparently; transactions keep each write short.
-    this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.trunc(busyTimeoutMs))};`);
-    this.db.exec(SCHEMA);
-    this.ensureColumns();
+    try {
+      this.db.exec('PRAGMA journal_mode = WAL;');
+      // Shared-store deployments have multiple processes writing the same file
+      // (recall's access bookkeeping vs. another agent's remember). WAL alone
+      // does not serialize writers: without a busy timeout a colliding write
+      // throws SQLITE_BUSY immediately. A bounded wait lets the loser retry
+      // transparently; transactions keep each write short.
+      this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.trunc(busyTimeoutMs))};`);
+      this.db.exec(SCHEMA);
+      this.ensureColumns();
+    } catch (err) {
+      // A file that turns out not to be a store must not stay open: on Windows
+      // the leaked handle locks it for the rest of the process, so a read-only
+      // probe (survey, prune) can make the file undeletable.
+      try {
+        this.db.close();
+      } catch {
+        /* already released */
+      }
+      throw err;
+    }
   }
 
   /** True while this store is held in memory because no file exists yet. */
@@ -270,6 +285,14 @@ export class SqliteStore {
     return Number(r.c);
   }
 
+  /** Live rows hidden from default recall (folded by compress / merge). */
+  countDemoted(): number {
+    const r = this.db
+      .prepare('SELECT COUNT(*) AS c FROM memories WHERE superseded = 0 AND demoted = 1')
+      .get() as { c: number };
+    return Number(r.c);
+  }
+
   /** True when the store holds no rows at all (active or superseded) and no
    *  archived history — i.e. the file carries no information worth keeping. */
   isEmpty(): boolean {
@@ -289,9 +312,9 @@ export class SqliteStore {
           participants_json, rule, entities_json, tags_json, occurred_at,
           source, confidence, importance, access_count, last_access_at,
           created_at, updated_at, superseded, superseded_by, verify_json,
-          verify_result, verified_at, retracts, guard_json, demoted,
+          verify_result, verified_at, retracts, guard_json, scope, demoted,
           demoted_to, demoted_at, vec
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
         row.id, row.version, row.kind, row.summary, row.detail,
@@ -300,7 +323,7 @@ export class SqliteStore {
         row.confidence, row.importance, row.access_count, row.last_access_at,
         row.created_at, row.updated_at, row.superseded, row.superseded_by ?? null,
         row.verify_json, row.verify_result, row.verified_at, row.retracts,
-        row.guard_json, row.demoted, row.demoted_to ?? null, row.demoted_at ?? null,
+        row.guard_json, row.scope, row.demoted, row.demoted_to ?? null, row.demoted_at ?? null,
         row.vec
       );
   }
@@ -315,7 +338,7 @@ export class SqliteStore {
           tags_json = ?, occurred_at = ?, source = ?, confidence = ?,
           importance = ?, access_count = ?, last_access_at = ?, updated_at = ?,
           superseded = ?, superseded_by = ?, verify_json = ?, verify_result = ?,
-          verified_at = ?, retracts = ?, guard_json = ?, demoted = ?,
+          verified_at = ?, retracts = ?, guard_json = ?, scope = ?, demoted = ?,
           demoted_to = ?, demoted_at = ?, vec = ?
          WHERE id = ?`
       )
@@ -326,7 +349,7 @@ export class SqliteStore {
         row.importance, row.access_count, row.last_access_at, row.updated_at,
         row.superseded, row.superseded_by ?? null, row.verify_json,
         row.verify_result, row.verified_at, row.retracts, row.guard_json,
-        row.demoted, row.demoted_to ?? null, row.demoted_at ?? null,
+        row.scope, row.demoted, row.demoted_to ?? null, row.demoted_at ?? null,
         row.vec, row.id
       );
   }
@@ -343,8 +366,8 @@ export class SqliteStore {
           participants_json, rule, entities_json, tags_json, occurred_at,
           source, confidence, importance, access_count, last_access_at,
           created_at, updated_at, archived_at, verify_json, verify_result,
-          verified_at, retracts, guard_json
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+          verified_at, retracts, guard_json, scope
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
         row.id, row.version, row.kind, row.summary, row.detail,
@@ -352,7 +375,7 @@ export class SqliteStore {
         row.entities_json, row.tags_json, row.occurred_at, row.source,
         row.confidence, row.importance, row.access_count, row.last_access_at,
         row.created_at, row.updated_at, archivedAt, row.verify_json,
-        row.verify_result, row.verified_at, row.retracts, row.guard_json
+        row.verify_result, row.verified_at, row.retracts, row.guard_json, row.scope
       );
   }
 
@@ -424,7 +447,7 @@ export class SqliteStore {
   historyOf(id: string): HistoryRow[] {
     return this.db
       .prepare(
-        'SELECT version, summary, archived_at, detail, entities_json, verify_result FROM memory_history WHERE id = ? ORDER BY version DESC'
+        'SELECT version, summary, archived_at, detail, entities_json, verify_result, scope FROM memory_history WHERE id = ? ORDER BY version DESC'
       )
       .all(id) as unknown as HistoryRow[];
   }
@@ -510,4 +533,77 @@ export function pruneEmptyStores(
     }
   }
   return removed;
+}
+
+/**
+ * The store-scoping contract, stated once so every host can display it.
+ *
+ * It exists because "the memory is gone" and "you are reading a different
+ * file" look identical from a tool result — and only one of them is a bug in
+ * what you remember. Adapters add their own line about how *their* file name
+ * is derived; this is the part that is true for all of them.
+ */
+export const SCOPE_RULE =
+  'Memories never cross store files: one SQLite file per scope, and a read sees only what was ' +
+  'written through the same path. So an empty recall has two very different causes — nothing was ' +
+  'remembered, or it was remembered in another store. Check sibling_stores before believing the ' +
+  'first one: a zero-row store next to a full one means the write and the read are not looking at ' +
+  'the same file.';
+
+/** What `surveyStores` reports about one .db file in a cache directory. */
+export type StoreSurveyEntry = {
+  /** File name only — the directory is already in `survey.dir`. */
+  file: string;
+  /** Live rows in the file, the same count `stats().active` reports. */
+  rows: number;
+  /** How many of those are folded away by compress/merge: still live, never recalled by default. */
+  demoted: number;
+  /** File mtime as ISO, or null when it could not be read. */
+  lastWrite: string | null;
+  /** True for the store the caller is asking about. */
+  current: boolean;
+};
+
+/**
+ * Count every store file in a directory, the way `prune` already walks it.
+ *
+ * Read-mostly: it opens each file to run two COUNTs and closes it. A file that
+ * is not a store (or is locked) is named in `unreadable` instead of failing the
+ * survey — the report is diagnostic output, and losing it to one odd file in a
+ * cache directory would hide exactly the split it exists to reveal.
+ */
+export function surveyStores(
+  dir: string,
+  opts: { current?: string } = {}
+): { dir: string; stores: StoreSurveyEntry[]; unreadable: string[] } {
+  const stores: StoreSurveyEntry[] = [];
+  const unreadable: string[] = [];
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return { dir, stores, unreadable }; // cache root does not exist yet
+  }
+  const currentPath = opts.current ? resolve(opts.current) : null;
+  for (const file of entries.filter((f) => f.endsWith('.db'))) {
+    const full = join(dir, file);
+    try {
+      const lastWrite = new Date(statSync(full).mtimeMs).toISOString();
+      const probe = new SqliteStore(full);
+      let rows: number;
+      let demoted: number;
+      try {
+        rows = probe.countActive();
+        demoted = probe.countDemoted();
+      } finally {
+        probe.close();
+      }
+      stores.push({ file, rows, demoted, lastWrite, current: currentPath ? resolve(full) === currentPath : false });
+    } catch {
+      unreadable.push(file);
+    }
+  }
+  // fullest first: the question is where the memories are, not what order readdir gave them in.
+  stores.sort((a, b) => b.rows - a.rows || a.file.localeCompare(b.file));
+  return { dir, stores, unreadable };
 }

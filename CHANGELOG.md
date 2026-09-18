@@ -1,5 +1,59 @@
 # Changelog
 
+## [Unreleased] — 前提作用域 `scope` + 重复合并 + 兜底提示 + 库分裂可见（版本号待定）
+
+> 四条改动来自同一份外部实测反馈，共同点是**把"看起来没有"和"其实不是那样"区分开**：verify 不再拿旧口径的答案给新问题盖章（① `scope`）；重复报告不再诱使你把两种前提下的同一句话折成一条（② `merge` + `mixedPremises`）；召回没过门槛时不再静默空白，而是把最接近的痕迹标明身份给出（③）；一条记忆都没召回时，先看清是不是读错了库文件（④）。
+
+### Added — ① `scope`：把"断言集合"升级为"带前提的断言集合"
+
+- **新字段 `scope`**（`MemoryPayload` / `StoredMemory` / `RelatedTrace`）：`key=value` 段，`;` / `,` / 换行分隔，`=` 或 `:` 皆可（例：`population=all records; comparator=instruction start`）。进嵌入文本，因此同时影响召回排序。
+- **判定完全结构化，未新增相似度阈值**（`diagnostics().thresholds` 与设置项一个数都没变）：只比较双方都点名了的 key（只有一方写的 key 视为补充条件，不算反对）；value 按词集合比较——剔英文停用词、latin / 数字整段成词、中文逐字成词（比嵌入器更细的粒度，避免中文改写被误判成新前提），一方包含另一方或交并比 ≥ 0.5（内部常数）判兼容。任一方没写 scope 时**永不判为冲突**，转为"前提未核对"提示。
+- **写入端 `remember()`**：与更接近的存量行前提冲突时不覆盖、不合并 → `outcome:'new'` + `different-scope:` 警告（点名被顶住的行与冲突的 key，同一 id 只计一次）；前提一致照常走强化 / 版本化覆盖；重述时若存量行缺前提而新写带了，把前提**补到原行**而不是另起一行。`update()` 换前提时旧前提照常进 `history`。
+- **读取端 `sourceMonitor(claim, { scope })`**：过门槛候选里**优先选前提一致的那条**当支持（字面更接近的外前提行让位）；前提冲突 → 新增返回字段 `out_of_scope: true`，`substantiated` / `contradicted` 双假、四组证据清空，note 以 `OUT_OF_SCOPE:` 开头并给出两条出路（在痕迹自己的前提下复查 / 带自己的 scope 另记一条）。SUBSTANTIATED 与 CONTRADICTED 路径显式带 `out_of_scope: false`。
+- **前提没被核对时不静默**：支持行带前提而调用方没给 scope → note 追加 `CONDITIONAL SCOPE — …that premise was not checked`；给了 scope 而支持行没带 → note 说明无从核对。
+- **透出**：`composeContext` 渲染 `[scope: …]`（与其它字段同样过注入清洗），`recall` 命中、`neighbours[]`、`history()` 均带 `scope`。
+- **旧库零迁移**：`memories.scope` 与 `memory_history.scope` 走 `ensureColumns()` 的 `ALTER TABLE` 补列，存量行读作"未声明前提"；不带 scope 的读写路径行为不变（回归测试锁定）。另有删列后重开库的迁移测试：补列 → 新写能带前提。
+
+### Added — ② `mergeDuplicates()`：把 `duplicates` 报告变成可执行的一步
+
+以前 `duplicates` 只能"看一眼再手动 `delete`"，而 `delete` 会连版本历史一起删掉。现在有一条明确的合并动作，DSH 与 opencode 都叫 `memory_maintain` 的 `merge`。
+
+- **引擎 `mergeDuplicates({ ids, into?, dryRun? })`**：只吃**一个**重复组的 id（≥2）。留下的行按"有通过的证据 > 访问次数 > importance > 版本号 > 最早写入"挑，`into` 可显式指定；`dryRun` 只预览不动库（适配层默认就是预览，`dry_run:false` 才落地）。
+- **合并 = 折叠，不是删除**：多余行走 `compress` 同一套 demote 机制，**留在库里**、默认召回不再出现、`list()` 一直列出它们（行上带 `demoted: true`，`recall(..., { includeDemoted: true })` 才把它们放回召回）、`undemote` 随时恢复。opencode 此前没有 `undemote` 动作，本次一并补上（否则提示语里承诺"可回滚"就是假的）。
+- **信息只增不减**：先把被并行的实体、标签、更长的 `detail`、更高 importance 结转给幸存行，**再**退役它们（顺序写在注释里：中途崩溃只会留下"没并完"，不会留下"信息丢了"）。返回 `carried[]` 明说结转了什么。
+- **三种拒绝**：① 与幸存行前提冲突的行 → 进 `blocked[]` 并给出冲突 key（"同一句话在别的条件下仍是它自己的痕迹"）——只有这些行不折，组内与幸存行前提相符的行照常折叠；② id 之间不是同一断言的重述 → 直接抛错；③ `retraction` / `guard` / `invariant` 标记行不参与合并（它们本来就是浓缩结果）。
+- **`duplicates()` 报告同时变宽**：每组每行新增 `scope`，组级新增 `mixedPremises: true/false`——定义为"组里至少有一对行前提互斥"（不是"整组都不是重复"）。两个适配层的提示语据此写成"这样的组不要顺手折成一条"，而引擎的实际行为更精确：与幸存行前提相符的行照常折叠，冲突的行留在 `blocked[]`；全都冲突时 `survivor` 返回 `null`、一条不折。
+- **DSH 的 `list` 输出补 `demoted` 字段**：折叠行本来就一直在清单里，但没有任何标记，agent 分不清哪条被折过、也就取不到 `undemote` 要用的 id——"可回滚"这句承诺在工具面上是断的（opencode 直接返回引擎对象，本来就有这个字段）。测试同时锁住两家的清单里能读出被折行的 id。
+
+### Added — ③ 门槛没过时不再空白：最接近的痕迹标明身份给出 + 覆盖率计数
+
+原来"库里没东西"和"最像的那条只打了 0.31（门槛 0.32）"输出的是同一句"没有相关记忆"，而后者才是值得看的信号。
+
+- **`composeContext`**：命中为空且召回原因是 `below-threshold` 时，把最接近的那条作为**第 1 行**渲染，标 `[low-confidence sim 0.31 < floor 0.32: the closest trace, not a memory — verify before asserting]`，并带一条 warning 说明身份。它**不借用**原行的 `[VERIFIED]` / `[ASSERTED]`（没过门槛就没有资格声称证据等级）；`items[0].lowConfidence === true`，程序侧也能判。
+- **不给猜的地方**：相似度为 0（完全没有词面重叠）或库为空 → 仍然只出状态行，不塞任何东西。`{ lowConfidenceTop1: false }` 可整体关掉。
+- **不再用 `[recent]` 顶坑**：零命中时补近况的分支被撤回（那会让通道看起来健康，实际每次都在端出最后几条写入），改为显式状态行 + warning。这是本批唯一的行为契约变更，`test/memory.test.mjs` 相应改写为"不得出现未被标明的填充行"。
+- **`diagnostics().coverage = { turns, misses, guesses, scope: 'process' }`**：本进程调过多少次门槛、多少次什么都没放行、其中多少次给出了标明身份的猜测。`misses / turns` 就是召回命中率。刻意**不落库**——持久化计数器会被读成历史，而它回答的是"这次会话里记忆系统有没有在起作用"。
+
+### Added — ④ `status` 看得见"隔壁那个库"：`sibling_stores` / `scope_rule`
+
+DSH 按 agent id 分库、opencode 按项目目录分库，于是"没记住"和"记在另一个文件里"在工具输出里长得一模一样。这是实测里两个库各存各的那类事故的诊断入口。
+
+- **引擎新增导出 `surveyStores(dir, { current })` 与 `SCOPE_RULE`**：前者照 `prune` 已有的走目录方式，把目录里每个 `.db` 打开数一遍行数（`rows` 与 `stats().active` 同口径、`demoted` 单列、`lastWrite` 取 mtime、`current` 标出调用者自己），按行数从多到少排；打不开的文件进 `unreadable[]` 而不是让整份报告消失。后者把"记忆不会跨库文件流动"这条契约写在引擎里一处，适配层各自只补一句"本宿主的文件名是怎么来的"。
+- **`diagnostics()` 多两个字段**：`sibling_stores`（上面那份）和 `scope_rule`；`suspicious` 多一个 `emptyWhileSiblingsFull`——本库为空而隔壁有货。`:memory:` 库不扫目录（`dirname(':memory:')` 是 `.`，那会把进程恰好启动在哪个目录里的 `.db` 全列出来）。
+- **两个适配层的 `status` 各加 `path_rule`，`health` 判定顺序改为"先看库分裂"**：空库 + 隔壁满 → 直接说"这条记忆写在另一个库里"（DSH 点名 agent 维度，opencode 点名项目维度并提示 `sharedStore`），其次才是原来那条嵌入器不匹配。`diagnostics` 整体透出，所以 `sibling_stores` / `scope_rule` / `coverage` 在两家 `status` 里都能直接读到，不需要改渲染层。
+- **顺带补齐 opencode 的一部分清洗面**：`duplicates` 报告与新增的 `merge` 输出（含引擎抛回的拒绝理由）一律过引擎 `sanitizeMemoryText`，与 DSH 的 `list` 一致。注意 opencode 的 `list` / `history` / `recall` 命中仍**没有**清洗（只有自动注入的 digest 经引擎清洗），是遗留缺口，本批未动，见 ROADMAP。
+
+### Fixed
+
+- **`SqliteStore` 构造失败会漏掉文件句柄**：开库成功后建表 / 补列抛错（典型情形：目录里躺着一个不是 SQLite 的 `.db`）时，句柄不释放。Windows 上这会把该文件锁到进程结束，只读探测都变成"删不掉"。现在构造失败前先 `close()` 再抛。`pruneEmptyStores` 里有同样的模式，一并受益。
+
+### Tests
+
+- 引擎新增 32 项：`test/scope.test.mjs` 12（写读往返、无 scope 时 verify 行为不变、前提匹配即支持、`OUT_OF_SCOPE`、`CONDITIONAL SCOPE` 注记、前提一致的痕迹压过字面更接近的外前提行、不同前提各成一条痕迹、同前提仍复述强化、`update` 归档旧前提、补录缺失前提、旧库迁移、`different-scope:` 不重复计数）+ `test/merge-duplicates.test.mjs` 7（预览、落地后 `undemote` 往返、证据持有者幸存并继承实体、混合前提拒绝、无关 id 抛错、标记行抛错、报告带 `scope` / `mixedPremises`）+ `test/digest-top1.test.mjs` 5（低于门槛仍给最接近痕迹并标明身份、零重叠不给猜、空库只出状态行、正常命中不加标记、`coverage` 计数）+ `test/survey-stores.test.mjs` 8（空目录 / 缺目录、逐库计数与 `current` 标注、demoted 单列、非库文件进 `unreadable` 且不致命、`diagnostics` 透出、空库隔壁满 / 无隔壁两种情形、`SCOPE_RULE` 文案）。
+- 适配层新增 10 项。DSH 5：`scope` 参数与 `OUT_OF_SCOPE` 回显、`duplicates → merge` 预览到落地、混合前提组不整组作废（`blocked[]` + 其余照常折叠）、`status` 点名库分裂、**使用纪律文本本身被断言**（`GUIDANCE` 必须点名 `duplicates` / `merge` / `low-confidence`，否则模型看不到这条清理路径）。opencode 5：`scope` / `OUT_OF_SCOPE`、`duplicates → merge` 预览到落地、`merge` 不折不同前提、`status` 的 `path_rule` 与"隔壁那个库"提示、`DISCIPLINE` 同样点名 `merge` 与 digest 的猜测行。
+- **全量 194 项通过 / 0 失败**（引擎 142 + DSH 35 + opencode 17；`npm test` 会先 `tsc` 构建再跑）。本批基线是 152 项（引擎 110 + 适配层 42），新增即上面 42 项。
+
+
 ## [0.2.1] — 2026-09-18
 
 ### Added — Bun 运行时支持（引擎现在直接跑在 opencode 里）

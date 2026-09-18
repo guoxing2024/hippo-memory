@@ -1,5 +1,37 @@
 # Changelog
 
+## [Unreleased] — 前提作用域 `scope`（版本号待定）
+
+### Added
+
+- **`memory_remember` 新增 `scope` 参数**（`key=value; key=value`）：声明这条结论在什么条件下成立。响应回显 `scope`；前提与存量行对不上时新写**不覆盖旧行**，两条并存并带 `different-scope:` 警告。
+- **`memory_verify` 新增 `scope` 参数与 `out_of_scope` 返回**：库里那条是在别的前提下说的 → 答 `OUT_OF_SCOPE`（`substantiated` / `contradicted` 双假），不再把旧前提下的结论盖到当前问题上。支持行带前提而提问没给 scope 时，note 里出现 `CONDITIONAL SCOPE`。
+- **`memory_recall` 命中带 `scope`**（`hitView` 透出），同一主题多个前提各一行时可分辨。
+- **注入的使用纪律更新**：写入一条要求"只在条件下成立就带 `scope`"；查证一条要求"`out_of_scope` 说明记忆里的答案属于别的前提，不得搬用"。
+
+> 依赖引擎带 `scope` 的新版本（当前 `hippo-memory-core: ^0.2.1`，发布时需提高下限）。配旧引擎不报错：`scope` 被忽略、`out_of_scope` 恒为 `false`。
+
+### Added — ② 重复合并：`memory_maintain merge` / `undemote`
+
+- **新增 `merge` 动作**：`{ action: "merge", ids: [一个 duplicates 组的 id] }`，**默认预览**（`dry_run !== false`），`dry_run: false` 才落地。返回 `survivor` / `retired[]` / `carried[]` / `blocked[]` / `note`，全部文本过引擎 `sanitizeMemoryText`（引擎抛回的拒绝理由也清洗——理由里有记忆原文）。
+- **补上 `undemote` 动作**：此前提示语承诺"折叠可回滚"，但 opencode 侧根本没有恢复入口，承诺是假的。现在 `{ action: "undemote", ids: [...] }` 直接透传引擎的 `{ restored[] }`。
+- **`duplicates` 报告变宽并清洗**：每行带 `scope`，组级带 `mixedPremises`（组里至少有一对行前提互斥即为 true）。提示语据此写明"这类组里与幸存行前提相符的行照常折叠，冲突的行留在 `blocked[]`"。
+- **`merge` 是折叠不是删除**：多余行仍在库里、默认召回不出现、`list` 仍列出（引擎 `StoredMemory.demoted` 原样透出）。DSH 版 `list` 这次补了 `demoted` 字段，本包因为直接返回引擎对象所以本来就有。
+
+### Added — ③ digest 门槛没过时不再空白
+
+零命中 digest 现在可能带第 1 行 `[low-confidence sim 0.31 < floor 0.32: the closest trace, not a memory — verify before asserting]`（引擎产出，适配层不额外渲染）；同时零命中不再回填 `[recent]` 近况。**`DISCIPLINE` 补一句解释这行是什么**（门槛以下的猜测、不是记忆、不得当作已存事实复述），否则模型会把它当成过了门槛的证据引用。
+
+### Added — ④ `status` 看得见隔壁那个库
+
+- **新增 `path_rule`**：说明本项目的库文件名怎么来的（按项目目录 slug 分库；`sharedStore: true` 时所有项目写同一个 `shared.db`）。
+- **`diagnostics` 整体透出**：`sibling_stores`（缓存目录里每个 `.db` 的 `rows` / `demoted` / `lastWrite` / `current`）、`scope_rule`、`coverage` 直接可在 `status` 里读到。
+- **`health` 先判"本库空、隔壁满"**：这种情形说的是"这条记忆写在另一个库里"并提示 `sharedStore`，而不是原先那句嵌入器不匹配——opencode 按项目分库，过去这两种故障输出同形。
+
+### Changed — 注入的使用纪律
+
+`DISCIPLINE` 第 4 条（MAINTAIN）现在点名 `status` / `duplicates` / `merge` / `undemote`，并写明"`delete` 会连版本历史一起删，清重复该用 `merge`"。纪律里不提的工具模型不会想到去用，所以这一段是 `merge` 在 opencode 里真正可达的前提。新增测试断言这段文案包含 `merge` 与 `low-confidence`。
+
 ## [0.2.2] — 2026-09-18
 
 ### Fixed

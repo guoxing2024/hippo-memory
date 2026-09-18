@@ -117,6 +117,13 @@ test('registers a guidance section and a digest context contribution', () => {
   assert.ok(contexts.some((c) => c.name === 'hippo-memory:digest'), 'digest context');
 });
 
+test('guidance tells the agent how to clean duplicates and how to read a guess', () => {
+  const text = sections.find((s) => s.name === 'plugin:hippo-memory').text;
+  assert.match(text, /duplicates/, 'names the read-only report');
+  assert.match(text, /\bmerge\b/, 'names the action that acts on a duplicates group');
+  assert.match(text, /low-confidence/, 'explains the digest line that is a guess, not a memory');
+});
+
 test('settings schema exposes the full field set with defaults', () => {
   const shape = SettingsSchema.toString();
   assert.match(shape, /enabled/);
@@ -258,6 +265,49 @@ test('verify returns verdict plus closest candidate when unsubstantiated', async
   const support = await toolExec('memory_verify', { claim: 'billing db -> postgres' });
   assert.equal(support.substantiated, true);
   assert.ok(support.support);
+});
+
+test('remember carries scope and verify answers OUT_OF_SCOPE for foreign premises', async () => {
+  const agent = { agent: { id: 'scope-agent' } };
+  const written = await toolExec(
+    'memory_remember',
+    {
+      kind: 'semantic',
+      summary: 'ZZADAPTERSCOPE the pair stays at the independence baseline',
+      scope: 'population=all records; comparator=instruction start'
+    },
+    agent
+  );
+  assert.equal(written.scope, 'population=all records; comparator=instruction start');
+
+  const off = await toolExec(
+    'memory_verify',
+    {
+      claim: 'ZZADAPTERSCOPE the pair stays at the independence baseline',
+      scope: 'comparator=disp field of the recorded instruction'
+    },
+    agent
+  );
+  assert.equal(off.out_of_scope, true, `foreign premises must not substantiate: ${off.note}`);
+  assert.equal(off.substantiated, false);
+
+  const on = await toolExec(
+    'memory_verify',
+    {
+      claim: 'ZZADAPTERSCOPE the pair stays at the independence baseline',
+      scope: 'comparator=instruction start'
+    },
+    agent
+  );
+  assert.equal(on.out_of_scope, false);
+  assert.equal(on.substantiated, true);
+
+  const plain = await toolExec('memory_verify', { claim: 'ZZADAPTERSCOPE the pair stays at the independence baseline' }, agent);
+  assert.equal(plain.out_of_scope, false, 'no caller scope keeps the old verdict');
+  assert.match(plain.note, /CONDITIONAL SCOPE/);
+
+  const r = await toolExec('memory_recall', { query: 'ZZADAPTERSCOPE independence baseline' }, agent);
+  assert.equal(r.hits[0].scope, 'population=all records; comparator=instruction start');
 });
 
 /* ------------------------- maintain: stats/list/history ------------------------- */
@@ -620,3 +670,74 @@ test('compress previews groups, folds on plan, expands and restores', async () =
   assert.equal(back.restored.length, 1, 'one row restored');
 });
 
+
+test('duplicates -> merge previews, then retires the extra into the survivor', async () => {
+  const agent = { agent: { id: 'merge-agent' } };
+  const ep = await toolExec('memory_remember', {
+    kind: 'episode', summary: 'ZZMRG modbus timeout -> 1500 ms on the gateway',
+    entities: ['zzmrg'], source: 'tool', importance: 0.9
+  }, agent);
+  await toolExec('memory_maintain', { action: 'consolidate' }, agent);
+  const rep = await toolExec('memory_maintain', { action: 'duplicates' }, agent);
+  const group = rep.groups.find((g) => g.memories.some((x) => x.id === ep.id));
+  assert.ok(group, `the episode/rule pair is reported: ${JSON.stringify(rep)}`);
+  assert.equal(group.mixedPremises, false, 'the report says the pair is mergeable');
+  const ids = group.memories.map((x) => x.id);
+
+  const preview = await toolExec('memory_maintain', { action: 'merge', ids }, agent);
+  assert.equal(preview.dry_run, true, 'the default is a preview');
+  assert.equal(preview.retired.length, 1);
+  const before = await toolExec('memory_maintain', { action: 'list', limit: 100 }, agent);
+  assert.ok(ids.every((id) => before.memories.some((x) => x.id === id)), 'a preview retires nothing');
+
+  const applied = await toolExec('memory_maintain', { action: 'merge', ids, dry_run: false }, agent);
+  assert.equal(applied.ok, true, `merge applied: ${JSON.stringify(applied)}`);
+  assert.equal(applied.retired.length, 1);
+  const listed = await toolExec('memory_maintain', { action: 'list', limit: 100 }, agent);
+  const folded = listed.memories.find((x) => x.id === applied.retired[0].id);
+  assert.ok(folded, 'the folded row is still listed — merge did not delete it');
+  assert.equal(folded.demoted, true, 'the list names it as folded, so undemote has an id to work from');
+  const after = await toolExec('memory_maintain', { action: 'duplicates' }, agent);
+  assert.ok(!after.groups.some((g) => g.memories.some((x) => ids.includes(x.id))), 'merged group stops being reported');
+  const rec = await toolExec('memory_recall', { query: 'ZZMRG modbus timeout', limit: 10 }, agent);
+  assert.equal(rec.hits.filter((h) => ids.includes(h.id)).length, 1, 'one restatement is offered, not two');
+});
+
+test('merge refuses a mixed-premise group instead of folding two conditions into one', async () => {
+  const agent = { agent: { id: 'merge-premise-agent' } };
+  const a = await toolExec('memory_remember', {
+    kind: 'semantic', summary: 'ZZMRG2 pair stays at the independence baseline', scope: 'population=first 4096 rows'
+  }, agent);
+  assert.equal(a.scope, 'population=first 4096 rows', 'the write echoes the premise it stored');
+  const b = await toolExec('memory_remember', {
+    kind: 'semantic', summary: 'ZZMRG2 pair stays at the independence baseline', scope: 'population=all records'
+  }, agent);
+  assert.equal(b.outcome, 'new');
+  const rep = await toolExec('memory_maintain', { action: 'duplicates' }, agent);
+  const group = rep.groups.find((g) => g.memories.some((x) => x.id === a.id));
+  assert.equal(group.mixedPremises, true, `the report flags it: ${JSON.stringify(group)}`);
+  // The flag is per-pair, so the advice must not write the whole group off: a
+  // group can hold real restatements next to rows stated under other premises.
+  assert.match(rep.note, /not restatements of each other/, 'the note names what the flag means');
+  assert.doesNotMatch(rep.note, /group with mixedPremises:true is NOT duplicates/);
+  const res = await toolExec('memory_maintain', { action: 'merge', ids: group.memories.map((x) => x.id) }, agent);
+  assert.equal(res.survivor, null, 'nothing is kept over the other');
+  assert.equal(res.retired.length, 0);
+  assert.equal(res.blocked.length, 1);
+  assert.match(res.blocked[0].reason, /premise/i);
+});
+
+test('status names the store split: empty here, full next door', async () => {
+  const writer = { agent: { id: 'split-writer-agent' } };
+  await toolExec('memory_remember', { kind: 'semantic', summary: 'ZZSPL sibling holds the fact -> 1' }, writer);
+  const reader = { agent: { id: 'split-reader-agent' } };
+  const st = await toolExec('memory_maintain', { action: 'status' }, reader);
+  assert.equal(st.diagnostics?.sibling_stores?.stores?.find((s) => s.file === 'split-writer-agent.db')?.rows, 1,
+    `the neighbour is counted: ${JSON.stringify(st.diagnostics?.sibling_stores)}`);
+  assert.equal(st.diagnostics?.sibling_stores?.stores?.some((s) => s.current), false,
+    'a store that never wrote has no file to be current in');
+  assert.match(String(st.diagnostics?.scope_rule), /never cross|one store|per /i,
+    'the engine rule reaches the model through status');
+  assert.match(String(st.health), /split|another store|sibling/i, `health says it plainly: ${st.health}`);
+  assert.match(String(st.path_rule), /agent/i, 'and names the rule this host applies');
+});

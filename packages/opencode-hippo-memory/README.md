@@ -16,10 +16,13 @@
 
 | 能力 | 说明 |
 |---|---|
-| **4 个记忆工具** | `memory_remember` 写 / `memory_recall` 查 / `memory_verify` 断言前查证 / `memory_maintain` 维护（status / stats / list / history / duplicates / override-audit / consolidate / forget / delete） |
-| **每轮自动注入** | 用当前对话当线索，把相关旧结论拼成 `[hippo-memory digest]` 块注入系统提示；**命中才耗 token** |
+| **4 个记忆工具** | `memory_remember` 写 / `memory_recall` 查 / `memory_verify` 断言前查证 / `memory_maintain` 维护（status / stats / list / history / duplicates / merge / undemote / override-audit / consolidate / forget / delete，共 11 个动作） |
+| **每轮自动注入** | 用当前对话当线索，把相关旧结论拼成 `[hippo-memory digest]` 块注入系统提示；**命中才耗 token**。全部低于门槛时不再空白：最接近的那条作为第 1 行给出并标明 `[low-confidence … not a memory]`（随下个版本发布） |
 | **压缩前保住结论** | 会话压缩（compaction）前把持久记忆附进压缩上下文，压缩后不丢关键结论 |
 | **使用纪律** | 系统提示追加一小节，教模型 WRITE → RECALL → VERIFY → MAINTAIN，查无实据就说"记不清" |
+| **前提作用域** | `memory_remember` / `memory_verify` 都接受 `scope`（`key=value; …`）；换口径的重测各存各的，verify 会答 `out_of_scope`（随下个版本发布） |
+| **重复合并** | `memory_maintain { action: "duplicates" }` 只读报告同一句话的重述（每组带 `mixedPremises`），确认后 `{ action: "merge", ids: [...] }` 折叠成一条：默认预览，`dry_run: false` 才落地，多余行不删、`undemote` 可恢复（随下个版本发布） |
+| **隔壁那个库看得见** | `status` 除 `health` / 诊断外，新增 `path_rule`（本项目库文件名的由来）、`sibling_stores`（同目录每个 `.db` 各有多少行）、`coverage`（本进程 digest 门槛的读数）；本库空而隔壁满时 `health` 第一句就是"记在另一个文件里"（随下个版本发布） |
 | **纯本地** | SQLite（`node:sqlite` / `bun:sqlite` 自动选），零外部服务、零 API key、零网络请求 |
 
 ---
@@ -111,8 +114,10 @@ opencode debug info        # plugins: 一行里应出现 opencode-hippo-memory
 ```markdown
 这个项目启用了长期记忆（memory_* 工具）：
 - 学到持久结论、做完决策 → memory_remember（summary 用 <主体> -> <结论>）
+- 只在某种条件下成立的结论（样本范围、比较基准、版本）→ 带上 scope: "key=value; key=value"
 - 回答涉及旧事实/旧决策 → 先 memory_recall，别只凭当前上下文猜
-- 断言记忆里的东西之前 → memory_verify；没依据就说"记忆里没有"，不要编
+- 断言记忆里的东西之前 → memory_verify（问的也是同一个 scope）；没依据就说"记忆里没有"，
+  out_of_scope 就说明库里那条属于别的前提，不要搬用
 ```
 
 ---
@@ -129,7 +134,7 @@ opencode debug info        # plugins: 一行里应出现 opencode-hippo-memory
 
 查不到时不给空数组，而是说明原因：`reason` = `below-threshold`（有相关但没过门槛，看 `nearMisses`）/ `no-candidates`（库里没有或全被筛掉）。
 
-写入的结局看 `outcome`，不要数行数：`new` 新增 / `none` 复述强化（不新增行）/ `merge` 并入 / `override` 同主体换值（旧版归档、带 warning 指名退役对象）/ `supersede` 显式退役。
+写入的结局看 `outcome`，不要数行数：`new` 新增 / `none` 复述强化（不新增行）/ `merge` 并入 / `override` 同主体换值（旧版归档、带 warning 指名退役对象）/ `supersede` 显式退役。命中与写入结果都带 `scope`（这条结论声明的前提，未声明为 `null`）；带前提的新写与库里的旧前提对不上时走 `new` 并附 `different-scope:` 警告，而不是覆盖。
 
 ---
 
@@ -149,7 +154,10 @@ Windows 用 `%LOCALAPPDATA%\opencode\hippo-memory`；其余平台用 `~/.cache/o
 ## ❓ 常见问题
 
 **Q：和 `dsh-hippo-memory` 什么关系？**
-同一个引擎的两个宿主适配层，**互不通用**：DSH 用前者，opencode 用本包。
+同一个引擎的两个宿主适配层，**互不通用**：DSH 用前者，opencode 用本包。数据也不通用——DSH 按 agent id 分库（`~/.dsh/storages/hippo-memory/`），opencode 按项目目录分库（`<缓存根>/opencode/hippo-memory/`）。在 DSH 里记下的结论，到 opencode 查就是"没记过"；反之同理。
+
+**Q：换个项目 / 换个会话就查不到了？**
+先分清两种"查不到"。本包默认**每个项目目录一个库**：A 项目的结论在 B 项目里本来就读不到（不是没记住）。想全项目共用一个库，把 `sharedStore: true` 写进 `plugin` 的设置项。判据在 `memory_maintain { action: "status" }` 里（随下个版本发布）：`path_rule` 说明这个文件名怎么来的，`sibling_stores` 列出同目录每个 `.db` 各有多少行，本库 0 行而隔壁有货时 `health` 直接说"记在另一个文件里"。
 
 **Q：装完没反应？**
 先看上面"⚠️ 一个很容易踩的坑"——`opencode debug info` 列出包名**不代表加载成功**。按顺序查：
@@ -161,6 +169,9 @@ Windows 用 `%LOCALAPPDATA%\opencode\hippo-memory`；其余平台用 `~/.cache/o
 
 **Q：查旧结论查不到？**
 先 `memory_maintain` → `status`：一句话 `health` + 诊断（驱动、向量维度、`dimMismatch`、阈值）。默认哈希嵌入只认字面词，中文同义改写召回偏弱——换成语义模型（引擎侧 `setEmbedder()`）或把 query 写得贴近原文。
+
+**Q：同一句话换个测量口径测出不同数字，会被当成同一条记忆吗？**
+会——除非写入时带 `scope`（`key=value; key=value`，如 `population=all rows; comparator=instruction start`，随下个版本发布）。带上之后：前提对不上的两条结论各自留存、互不覆盖（写入回显 `different-scope:` 警告）；`memory_verify` 也要带 `scope` 问，库里那条属于别的前提时它答 `out_of_scope`（`substantiated`、`contradicted` 都为 `false`），而不是把旧口径的结论盖到新口径的问题上。
 
 **Q：压缩之后记忆还在吗？**
 在。数据在 SQLite 里，与上下文无关；本插件还会在压缩前把持久记忆塞进压缩上下文 (`experimental.session.compacting`)，减少"压缩后忘事"。

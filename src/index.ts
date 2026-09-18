@@ -1,7 +1,8 @@
 export {
   HippoMemory,
 } from './memory.js';
-export { pruneEmptyStores, SqliteStore } from './sqlite.js';
+export { pruneEmptyStores, SCOPE_RULE, surveyStores, SqliteStore } from './sqlite.js';
+export type { StoreSurveyEntry } from './sqlite.js';
 export { sqliteDriver, setSqliteDriver, DatabaseCtorRef } from './sqlite-runtime.js';
 export type { SqliteDatabaseLike, SqliteStatementLike, SqliteDatabaseCtor, SqliteDriver } from './sqlite-runtime.js';
 export { sanitizeMemoryText, looksInjected, dataFrame, rangeCheck, MAX_CONTEXT_TEXT } from './guard.js';

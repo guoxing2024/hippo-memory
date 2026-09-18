@@ -59,6 +59,20 @@ export interface MemoryPayload {
   verify?: { cmd?: string; expect?: string; artifact?: string };
   /** Agent-reported outcome of running `verify` (never self-assessed). */
   verifyResult?: 'pass' | 'fail';
+  /**
+   * Stated premises: the conditions this summary holds under — population,
+   * comparator, measurement setup, release window. Written as `key=value`
+   * segments separated by `;` (or `,`), e.g.
+   * `population=all records; comparator=instruction start`.
+   *
+   * This exists because one sentence can be true under one setup and false
+   * under another; a flat summary cannot carry that, so `verify` used to
+   * substantiate an old-scope conclusion against a new-scope claim. `verify`
+   * compares scopes structurally and answers OUT_OF_SCOPE when a shared key
+   * holds another value. Distinct from "scope" in the conflict gates, which
+   * means entity overlap.
+   */
+  scope?: string;
   /** ISO time the evidence was last executed. */
   verifiedAt?: string;
   /**
@@ -112,6 +126,8 @@ export interface StoredMemory {
   verify?: { cmd?: string; expect?: string; artifact?: string };
   /** Agent-reported evidence outcome (never self-assessed). */
   verifyResult?: 'pass' | 'fail';
+  /** Stated premises this summary holds under (see MemoryPayload.scope). */
+  scope?: string;
   /** ISO time the evidence was last executed. */
   verifiedAt?: string;
   /** Id of the memory this row retracts (retraction rows). */
@@ -156,6 +172,11 @@ export interface RetrievedMemory extends StoredMemory {
   consolidated: boolean;
   /** True when this hit came from the recency buffer, not goal-relevance. */
   recent?: boolean;
+  /**
+   * True when nothing cleared the similarity floor for this cue and this is the
+   * closest trace, offered as a labelled guess rather than as a memory.
+   */
+  lowConfidence?: boolean;
   /** Set when a live retraction targets this hit (do-not-repeat flag). */
   retracted?: { by: string; criterion: string };
 }
@@ -176,6 +197,8 @@ export interface RelatedTrace {
   entities: string[];
   /** Raw cosine similarity to the claim / new memory. */
   similarity: number;
+  /** Stated premises of this trace, when it declares any (see MemoryPayload.scope). */
+  scope?: string;
   /** Agent-reported evidence outcome, when the row carries any. */
   verifyResult?: 'pass' | 'fail';
 }

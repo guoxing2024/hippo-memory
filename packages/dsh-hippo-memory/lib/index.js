@@ -73,11 +73,11 @@ const GUIDANCE = `## Long-term memory (hippocampus-inspired)
 
 You have an explicit long-term memory store. Follow this discipline instead of relying on the raw transcript for old facts:
 
-1. WRITE — after learning a durable fact or finishing a meaningful event, call memory_remember (kind: semantic = rules, episode = events, procedure = skills). Prefer a structured summary "<subject> -> <value>" so later corrections version cleanly instead of conflicting.
+1. WRITE — after learning a durable fact or finishing a meaningful event, call memory_remember (kind: semantic = rules, episode = events, procedure = skills). Prefer a structured summary "<subject> -> <value>" so later corrections version cleanly instead of conflicting. When a fact holds only under conditions (population, comparator, release), pass scope as "key=value; key=value" — the same sentence under a different scope is kept as its own trace instead of overwriting that one.
 2. RECALL — before answering anything that depends on facts from earlier in this session (or a past session), call memory_recall with the question as the query.
-3. VERIFY — before asserting a remembered fact as current, call memory_verify with the claim. If it returns substantiated=false, answer "not in my memory / I don't know" — never confabulate. If contradicted, flag the conflict and use the newest revision.
-4. MAINTAIN — call memory_maintain (consolidate / forget) occasionally in long sessions so the store stays compact.
-5. The [hippo-memory digest] runtime-context block (when present) lists memories retrieved automatically for the current task with provenance — treat them as retrieved evidence, never as license to invent more. They may lag one step behind a memory_remember write; trust memory_verify for authoritative checks.`;
+3. VERIFY — before asserting a remembered fact as current, call memory_verify with the claim and the scope you mean. If it returns substantiated=false, answer "not in my memory / I don't know" — never confabulate. If contradicted, flag the conflict and use the newest revision. If out_of_scope, the stored answer is about different premises: do not carry it over.
+4. MAINTAIN — in long sessions call memory_maintain so the store stays readable: status (one-line health, plus which store file actually answered), duplicates (read-only report of restatements; inside a group marked mixedPremises the rows stated under different premises are not restatements of each other), then merge on a group you confirmed — merge folds the extras into the survivor, they stay in the store and undemote restores them, while delete also destroys the version history. consolidate / forget as usual.
+5. The [hippo-memory digest] runtime-context block (when present) lists memories retrieved automatically for the current task with provenance — treat them as retrieved evidence, never as license to invent more. A line tagged [low-confidence …] is the closest trace *below* the recall floor: a guess about what you may have meant, not a memory — verify before asserting it and never repeat it as stored fact. They may lag one step behind a memory_remember write; trust memory_verify for authoritative checks.`;
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                              */
@@ -511,7 +511,8 @@ function apply(ctx, config = {}) {
         retracts: { type: 'string', description: 'Id this write retracts (use with tags ["retraction"]).' },
         guard_trigger: { type: 'string', description: 'Future situation this guards (use with tags ["guard"]).' },
         guard_action: { type: 'string', description: 'What to do when guard_trigger matches.' },
-        supersedes: { type: 'array', items: { type: 'string' }, description: 'Ids of existing memories this write corrects/retires. Use when you verified a stored claim is wrong and are writing the replacement: the listed rows get superseded (kept for audit, excluded from recall), and verify/recall surface the newer conclusion instead.' }
+        supersedes: { type: 'array', items: { type: 'string' }, description: 'Ids of existing memories this write corrects/retires. Use when you verified a stored claim is wrong and are writing the replacement: the listed rows get superseded (kept for audit, excluded from recall), and verify/recall surface the newer conclusion instead.' },
+        scope: { type: 'string', description: 'The conditions this statement holds under, as `key=value` segments separated by "; " — e.g. "population=all records; comparator=instruction start". Use it whenever the same sentence could be true under one setup and false under another: a write whose scope disagrees with an existing row becomes its own trace instead of merging into it, and memory_verify compares scopes and answers OUT_OF_SCOPE rather than blessing the wrong one.' }
       },
       output: outputOf(),
       async execute(args, exec) {
@@ -534,7 +535,8 @@ function apply(ctx, config = {}) {
           verifiedAt: args.verified_at,
           retracts: args.retracts,
           guard: args.guard_trigger && args.guard_action ? { trigger: args.guard_trigger, action: args.guard_action } : undefined,
-          supersedes: Array.isArray(args.supersedes) ? args.supersedes : undefined
+          supersedes: Array.isArray(args.supersedes) ? args.supersedes : undefined,
+          scope: typeof args.scope === 'string' ? args.scope : undefined
         });
         invalidateDigest(agentKey);
         return cleanJson({
@@ -544,6 +546,7 @@ function apply(ctx, config = {}) {
           version: res.memory.version,
           kind: res.memory.kind,
           summary: res.memory.summary,
+          scope: res.memory.scope ?? null,
           // An override archives the previous revision instead of erasing it.
           // Say so explicitly: silent versioning reads as data loss.
           superseded: res.superseded
@@ -603,6 +606,7 @@ function apply(ctx, config = {}) {
             kind: h.kind,
             summary: h.summary,
             detail: h.detail ?? null,
+            scope: h.scope ?? null,
             entities: h.entities ?? [],
             tags: h.tags ?? [],
             confidence: h.confidence,
@@ -641,18 +645,20 @@ function apply(ctx, config = {}) {
 
     reg(defineTool({
       name: 'memory_verify',
-      description: 'Source-monitoring check for a factual claim: SUBSTANTIATED (memory supports it), CONTRADICTED (memory holds the opposite / a newer revision), or UNSUBSTANTIATED (no memory). Call BEFORE asserting remembered facts. Never assert an unsubstantiated claim as fact — answer "not in my memory" instead.',
+      description: 'Source-monitoring check for a factual claim: SUBSTANTIATED (memory supports it), CONTRADICTED (memory holds the opposite / a newer revision), OUT_OF_SCOPE (the closest trace holds under premises your `scope` argument disagrees with), or UNSUBSTANTIATED (no memory). Call BEFORE asserting remembered facts. Never assert an unsubstantiated claim as fact — answer "not in my memory" instead.',
       parameters: {
-        claim: { type: 'string', required: true, description: 'The claim you intend to assert.' }
+        claim: { type: 'string', required: true, description: 'The claim you intend to assert.' },
+        scope: { type: 'string', description: 'The conditions you are asking about, in the same `key=value; key=value` form memory_remember takes. Memory stated under a disagreeing scope is reported OUT_OF_SCOPE instead of substantiated, and the trace stated under YOUR premises is chosen as the support even when another row matches the wording more closely.' }
       },
       output: outputOf(),
       async execute(args, exec) {
         await embedderReadyForQuery();
         const store = storeFor(sanitize(agentIdOf(exec)));
-        const v = await store.sourceMonitor(args.claim);
+        const v = await store.sourceMonitor(args.claim, { scope: typeof args.scope === 'string' ? args.scope : undefined });
         return cleanJson({
           substantiated: v.substantiated,
           contradicted: v.contradicted,
+          out_of_scope: v.out_of_scope === true,
           support: v.support ?? null,
           contradiction: v.contradiction ?? null,
           closest: v.closest ?? null,
@@ -668,12 +674,13 @@ function apply(ctx, config = {}) {
 
     reg(defineTool({
       name: 'memory_maintain',
-      description: 'Long-term memory housekeeping. consolidate: abstract well-established episodes into durable semantic rules. compress: fold N same-scope traces into 1 caller-authored invariant + K representatives (dry_run previews groups; apply with plan_json; undemote restores). forget: decay / soft-delete weak traces (preview with dry_run). stats: store summary. list: newest-first inventory of active memories. history: show revision history of one memory id. delete: permanently remove a memory by id. prune: delete store files that hold no memories. status: embedder/plugin state.',
+      description: 'Long-term memory housekeeping. consolidate: abstract well-established episodes into durable semantic rules. compress: fold N same-scope traces into 1 caller-authored invariant + K representatives (dry_run previews groups; apply with plan_json; undemote restores). merge: collapse the near-duplicate restatements a "duplicates" group reports into one live trace (dry_run previews which row survives; the rest stay live but hidden, undemote restores). forget: decay / soft-delete weak traces (preview with dry_run). stats: store summary. list: newest-first inventory of active memories. history: show revision history of one memory id. delete: permanently remove a memory by id. prune: delete store files that hold no memories. status: embedder/plugin state.',
       parameters: {
-        action: { type: 'string', required: true, enum: ['consolidate', 'compress', 'undemote', 'forget', 'stats', 'list', 'history', 'delete', 'prune', 'duplicates', 'override-audit', 'status'], description: 'Which maintenance action to run. "duplicates" reports near-duplicate restatements (read-only). "override-audit" screens overridden rows whose archived text shares little with the live text — the signature of an unrelated memory retired by an override (read-only). "compress" with dry_run (default) proposes foldable groups; with dry_run:false plus plan_json it folds.' },
+        action: { type: 'string', required: true, enum: ['consolidate', 'compress', 'undemote', 'forget', 'stats', 'list', 'history', 'delete', 'prune', 'duplicates', 'merge', 'override-audit', 'status'], description: 'Which maintenance action to run. "duplicates" reports near-duplicate restatements (read-only); a group is tagged mixedPremises:true when any two rows in it state incompatible premises. "merge" acts on ONE duplicates group: ids:[group ids] with dry_run (default) previews, dry_run:false retires the extras into the survivor. "override-audit" screens overridden rows whose archived text shares little with the live text — the signature of an unrelated memory retired by an override (read-only). "compress" with dry_run (default) proposes foldable groups; with dry_run:false plus plan_json it folds.' },
         id: { type: 'string', description: 'Memory id (history/delete action).' },
-        ids: { type: 'array', items: { type: 'string' }, description: 'Memory ids (undemote action).' },
-        dry_run: { type: 'boolean', description: 'forget/compress: preview without mutating (default true).' },
+        ids: { type: 'array', items: { type: 'string' }, description: 'Memory ids (undemote action; merge: the ids of ONE duplicates group).' },
+        into: { type: 'string', description: 'merge: id to keep instead of the one the engine would pick (must be one of ids).' },
+        dry_run: { type: 'boolean', description: 'forget/compress/merge: preview without mutating (default true).' },
         limit: { type: 'number', description: 'list: max entries (default 50).' },
         plan_json: { type: 'string', description: 'compress apply: JSON-encoded {invariant:{summary,detail?,entities?},members:[ids],representatives:[ids]} (engine validates, never authors the invariant).' }
       },
@@ -733,6 +740,7 @@ function apply(ctx, config = {}) {
               kind: m.kind,
               summary: sanitizeMemoryText(m.summary),
               detail: m.detail ? sanitizeMemoryText(m.detail) : null,
+              scope: m.scope ? sanitizeMemoryText(m.scope) : null,
               entities: m.entities ?? [],
               tags: m.tags ?? [],
               source: sanitizeMemoryText(m.source),
@@ -740,6 +748,7 @@ function apply(ctx, config = {}) {
               verify_result: m.verifyResult ?? null,
               verified_at: m.verifiedAt ?? null,
               retracts: m.retracts ?? null,
+              demoted: !!m.demoted,
               updatedAt: m.updatedAt ?? m.occurredAt ?? null,
               consolidated: !!m.consolidated
             })),
@@ -750,7 +759,7 @@ function apply(ctx, config = {}) {
         }
         if (args.action === 'history') {
           if (!args.id) return { error: 'history requires an id' };
-          return cleanJson({ history: store.history(args.id).map((h) => ({ ...h, summary: sanitizeMemoryText(h.summary), detail: h.detail ? sanitizeMemoryText(h.detail) : null, verify_result: h.verifyResult ?? null })) });
+          return cleanJson({ history: store.history(args.id).map((h) => ({ ...h, summary: sanitizeMemoryText(h.summary), detail: h.detail ? sanitizeMemoryText(h.detail) : null, scope: h.scope ? sanitizeMemoryText(h.scope) : null, verify_result: h.verifyResult ?? null })) });
         }
         if (args.action === 'prune') {
           // Sweep store files that hold no memories and no history — the
@@ -777,6 +786,32 @@ function apply(ctx, config = {}) {
             note: res.note
           });
         }
+        if (args.action === 'merge') {
+          // Act on one group from the `duplicates` report. Default is a preview,
+          // like compress: the caller should see which row survives before any
+          // of them is retired.
+          const ids = Array.isArray(args.ids) ? args.ids : [];
+          if (ids.length < 2) return cleanJson({ ok: false, error: 'merge requires ids: the ids of one duplicates group (2 or more)' });
+          try {
+            const res = await store.mergeDuplicates({
+              ids,
+              into: typeof args.into === 'string' ? args.into : undefined,
+              dryRun: args.dry_run !== false
+            });
+            if (args.dry_run === false && res.retired.length) invalidateDigest(sanitize(agentIdOf(exec)));
+            return cleanJson({
+              ok: true,
+              dry_run: res.dryRun === true,
+              survivor: res.survivor ?? null,
+              retired: res.retired,
+              carried: res.carried,
+              blocked: res.blocked,
+              note: res.note
+            });
+          } catch (err) {
+            return cleanJson({ ok: false, error: err?.message ?? String(err) });
+          }
+        }
         if (args.action === 'duplicates') {
           // Read-only report: near-duplicate restatements (e.g. an episode and
           // the "FACT: …" rule abstracted from it). Nothing is deleted here.
@@ -787,10 +822,17 @@ function apply(ctx, config = {}) {
             duplicateMemories: res.groups.reduce((n, g) => n + g.memories.length - 1, 0),
             groups: res.groups.map((g) => ({
               ...g,
-              memories: g.memories.map((m) => ({ ...m, summary: sanitizeMemoryText(m.summary) }))
+              memories: g.memories.map((m) => ({
+                ...m,
+                summary: sanitizeMemoryText(m.summary),
+                scope: m.scope ? sanitizeMemoryText(m.scope) : null
+              }))
             })),
             note: res.groups.length
-              ? 'review, then remove redundant ids with action "delete" (history is removed with the row)'
+              ? 'review, then merge a group with action "merge" (extras stay live but hidden; reversible with "undemote"), ' +
+              'or remove ids with action "delete" (history is removed with the row). In a group marked mixedPremises:true ' +
+              'the rows that state different premises are not restatements of each other: merge leaves them in blocked[] ' +
+              'and still folds the rest of the group.'
               : 'no near-duplicate restatements found'
           });
         }
@@ -812,11 +854,20 @@ function apply(ctx, config = {}) {
             dim: embedProvider?.dim ?? null,
             embedderNote: embedderStatusText(),
             storeStats: store.stats(),
+            path_rule: current().sharedStore
+              ? 'sharedStore is on: every agent id reads and writes one shared store file.'
+              : 'one store file per agent id under storages/hippo-memory; a fact remembered by another agent is ' +
+                'not visible here (set sharedStore to true to merge them).',
             // P0-3: deep observability — the silent killer is an embedder
             // mismatch (model-vector store queried by the hashing fallback:
             // garbage cosines, zero hits, nothing in the counts looks wrong).
             diagnostics: diag,
-            health: diag.suspicious.possibleEmbedderMismatch
+            health: diag.suspicious.emptyWhileSiblingsFull
+              ? // Per-agent stores make this the most common non-bug: the fact was
+                // remembered, just not by this agent. Say so before anything else.
+                'WARN: this store is empty while a sibling file in the same directory holds memories — ' +
+                'per DSH every agent id has its own store, so the write went to another agent (see diagnostics.sibling_stores)'
+              : diag.suspicious.possibleEmbedderMismatch
               ? 'WARN: stored vector dims do not match the active embedder — recall is likely broken for this store (re-migrate or check embedder setting)'
               : diag.suspicious.neverAccessedRatio > 0.8 && diag.activity.totalAccess > 0
                 ? 'WARN: most memories were never recalled — check cue phrasing / thresholds'

@@ -29,6 +29,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { dirname } from 'node:path';
 import {
   DEFAULT_OPTIONS,
   type CompressPlan,
@@ -47,7 +48,7 @@ import {
   type WriteNeighbour,
   nowIso
 } from './schema.js';
-import { SqliteStore, vecFromBlob, vecToBlob, type MemoryRow } from './sqlite.js';
+import { SCOPE_RULE, SqliteStore, surveyStores, vecFromBlob, vecToBlob, type MemoryRow, type StoreSurveyEntry } from './sqlite.js';
 import { cosine, embedHashing } from './vectors.js';
 import { dataFrame, rangeCheck, sanitizeMemoryText } from './guard.js';
 
@@ -110,6 +111,7 @@ function rowToMemory(row: MemoryRow, withEmbedding: boolean): StoredMemory {
     verify: row.verify_json ? (JSON.parse(row.verify_json) as { cmd?: string; expect?: string; artifact?: string }) : undefined,
     verifyResult: row.verify_result === 'pass' || row.verify_result === 'fail' ? row.verify_result : undefined,
     verifiedAt: row.verified_at ?? undefined,
+    scope: row.scope ?? undefined,
     retracts: row.retracts ?? undefined,
     guard: row.guard_json ? (JSON.parse(row.guard_json) as { trigger: string; action: string }) : undefined,
     demoted: row.demoted === 1,
@@ -134,6 +136,12 @@ export class HippoMemory {
   private embedder: EmbeddingProvider | null = null;
   /** Store file path (exposed via diagnostics for observability). */
   private readonly dbPath: string;
+  /**
+   * How often the working-memory gate stayed quiet. Counted in memory, per
+   * process: a persisted counter would read like history, and the question it
+   * answers ("did recall fire on this session?") is about the live process.
+   */
+  private readonly digestCoverage = { turns: 0, misses: 0, guesses: 0 };
 
   /**
    * @param opts.createFile  false = open lazily: a store whose file does not
@@ -179,7 +187,7 @@ export class HippoMemory {
       } catch {
         /* malformed guard JSON embeds as empty */
       }
-      return [r.summary, r.detail ?? '', r.episode_place ?? '', r.rule ?? '', ...guardBits, ...entities].join('\n');
+      return [r.summary, r.detail ?? '', r.episode_place ?? '', r.rule ?? '', ...guardBits, r.scope ?? '', ...entities].join('\n');
     });
     const vecs = await this.embedder.embed(texts);
     const now = nowIso();
@@ -207,6 +215,7 @@ export class HippoMemory {
         verified_at: row.verified_at,
         retracts: row.retracts,
         guard_json: row.guard_json,
+        scope: row.scope ?? null,
         demoted: row.demoted,
         demoted_to: row.demoted_to,
         demoted_at: row.demoted_at,
@@ -325,9 +334,14 @@ export class HippoMemory {
     const guard = payload.guard && payload.guard.trigger?.trim() && payload.guard.action?.trim()
       ? { trigger: payload.guard.trigger.trim(), action: payload.guard.action.trim() }
       : undefined;
+    // Stated premises (see MemoryPayload.scope). Part of the encoding, so a
+    // premise-aware query finds the row, and it gates the merge/override
+    // branches so a same-sentence write under another premise is not folded
+    // into the old one.
+    const scope = typeof payload.scope === 'string' && payload.scope.trim() ? payload.scope.trim() : undefined;
     const contentText = [
       summary, payload.detail ?? '', payload.episode?.place ?? '', payload.episode?.time ?? '',
-      payload.semantic?.rule ?? '', ...(guard ? [guard.trigger, guard.action] : []), ...entities
+      payload.semantic?.rule ?? '', ...(guard ? [guard.trigger, guard.action] : []), ...(scope ? [scope] : []), ...entities
     ].join('\n');
     const vec = await this.embedOne(contentText);
     // Range priors (suggestion 3): warn-only, never block.
@@ -386,6 +400,24 @@ export class HippoMemory {
     // Rows that matched the structured-claim subject key but share no entity:
     // reported back, never overwritten (see the scope guard at branch 0).
     const scopeOnlyMatches: { id: string; summary: string; similarity: number; reason: string }[] = [];
+    // Premise clash (scope field): rows this write must NOT fold into, because
+    // they state a different condition under a key both sides name. Collecting
+    // them keeps the skip visible instead of silent (same rule as the entity
+    // gate above).
+    const premiseClash = (rowScope: string | null | undefined): string[] => scopeDifferences(scope, rowScope);
+    const premiseSkipped: { id: string; summary: string; keys: string[] }[] = [];
+    const notePremiseSkip = (r: MemoryRow, keys: string[]): void => {
+      // Several write branches can reject the same incumbent in one pass (a
+      // structured claim fails the entity gate, then the verbatim scan sees the
+      // same row). Naming it twice would read as two blocked rows.
+      const seen = premiseSkipped.find((p) => p.id === r.id);
+      if (seen) seen.keys = Array.from(new Set([...seen.keys, ...keys]));
+      else premiseSkipped.push({ id: r.id, summary: sanitizeMemoryText(r.summary).slice(0, 60), keys });
+    };
+    // A re-tell that supplies the premise the incumbent never stated fills it
+    // in; one that states nothing leaves the recorded premise alone (a
+    // premise-free echo must not erase what a row holds "under").
+    const premiseFill = (r: MemoryRow): { scope?: string } => (!r.scope && scope ? { scope } : {});
     const neighbours: WriteNeighbour[] = candidates
       .slice()
       .sort((a, b) => b.sim - a.sim)
@@ -452,6 +484,7 @@ export class HippoMemory {
         verifiedAt: verifiedAt,
         retracts: payload.retracts,
         guard,
+        scope,
         confidence,
         importance,
         createdAt: now,
@@ -509,6 +542,11 @@ export class HippoMemory {
         if (isRetractionRow(r)) continue;
         const oldClaim = claimParts(r.summary);
         if (!oldClaim || oldClaim.subject !== newClaim.subject) continue;
+        const clash = premiseClash(r.scope);
+        if (clash.length) {
+          notePremiseSkip(r, clash);
+          continue;
+        }
         const rowEntities = JSON.parse(r.entities_json || '[]') as string[];
         const scopeOk = entities.length > 0 && rowEntities.length > 0 && this.entitiesOverlap(entities, rowEntities);
         const rowSim = candidates.find((c) => c.r.id === r.id)?.sim ?? 0;
@@ -533,7 +571,7 @@ export class HippoMemory {
           // Spaced rehearsal: the boost scales with the time since the last
           // access (massed repetition earns little; spaced re-telling more).
           const imp = Math.min(1, r.importance + rehearsalBoost(r.last_access_at, Date.parse(now)));
-          this.db.update({ ...r, importance: imp, updated_at: now });
+          this.db.update({ ...r, ...premiseFill(r), importance: imp, updated_at: now });
           return {
             outcome: 'none',
             memory: rowToMemory(this.db.getById(r.id)!, false),
@@ -577,6 +615,7 @@ export class HippoMemory {
           verifiedAt: verifiedAt,
           retracts: payload.retracts,
           guard,
+          scope,
           confidence
         });
         return {
@@ -604,9 +643,13 @@ export class HippoMemory {
       closest !== undefined &&
       normalizeText(stripAbstractPrefix(closest.r.summary)) === normalizeText(stripAbstractPrefix(summary)) &&
       (payload.detail ?? '').trim() === (closest.r.detail ?? '').trim();
-    if (closest && isRetell) {
+    const closestClash = premiseClash(closest?.r.scope);
+    if (closest && isRetell && closestClash.length > 0) {
+      notePremiseSkip(closest.r, closestClash);
+    }
+    if (closest && isRetell && closestClash.length === 0) {
       const imp = Math.min(1, closest.r.importance + rehearsalBoost(closest.r.last_access_at, Date.parse(now)));
-      this.db.update({ ...closest.r, importance: imp, updated_at: now });
+      this.db.update({ ...closest.r, ...premiseFill(closest.r), importance: imp, updated_at: now });
       return {
         outcome: 'none',
         memory: rowToMemory(this.db.getById(closest.r.id)!, false),
@@ -638,6 +681,7 @@ export class HippoMemory {
       const newEnts = new Set(entities.map((e) => e.toLowerCase()));
       const nearSemantic = candidates.find((x) => {
         if (x.r.kind !== 'semantic') return false;
+        if (premiseClash(x.r.scope).length > 0) return false;
         if (normalizeText(stripAbstractPrefix(x.r.summary)) !== newBody) return false;
         if (((x.r.detail ?? '') as string).trim() !== newDetail) return false;
         const rowEnts = JSON.parse(x.r.entities_json || '[]') as string[];
@@ -645,7 +689,7 @@ export class HippoMemory {
       });
       if (nearSemantic) {
         const imp = Math.min(1, nearSemantic.r.importance + 0.01 + rehearsalBoost(nearSemantic.r.last_access_at, Date.parse(now)));
-        this.db.update({ ...nearSemantic.r, importance: imp, updated_at: now });
+        this.db.update({ ...nearSemantic.r, ...premiseFill(nearSemantic.r), importance: imp, updated_at: now });
         return {
           outcome: 'merge',
           memory: rowToMemory(this.db.getById(nearSemantic.r.id)!, false),
@@ -686,6 +730,7 @@ export class HippoMemory {
       !isRetraction &&
       !isRetractionRow(closest.r) &&
       !shielded &&
+      closestClash.length === 0 &&
       closest.sim >= this.options.contradictionThreshold &&
       sharesScope &&
       (sameSubject || oppositePolarity) &&
@@ -711,6 +756,7 @@ export class HippoMemory {
       !isRetraction &&
       !isRetractionRow(closest.r) &&
       !shielded &&
+      closestClash.length === 0 &&
       closest.sim >= this.options.contradictionThreshold &&
       sharesScope &&
       (sameSubject || oppositePolarity) &&
@@ -744,6 +790,7 @@ export class HippoMemory {
         verifiedAt: verifiedAt,
         retracts: payload.retracts,
         guard,
+        scope,
         confidence
       });
       return {
@@ -785,6 +832,7 @@ export class HippoMemory {
       verifiedAt: verifiedAt,
       retracts: payload.retracts,
       guard,
+      scope,
       confidence,
       importance,
       createdAt: now,
@@ -800,7 +848,17 @@ export class HippoMemory {
           `(${scopeOnlyMatches.map((m) => `${m.id.slice(0, 8)} "${m.summary.slice(0, 50)}"`).join('; ')}). ` +
           `To update one, declare its entities on your next write or pass supersedes:[id].`
         : undefined;
-    const notesWarning = withNotes(shielded, blockedWarning, withheldContradiction);
+    // Premise clash: two statements that hold under different conditions are
+    // two traces. Say why the near-identical incumbent was not reused, or the
+    // caller reads a separate row as a failed update.
+    const premiseWarning =
+      premiseSkipped.length > 0
+        ? `different-scope: kept as its own trace — ${premiseSkipped.length} row(s) state another premise under ` +
+          `the key(s) ${Array.from(new Set(premiseSkipped.flatMap((p) => p.keys))).join(', ')} ` +
+          `(${premiseSkipped.map((p) => `${p.id.slice(0, 8)} "${p.summary}"`).join('; ')}). ` +
+          `The same sentence under a different condition is not a re-tell; pass the same scope to rehearse, or supersedes:[id] to retire it.`
+        : undefined;
+    const notesWarning = withNotes(shielded, blockedWarning, withheldContradiction, premiseWarning);
     return {
       outcome: 'new',
       memory: rowToMemory(row, false),
@@ -823,6 +881,7 @@ export class HippoMemory {
       payload.episode?.place ?? existing.episode?.place ?? '',
       payload.episode?.time ?? existing.episode?.time ?? '',
       payload.semantic?.rule ?? existing.semantic?.rule ?? '',
+      payload.scope ?? existing.scope ?? '',
       ...(payload.entities ?? []).map((e) => (typeof e === 'string' ? e : e.name)),
       ...existing.entities
     ].join('\n');
@@ -859,6 +918,7 @@ export class HippoMemory {
         verified_at: payload.verifiedAt !== undefined ? payload.verifiedAt : row.verified_at,
         retracts: payload.retracts !== undefined ? payload.retracts : row.retracts,
         guard_json: payload.guard !== undefined ? JSON.stringify(payload.guard) : row.guard_json,
+        scope: payload.scope !== undefined ? (payload.scope?.trim() || null) : row.scope,
         confidence: payload.confidence ?? row.confidence,
         importance: payload.importance !== undefined ? clamp01(payload.importance) : row.importance,
         updated_at: now,
@@ -887,6 +947,7 @@ export class HippoMemory {
     verifiedAt?: string;
     retracts?: string;
     guard?: MemoryPayload['guard'];
+    scope?: string;
     confidence: 'high' | 'medium' | 'low' | 'speculative';
     importance: number;
     createdAt: string;
@@ -912,6 +973,7 @@ export class HippoMemory {
       verified_at: a.verifiedAt ?? null,
       retracts: a.retracts ?? null,
       guard_json: a.guard ? JSON.stringify(a.guard) : null,
+      scope: a.scope ?? null,
       demoted: 0,
       demoted_to: null,
       demoted_at: null,
@@ -1476,9 +1538,20 @@ export class HippoMemory {
    * where the rule carries a "FACT: " wrapper. Comparison strips that wrapper
    * and ignores case/punctuation, so a cross-kind restatement is recognised.
    * The write path now folds these automatically; this reports what is already
-   * stored so a caller can review before deleting anything.
+   * stored so a caller can review before merging (`mergeDuplicates`) or
+   * deleting anything. Grouping is by TEXT, so a group can also hold two
+   * traces that state incompatible premises: `mixedPremises` marks the group
+   * when *any pair* in it disagrees, because those two rows are different facts
+   * rather than duplicates (the other rows in the same group may still be).
    */
-  duplicates(): { groups: { key: string; memories: { id: string; kind: MemoryKind; version: number; summary: string }[] }[]; scanned: number } {
+  duplicates(): {
+    groups: {
+      key: string;
+      mixedPremises: boolean;
+      memories: { id: string; kind: MemoryKind; version: number; summary: string; scope: string | null }[];
+    }[];
+    scanned: number;
+  } {
     const byKey = new Map<string, StoredMemory[]>();
     for (const row of this.db.allActive()) {
       if (row.demoted === 1) continue; // folded detail is accounted for, not a stray duplicate
@@ -1491,13 +1564,171 @@ export class HippoMemory {
     }
     const groups = [...byKey.entries()]
       .filter(([, list]) => list.length > 1)
-      .map(([key, list]) => ({
-        key: key.slice(0, 120),
-        memories: list
-          .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-          .map((m) => ({ id: m.id, kind: m.kind, version: m.version, summary: m.summary }))
-      }));
+      .map(([key, list]) => {
+        const sorted = list.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+        let mixedPremises = false;
+        outer: for (let i = 0; i < sorted.length; i++) {
+          for (let j = i + 1; j < sorted.length; j++) {
+            if (scopeDifferences(sorted[i]?.scope ?? null, sorted[j]?.scope ?? null).length > 0) {
+              mixedPremises = true;
+              break outer;
+            }
+          }
+        }
+        return {
+          key: key.slice(0, 120),
+          mixedPremises,
+          memories: sorted.map((m) => ({
+            id: m.id,
+            kind: m.kind,
+            version: m.version,
+            summary: m.summary,
+            scope: m.scope ?? null
+          }))
+        };
+      });
     return { groups, scanned: this.db.countActive() };
+  }
+
+  /**
+   * Merge one duplicate group reported by `duplicates()` into a single live
+   * trace.
+   *
+   * The extras are demoted INTO the survivor — the same mechanism `compress`
+   * uses — so nothing is erased: they stay in the file, stay visible in `list()`
+   * (flagged `demoted`), drop out of default recall unless `includeDemoted` is
+   * set, and `undemote()` puts any of them back. `dryRun` previews the decision
+   * without touching the store.
+   */
+  async mergeDuplicates(plan: { ids: string[]; into?: string; dryRun?: boolean } = { ids: [] }): Promise<{
+    survivor: { id: string; kind: MemoryKind; version: number; summary: string } | null;
+    retired: { id: string; kind: MemoryKind; summary: string }[];
+    carried: string[];
+    blocked: { id: string; reason: string }[];
+    dryRun: boolean;
+    note: string;
+  }> {
+    const ids = Array.from(new Set((plan.ids ?? []).map((x) => String(x).trim()).filter(Boolean)));
+    if (ids.length < 2) throw new Error('merge: needs the ids of at least two restatements');
+    const rows: MemoryRow[] = [];
+    for (const id of ids) {
+      const row = this.db.getById(id);
+      if (!row || row.superseded === 1) throw new Error(`merge: no live memory ${id}`);
+      if (isCondensedRow(row)) {
+        throw new Error(`merge: ${id} is a marker row (retraction / guard / invariant) — retiring it would drop what it injects`);
+      }
+      rows.push(row);
+    }
+    // Same text is what makes them duplicates. Without this check a caller who
+    // hands over two unrelated ids would erase one of them behind a "cleanup".
+    const keys = new Set(rows.map((r) => normalizeText(stripAbstractPrefix(r.summary))));
+    if (keys.size > 1) {
+      throw new Error(
+        `merge: these ${rows.length} ids are not restatements of one claim (${[...keys].map((k) => `"${k.slice(0, 40)}"`).join(' vs ')}) — pass a single group from duplicates()`
+      );
+    }
+    // Pick the row that is worth keeping: re-checkable evidence outranks a bare
+    // restatement (merging must never retire the only row an agent can re-run),
+    // then usage, then salience; creation time only breaks ties.
+    const byValue = [...rows].sort(
+      (a, b) =>
+        Number(b.verify_result === 'pass') - Number(a.verify_result === 'pass') ||
+        b.access_count - a.access_count ||
+        b.importance - a.importance ||
+        b.version - a.version ||
+        a.created_at.localeCompare(b.created_at)
+    );
+    const survivor = plan.into ? rows.find((r) => r.id === plan.into) ?? null : byValue[0] ?? null;
+    if (!survivor) throw new Error(`merge: ${plan.into} is not one of the ids`);
+    const toView = (r: MemoryRow) => ({ id: r.id, kind: r.kind, summary: r.summary });
+
+    // Premise gate: `duplicates()` groups by TEXT, and the same sentence under
+    // another condition is deliberately its own trace (that is what `scope` is
+    // for), so those rows are not restatements of each other and stay apart.
+    const clashOf = (r: MemoryRow) => scopeDifferences(survivor.scope, r.scope);
+    const others = byValue.filter((r) => r.id !== survivor.id);
+    const retired = others.filter((r) => clashOf(r).length === 0);
+    const blocked = others
+      .filter((r) => clashOf(r).length > 0)
+      .map((r) => ({
+        id: r.id,
+        reason: `states different premises (${clashOf(r).join(', ')}) — the same sentence under another condition stays its own trace`
+      }));
+    if (retired.length === 0) {
+      return {
+        survivor: null,
+        retired: [],
+        carried: [],
+        blocked,
+        dryRun: !!plan.dryRun,
+        note: 'merge: nothing retired — every other row in the group states premises that disagree with the one it would be merged into'
+      };
+    }
+
+    // What the retired rows know that the survivor does not. Merging text is
+    // easy; losing the only mention of an entity is how a cleanup turns into a
+    // retrieval regression.
+    const ownEnts = new Set(JSON.parse(survivor.entities_json || '[]') as string[]);
+    const ownTags = new Set(JSON.parse(survivor.tags_json || '[]') as string[]);
+    const extraEnts: string[] = [];
+    const extraTags: string[] = [];
+    let richest = (survivor.detail ?? '').trim();
+    let richestFrom = '';
+    let topImportance = survivor.importance;
+    let importanceFrom = '';
+    for (const r of retired) {
+      for (const e of JSON.parse(r.entities_json || '[]') as string[]) {
+        if (!ownEnts.has(e) && !extraEnts.includes(e)) extraEnts.push(e);
+      }
+      for (const t of JSON.parse(r.tags_json || '[]') as string[]) {
+        if (!ownTags.has(t) && !extraTags.includes(t)) extraTags.push(t);
+      }
+      const d = (r.detail ?? '').trim();
+      if (d.length > richest.length) { richest = d; richestFrom = r.id; }
+      if (r.importance > topImportance) { topImportance = r.importance; importanceFrom = r.id; }
+    }
+    const carried: string[] = [];
+    if (extraEnts.length) carried.push(`entities +${extraEnts.length} (${extraEnts.join(', ')})`);
+    if (extraTags.length) carried.push(`tags +${extraTags.length} (${extraTags.join(', ')})`);
+    if (richestFrom) carried.push(`detail from ${richestFrom.slice(0, 8)} (longer verbatim record)`);
+    if (importanceFrom) carried.push(`importance ${survivor.importance} → ${topImportance}`);
+
+    if (plan.dryRun) {
+      return {
+        survivor: { id: survivor.id, kind: survivor.kind, version: survivor.version, summary: survivor.summary },
+        retired: retired.map(toView),
+        carried,
+        blocked,
+        dryRun: true,
+        note: `preview only — applying would keep ${survivor.id.slice(0, 8)} and retire ${retired.length} restatement(s) (reversible with undemote)`
+      };
+    }
+
+    // Carry over BEFORE retiring: if the process dies in between the group is
+    // still reported as duplicate (harmless, re-run), whereas the reverse order
+    // would drop the survivor's inherited entities with nothing left to restore.
+    if (extraEnts.length || extraTags.length || richestFrom || importanceFrom) {
+      await this.update(survivor.id, {
+        ...(extraEnts.length ? { entities: extraEnts.map((name) => ({ name })) } : {}),
+        ...(extraTags.length ? { tags: extraTags } : {}),
+        ...(richestFrom ? { detail: richest } : {}),
+        ...(importanceFrom ? { importance: topImportance } : {})
+      });
+    }
+    const now = nowIso();
+    return this.db.transaction(() => {
+      for (const r of retired) this.db.setDemoted(r.id, survivor.id, now);
+      // Report the row as it now stands: carrying over bumps its version.
+      const after = this.db.getById(survivor.id) ?? survivor;
+      return {
+        survivor: { id: after.id, kind: after.kind, version: after.version, summary: after.summary },
+        retired: retired.map(toView),
+        carried,
+        blocked,
+        dryRun: false,
+        note: `kept ${survivor.id.slice(0, 8)} and retired ${retired.length} restatement(s) — still live, hidden from default recall, reversible with undemote`
+      };
+    });
   }
 
   /**
@@ -1610,6 +1841,7 @@ export class HippoMemory {
       version: r.version,
       updatedAt: r.updated_at,
       entities: JSON.parse(r.entities_json || "[]") as string[],
+      scope: r.scope ?? undefined,
       similarity: sim
     };
   }
@@ -1629,13 +1861,18 @@ export class HippoMemory {
    *   - newer_related[]: newer rows on the same scope (stale-support check)
    *   - superseded_matches[]: rows retired via an explicit supersedes edge
    *   - stale_support: the top support is NOT the newest word on its scope
+   *   - out_of_scope: the support holds under premises the claim does not
+   *     share (see MemoryPayload.scope) — pass `opts.scope` to have the
+   *     engine compare them and prefer the trace stated under your premises.
    */
-  async sourceMonitor(claim: string): Promise<{
+  async sourceMonitor(claim: string, opts: { scope?: string } = {}): Promise<{
     substantiated: boolean;
     contradicted: boolean;
-    support?: { id: string; summary: string; detail?: string; verifyResult?: 'pass' | 'fail'; verifiedAt?: string; source?: string; confidence: string; version: number; score: number } | null;
-    contradiction?: { id: string; summary: string; detail?: string; verifyResult?: 'pass' | 'fail'; verifiedAt?: string; source?: string; confidence: string; version: number; score: number } | null;
-    closest?: { id: string; summary: string; detail?: string; verifyResult?: 'pass' | 'fail'; verifiedAt?: string; source?: string; confidence: string; version: number; score: number } | null;
+    /** True when the closest trace is stated under premises that disagree with `opts.scope`. */
+    out_of_scope: boolean;
+    support?: { id: string; summary: string; detail?: string; verifyResult?: 'pass' | 'fail'; verifiedAt?: string; source?: string; confidence: string; version: number; score: number; scope?: string } | null;
+    contradiction?: { id: string; summary: string; detail?: string; verifyResult?: 'pass' | 'fail'; verifiedAt?: string; source?: string; confidence: string; version: number; score: number; scope?: string } | null;
+    closest?: { id: string; summary: string; detail?: string; verifyResult?: 'pass' | 'fail'; verifiedAt?: string; source?: string; confidence: string; version: number; score: number; scope?: string } | null;
     /** Same-scope rows asserting the opposite polarity of the claim. */
     contradicting: RelatedTrace[];
     /** Newer rows sharing the claim's scope (the support may be stale). */
@@ -1648,6 +1885,7 @@ export class HippoMemory {
   }> {
     const cueVec = await this.embedOne(claim);
     const claimNegated = this.polarityOf(claim);
+    const queryScope = typeof opts.scope === 'string' && opts.scope.trim() ? opts.scope.trim() : undefined;
     // Score every comparable row ONCE: the argmax pass and the related-row scan
     // below need the same cosine against the same cue vector. Keeping the pairs
     // around avoids decoding and re-computing the whole store a second time.
@@ -1658,19 +1896,39 @@ export class HippoMemory {
       scored.push({ r, sim: cosine(b, cueVec) });
     }
 
-    let best: { id: string; summary: string; detail?: string; verifyResult?: 'pass' | 'fail'; verifiedAt?: string; source?: string; confidence: string; version: number; score: number } | undefined;
+    let best: { id: string; summary: string; detail?: string; verifyResult?: 'pass' | 'fail'; verifiedAt?: string; source?: string; confidence: string; version: number; score: number; scope?: string } | undefined;
     let bestSim = -1;
     for (const { r, sim } of scored) {
       if (sim <= bestSim) continue;
       const mem = rowToMemory(r, false);
-      best = { id: mem.id, summary: sanitizeMemoryText(mem.summary), detail: mem.detail ? sanitizeMemoryText(mem.detail) : undefined, verifyResult: mem.verifyResult, verifiedAt: mem.verifiedAt, source: mem.source ? sanitizeMemoryText(mem.source) : undefined, confidence: mem.confidence, version: mem.version, score: sim };
+      best = { id: mem.id, summary: sanitizeMemoryText(mem.summary), detail: mem.detail ? sanitizeMemoryText(mem.detail) : undefined, verifyResult: mem.verifyResult, verifiedAt: mem.verifiedAt, source: mem.source ? sanitizeMemoryText(mem.source) : undefined, confidence: mem.confidence, version: mem.version, score: sim, scope: mem.scope };
       bestSim = sim;
+    }
+
+    // Premise-aware support choice: when the caller states the conditions of
+    // the claim, a trace stated under THOSE conditions outranks a closer match
+    // stated under others (measured failure: an old-scope conclusion at higher
+    // similarity answered a new-scope claim, `substantiated: true`). A row that
+    // names no premise ranks between the two — it cannot be wrong for this
+    // scope, but it is not the caller's scope either, so it stays below a row
+    // that states it. Without a caller scope the ordering is untouched.
+    if (queryScope) {
+      const rank = (r: MemoryRow): number => (!r.scope ? 1 : scopeDifferences(r.scope, queryScope).length === 0 ? 2 : 0);
+      const chosen = scored
+        .filter(({ r, sim }) => sim >= this.options.similarityThreshold)
+        .sort((a, b) => rank(b.r) - rank(a.r) || b.sim - a.sim)[0];
+      if (chosen) {
+        const mem = rowToMemory(chosen.r, false);
+        best = { id: mem.id, summary: sanitizeMemoryText(mem.summary), detail: mem.detail ? sanitizeMemoryText(mem.detail) : undefined, verifyResult: mem.verifyResult, verifiedAt: mem.verifiedAt, source: mem.source ? sanitizeMemoryText(mem.source) : undefined, confidence: mem.confidence, version: mem.version, score: chosen.sim, scope: mem.scope };
+        bestSim = chosen.sim;
+      }
     }
 
     if (!best || bestSim < this.options.similarityThreshold) {
       return {
         substantiated: false,
         contradicted: false,
+        out_of_scope: false,
         closest: best ?? null,
         contradicting: [],
         newer_related: [],
@@ -1678,6 +1936,30 @@ export class HippoMemory {
         stale_support: false,
         note: `UNSUBSTANTIATED: no stored trace matches this claim (best similarity ${bestSim.toFixed(2)} < ${this.options.similarityThreshold}). Do NOT assert it from memory; answer "I don't know / not in my memory".`
       };
+    }
+
+    // Premise mismatch comes before the negation heuristic: judging the claim
+    // TRUE or FALSE against a trace stated under other conditions is exactly
+    // the silent contamination this field exists to stop.
+    if (queryScope && best.scope) {
+      const differing = scopeDifferences(best.scope, queryScope);
+      if (differing.length > 0) {
+        return {
+          substantiated: false,
+          contradicted: false,
+          out_of_scope: true,
+          support: best,
+          contradicting: [],
+          newer_related: [],
+          superseded_matches: [],
+          stale_support: false,
+          note:
+            `OUT_OF_SCOPE: the closest trace ${best.id} (v${best.version}) is stated under "${sanitizeMemoryText(best.scope)}" ` +
+            `and the claim was checked under "${sanitizeMemoryText(queryScope)}" — the key(s) ${differing.join(', ')} hold different values, ` +
+            `so memory neither supports nor refutes the claim here. Re-verify under the trace's own premises, ` +
+            `or remember the new-scope conclusion with its own scope so both stand side by side.`
+        };
+      }
     }
 
     // Negation heuristic on the global argmax (unchanged behaviour).
@@ -1690,6 +1972,7 @@ export class HippoMemory {
       return {
         substantiated: false,
         contradicted: true,
+        out_of_scope: false,
         contradiction: best,
         contradicting: bestRow ? [this.toRelated(bestRow, bestSim)] : [],
         newer_related: [],
@@ -1831,15 +2114,28 @@ export class HippoMemory {
         ? ` NOTE: support evidence is stale (last run ${supportRow.verified_at ?? 'unstamped'}) — re-run before trusting.`
         : '';
 
+    // Unchecked premise: the support is conditional and the caller never said
+    // which condition it is asking about. Substantiating it silently would be
+    // the same contamination in the other direction, so name the premise and
+    // say it was not compared.
+    const premiseNote = supportRow?.scope
+      ? queryScope
+        ? ''
+        : ` NOTE: CONDITIONAL SCOPE — the support holds only under "${sanitizeMemoryText(supportRow.scope)}" and the claim stated no scope, so that premise was not checked. Pass verify's scope argument to compare it.`
+      : queryScope
+        ? ` NOTE: the support states no scope — its premise could not be checked against "${sanitizeMemoryText(queryScope)}".`
+        : '';
+
     return {
       substantiated: true,
       contradicted: false,
+      out_of_scope: false,
       support: best,
       contradicting,
       newer_related: newerRelated,
       superseded_matches: supersededMatches,
       stale_support: staleSupport,
-      note: `SUBSTANTIATED: matches ${best.id} (v${best.version}, sim ${bestSim.toFixed(2)}).${infectedNote}${staleNote}${contradictNote}${archiveNote}${fuzzyNote}${staleEvidenceNote}`
+      note: `SUBSTANTIATED: matches ${best.id} (v${best.version}, sim ${bestSim.toFixed(2)}).${infectedNote}${staleNote}${contradictNote}${archiveNote}${fuzzyNote}${staleEvidenceNote}${premiseNote}`
     };
   }
   /* ============================ context gating ============================ */
@@ -1852,12 +2148,61 @@ export class HippoMemory {
    */
   async composeContext(
     goal: string,
-    opts: { limit?: number; includeRecent?: boolean; recentLimit?: number } = {}
+    opts: { limit?: number; includeRecent?: boolean; recentLimit?: number; lowConfidenceTop1?: boolean } = {}
   ): Promise<{ context: string; items: RetrievedMemory[]; warnings: string[] }> {
     const limit = opts.limit ?? 6;
     const rec = await this.recall({ query: goal }, limit);
     const items = [...rec.hits];
     const warnings = [...rec.warnings];
+    const tagNow = Date.now();
+    this.digestCoverage.turns += 1;
+    if (items.length === 0) this.digestCoverage.misses += 1;
+
+    /** One rendered line per memory; the only place the digest format lives. */
+    const renderLine = (m: RetrievedMemory, i: number): string => {
+      const prov = m.source ? ` [source: ${sanitizeMemoryText(m.source)}]` : '';
+      const conf = m.confidence === 'high' ? '' : ` [conf:${m.confidence}]`;
+      const kind = `[${m.kind}${m.consolidated ? '/semantic' : ''}]`;
+      const occ = m.occurredAt ? ` (at ${m.occurredAt})` : '';
+      // A guess carries no standing: it never cleared the floor, so it may not
+      // borrow VERIFIED/ASSERTED from the row it happens to be.
+      const standing = m.lowConfidence
+        ? ` [low-confidence sim ${m.similarity.toFixed(2)} < floor ${rec.threshold.toFixed(2)}: the closest trace, not a memory — verify before asserting]`
+        : evidenceFresh(m.verifyResult, m.verifiedAt, tagNow, this.options.evidenceTtlSec)
+          ? ' [VERIFIED]'
+          : m.kind === 'semantic'
+            ? ' [ASSERTED]'
+            : '';
+      const guardTag = m.tags.includes('guard') ? ' [GUARD]' : '';
+      const scopeTag = m.scope ? ` [scope: ${sanitizeMemoryText(m.scope)}]` : '';
+      const recentTag = m.recent ? ' [recent]' : '';
+      const retrTag = m.retracted ? ` [retracted: ${sanitizeMemoryText(m.retracted.criterion)}]` : '';
+      return `${i + 1}. ${kind}${prov}${conf}${occ}${standing}${guardTag}${scopeTag}${recentTag}${retrTag} v${m.version} ${sanitizeMemoryText(m.summary)}`;
+    };
+
+    // Nothing cleared the floor: still show the single closest trace, marked.
+    // "Nothing is stored" and "the best match scored 0.31 against your cue" are
+    // different answers, and the second one used to be dropped in silence.
+    // A similarity of exactly 0 is no overlap at all, so it stays a real miss.
+    const near =
+      items.length === 0 && rec.reason === 'below-threshold' && opts.lowConfidenceTop1 !== false
+        ? rec.nearMisses[0]
+        : undefined;
+    const guessRow = near && near.similarity > 0 ? this.db.getById(near.id) : undefined;
+    const guess: RetrievedMemory | null = guessRow && near
+      ? {
+          ...rowToMemory(guessRow, false),
+          score: near.similarity,
+          similarity: near.similarity,
+          relativeScore: 0,
+          consolidated: false,
+          lowConfidence: true
+        }
+      : null;
+    if (guess) {
+      this.digestCoverage.guesses += 1;
+      warnings.push('low-confidence: the closest sub-threshold trace is shown in the digest as a guess, not a memory — verify before asserting');
+    }
 
     // Fail-visible (suggestion 3): zero hits must render as a status line,
     // not as filler that looks alive. Backfilling [recent] rows here made
@@ -1867,8 +2212,13 @@ export class HippoMemory {
       warnings.push('includeRecent: no hits to supplement — recency buffer withheld so failure stays visible');
       warnings.push(`no hit cleared the threshold for this task (${n} stored)`);
       return {
-        context: dataFrame(`(no memory above threshold for this task; ${n} stored)`),
-        items,
+        context: dataFrame(
+          [
+            `(no memory above threshold for this task; ${n} stored${guess ? ' — the closest trace is shown below, as a guess' : ''})`,
+            ...(guess ? [renderLine(guess, 0)] : [])
+          ].join('\n')
+        ),
+        items: guess ? [guess] : [],
         warnings
       };
     }
@@ -1891,30 +2241,14 @@ export class HippoMemory {
       warnings.push('includeRecent: appended recent traces not directly goal-relevant');
     }
 
-    // Evidence + marker tags (suggestion 1/4/6): what the model asserts from
-    // this block must show its standing — re-runnable truth, plain assertion,
-    // prospective guard, or live retraction of the hit. VERIFIED requires
-    // FRESH evidence (past-TTL proof renders ASSERTED until re-run).
-    const tagNow = Date.now();
-    const lines = items.slice(0, limit).map((m, i) => {
-      const prov = m.source ? ` [source: ${sanitizeMemoryText(m.source)}]` : '';
-      const conf = m.confidence === 'high' ? '' : ` [conf:${m.confidence}]`;
-      const kind = `[${m.kind}${m.consolidated ? '/semantic' : ''}]`;
-      const occ = m.occurredAt ? ` (at ${m.occurredAt})` : '';
-      const standing =
-        evidenceFresh(m.verifyResult, m.verifiedAt, tagNow, this.options.evidenceTtlSec)
-          ? ' [VERIFIED]'
-          : m.kind === 'semantic'
-            ? ' [ASSERTED]'
-            : '';
-      const guardTag = m.tags.includes('guard') ? ' [GUARD]' : '';
-      const recentTag = m.recent ? ' [recent]' : '';
-      const retrTag = m.retracted ? ` [retracted: ${sanitizeMemoryText(m.retracted.criterion)}]` : '';
-      return `${i + 1}. ${kind}${prov}${conf}${occ}${standing}${guardTag}${recentTag}${retrTag} v${m.version} ${sanitizeMemoryText(m.summary)}`;
-    });
+    // Evidence + marker tags are rendered by renderLine above (standing, guard,
+    // scope, recency, retraction). A goal-relevant set wins, so the guess only
+    // appears when nothing else did.
+    if (items.length === 0 && guess) items.push(guess);
+    const shown = items.slice(0, limit);
     // Injection guard: memory text is data the agent (or a page it read) once
     // wrote — never instructions. Sanitized per line, framed as a whole block.
-    return { context: dataFrame(lines.join('\n')), items: items.slice(0, limit), warnings };
+    return { context: dataFrame(shown.map(renderLine).join('\n')), items: shown, warnings };
   }
 
   /* ============================ introspection ============================ */
@@ -1962,7 +2296,28 @@ export class HippoMemory {
       supersededEdges: number;
     };
     /** True when rows exist but none was ever recalled — the dead-store smell. */
-    suspicious: { neverAccessedRatio: number; possibleEmbedderMismatch: boolean };
+    suspicious: {
+      neverAccessedRatio: number;
+      possibleEmbedderMismatch: boolean;
+      /** This store is empty while a sibling in the same directory holds memories. */
+      emptyWhileSiblingsFull: boolean;
+    };
+    /**
+     * Working-memory gate usage for this process: turns asked, turns that
+     * cleared nothing, turns that ended up showing a labelled guess instead.
+     * `misses / turns` is the recall hit-rate; `guesses` says how much of the
+     * non-miss output was a hunch. Never persisted — scope is 'process'.
+     */
+    coverage: { turns: number; misses: number; guesses: number; scope: 'process' };
+    /**
+     * The other store files next to this one — the memories this process
+     * cannot see. An empty recall is otherwise indistinguishable from "this
+     * project never wrote anything", which is how a per-directory/per-agent
+     * store split reads to both host and user.
+     */
+    sibling_stores: { dir: string; stores: StoreSurveyEntry[]; unreadable: string[] };
+    /** The scoping contract, verbatim from the engine, so no adapter paraphrases it. */
+    scope_rule: string;
   } {
     const rows = this.db.allActive();
     const dimHist = new Map<number, number>();
@@ -1982,6 +2337,17 @@ export class HippoMemory {
     // superseded = 1, so counting over allActive() could only ever yield 0.
     const supersededEdges = this.db.countSupersededEdges();
     const neverAccessedRatio = rows.length === 0 ? 0 : neverAccessed / rows.length;
+    // ':memory:' has no directory to survey — and dirname() of it is '.', which
+    // would hand status a listing of whatever the process happened to start in.
+    const siblings =
+      this.dbPath === ':memory:'
+        ? { dir: ':memory:', stores: [], unreadable: [] }
+        : surveyStores(dirname(this.dbPath), { current: this.dbPath });
+    // The signature of a store split: this file reads empty while a neighbour
+    // in the same directory is full. Everything else in status then looks
+    // healthy, which is exactly why it needs its own name.
+    const emptyWhileSiblingsFull =
+      rows.length === 0 && siblings.stores.some((s) => !s.current && s.rows > 0);
     return {
       store_path: this.dbPath,
       embedder: {
@@ -2000,8 +2366,12 @@ export class HippoMemory {
       activity: { neverAccessed, totalAccess, meanAccess: rows.length === 0 ? 0 : totalAccess / rows.length, supersededEdges },
       suspicious: {
         neverAccessedRatio,
-        possibleEmbedderMismatch: dimMismatch
-      }
+        possibleEmbedderMismatch: dimMismatch,
+        emptyWhileSiblingsFull
+      },
+      coverage: { ...this.digestCoverage, scope: 'process' as const },
+      sibling_stores: siblings,
+      scope_rule: SCOPE_RULE
     };
   }
 
@@ -2020,11 +2390,12 @@ export class HippoMemory {
     return rowToMemory(row, false);
   }
 
-  history(id: string): { version: number; summary: string; detail?: string; entities?: string[]; verifyResult?: 'pass' | 'fail'; archivedAt: string }[] {
+  history(id: string): { version: number; summary: string; detail?: string; scope?: string; entities?: string[]; verifyResult?: 'pass' | 'fail'; archivedAt: string }[] {
     return this.db.historyOf(id).map((h) => ({
       version: Number(h.version),
       summary: h.summary as string,
       detail: (h.detail as string | null) ?? undefined,
+      scope: (h.scope as string | null) ?? undefined,
       entities: h.entities_json ? (JSON.parse(h.entities_json as string) as string[]) : undefined,
       verifyResult: (h.verify_result as string | null) === 'pass' || (h.verify_result as string | null) === 'fail'
         ? (h.verify_result as 'pass' | 'fail')
@@ -2107,6 +2478,70 @@ function claimParts(summary: string): { subject: string; value: string } | null 
 /** Strip the consolidation wrapper so "FACT: X" compares equal to "X". */
 function stripAbstractPrefix(s: string): string {
   return s.replace(/^\s*(?:fact|rule)\s*:\s*/i, '');
+}
+
+/** Connectives that carry no premise information inside a scope value. */
+const SCOPE_STOP = new Set(['a', 'an', 'the', 'of', 'to', 'is', 'are', 'in', 'at', 'on', 'for', 'by', 'with', 'and', 'or', 'as', 'per']);
+
+/**
+ * Scope terms: latin/digit runs kept whole, CJK split per character so a
+ * reworded Chinese premise still overlaps (the hashing embedder keeps a CJK
+ * run whole, which would make any paraphrase look like a new premise),
+ * stopwords dropped.
+ */
+function scopeTokens(s: string): string[] {
+  return (s.toLowerCase().match(/[a-z0-9][a-z0-9._+-]*|[一-鿿]/g) ?? []).filter((t) => !SCOPE_STOP.has(t));
+}
+
+/** `key=value; key=value` (or `key:value`, comma/newline separated) → key → terms. */
+function scopePairs(s: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const seg of s.split(/[;,\n]/)) {
+    const t = seg.trim();
+    if (!t) continue;
+    const eq = t.match(/^([^=:]+)[=:](.*)$/);
+    const key = normalizeText(eq ? eq[1] ?? '' : t);
+    if (!key) continue;
+    const terms = scopeTokens(eq ? eq[2] ?? '' : t);
+    out.set(key, out.has(key) ? [...out.get(key)!, ...terms] : terms);
+  }
+  return out;
+}
+
+/**
+ * Two values of the same premise key. Compatible when one restates the other
+ * (subset — "instruction start" vs "instruction start of the lea-rsp site")
+ * or they overlap by half; a reworded premise must not read as a new one.
+ */
+function scopeValuesCompatible(a: string[], b: string[]): boolean {
+  if (a.length === 0 || b.length === 0) return true; // nothing stated to disagree with
+  const sa = new Set(a);
+  const sb = new Set(b);
+  const smaller = sa.size <= sb.size ? sa : sb;
+  const larger = smaller === sa ? sb : sa;
+  if ([...smaller].every((t) => larger.has(t))) return true;
+  let inter = 0;
+  for (const t of sa) if (sb.has(t)) inter++;
+  const union = sa.size + sb.size - inter;
+  return union > 0 && inter / union >= 0.5;
+}
+
+/**
+ * Keys both premises name while holding different values — the disagreement
+ * evidence. Empty when either side states no premise: an unstated condition
+ * is not a contradiction (it is reported as an unchecked premise instead).
+ */
+function scopeDifferences(a?: string | null, b?: string | null): string[] {
+  if (!a || !b) return [];
+  const pa = scopePairs(a);
+  const pb = scopePairs(b);
+  const differing: string[] = [];
+  for (const [key, terms] of pa) {
+    const other = pb.get(key);
+    if (!other) continue;
+    if (!scopeValuesCompatible(terms, other)) differing.push(key);
+  }
+  return differing;
 }
 
 /**

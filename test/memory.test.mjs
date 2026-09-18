@@ -207,9 +207,11 @@ test('composeContext returns compact context with provenance', async () => {
   assert.match(ctx.context, /\[episode|\[semantic/);
   const withRecent = await mem.composeContext('standup', { includeRecent: true });
   // Fail-visible contract (suggestion 3): 'standup' matches nothing, so no
-  // silent recency backfill — an explicit status line instead.
-  assert.equal(withRecent.items.length, 0, 'no hits, no filler');
+  // silent recency backfill — an explicit status line instead. A single trace
+  // may still appear, but only flagged as a guess, never as recalled memory.
+  assert.equal(withRecent.items.filter((i) => !i.lowConfidence).length, 0, 'no hits, no unflagged filler');
   assert.ok(withRecent.context.includes('no memory above threshold'), 'failure visible in context');
+  assert.ok(!withRecent.context.includes('[recent]'), 'the recency buffer stays withheld');
   assert.ok(withRecent.warnings.some((w) => w.includes('includeRecent')), 'supplement path still marked');
 });
 
