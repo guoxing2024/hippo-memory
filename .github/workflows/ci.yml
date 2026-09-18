@@ -33,4 +33,6 @@ jobs:
         run: node bench/smoke.mjs
 
       - name: Syntax-check adapter bundles
-        run: node --check packages/dsh-hippo-memory/lib/index.js && node --check packages/dsh-hippo-memory/lib/client.js
+        run: |
+          node --check packages/dsh-hippo-memory/lib/index.js && node --check packages/dsh-hippo-memory/lib/client.js
+          node --check packages/opencode-hippo-memory/lib/index.js

@@ -17,8 +17,8 @@ Open, living plan — ordered by expected user impact. PRs welcome on any item.
 ## v0.2.x — other hosts
 
 - [x] **Engine runs on Bun** (core 0.2.1): runtime driver detection (`node:sqlite` / `bun:sqlite`) + lazy loading, so the package imports and runs inside Bun hosts such as opencode — verified end-to-end on opencode 1.18.31 / Bun 1.3.14
-- [ ] **`opencode-hippo-memory`** (in this repo under `packages/`): opencode plugin packaging the 4 memory tools (via `tool()`), digest injection (`experimental.chat.messages.transform` / `experimental.chat.system.transform`), pre-compaction carry-over (`experimental.session.compacting`) and the usage discipline
-- [ ] Adapter tests against a mocked opencode plugin host
+- [x] **`opencode-hippo-memory`** (in this repo under `packages/`): opencode plugin packaging the 4 memory tools (via `tool()`), digest injection (`experimental.chat.system.transform` with a `messages.transform` fallback that is guarded against double injection), pre-compaction carry-over (`experimental.session.compacting`), usage discipline and options (`enabled` / `contextLimit` / `sharedStore` / `discipline` / `similarityThreshold`); per-project stores under the platform cache root (Windows: `%LOCALAPPDATA%\opencode\hippo-memory`). Published to npm (0.2.2) and verified as installed by opencode's own registry pipeline: `~/.cache/opencode/packages/<spec>/node_modules/opencode-hippo-memory` resolves `main` -> `lib/index.js`, `@opencode-ai/plugin@1.18.31` present in the plugin's own tree, default export is a function, 6 hooks returned, tools carry real zod schemas, remember/recall round-trip writes a per-project `.db`
+- [x] Adapter tests driving the plugin object directly (12 cases: tools, injection, idempotency, compaction carry-over, options, error containment)
 
 ## v0.3.x — semantic memory
 

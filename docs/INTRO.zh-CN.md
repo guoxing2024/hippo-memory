@@ -1,7 +1,7 @@
 # 🧠 HippoMemory —— 给 DSH Agent 装上"海马体"
 
 > 一句话：**让 DeepSeek Runtime 的 agent 拥有跨会话、跨重启的长期记忆，长会话不再忘事、不再幻觉。**
-> 当前版本：插件 0.2.0 / 引擎 0.2.0（2026-09-18）
+> 当前版本：引擎 `hippo-memory-core` 0.2.1 ｜ DSH 插件 `dsh-hippo-memory` 0.2.1 ｜ opencode 插件 `opencode-hippo-memory` 0.2.2（2026-09-18）
 
 ## 为什么你需要它？
 
@@ -54,7 +54,7 @@ dsh web
 ## 0.2.1（本版）—— 引擎支持 Bun
 
 > `hippo-memory-core` 现在**运行时探测** SQLite 驱动：Node 用 `node:sqlite`、Bun 用 `bun:sqlite`。这意味着**引擎可以直接跑在 opencode 里**（实测 opencode 1.18.31 / Bun 1.3.14，无需打包无需垫片）。
-> ⚠️ 但 **DSH 插件 `dsh-hippo-memory` 仍然不能装到 opencode** —— 适配层是宿主专属的，opencode 版本（`opencode-hippo-memory`）在计划中。
+> ✅ opencode 用户装配套插件即可：`opencode plugin -g opencode-hippo-memory`（同样是 4 个工具 + 每轮注入 + 压缩保留 + 纪律）。
 
 ## 0.2.0 新东西（一句话版）
 

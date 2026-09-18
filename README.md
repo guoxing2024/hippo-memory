@@ -21,13 +21,16 @@
 
 **零外部依赖**：纯本地 SQLite（Node 内置 `node:sqlite`）+ 本地向量索引，无服务、无网络请求、无 API key。可选接入本地嵌入模型（bge-small-zh-v1.5，约 24MB）。带单元测试与**反幻觉评测基准**：长会话中无记忆组 0/8 答对、编造率 25%；HippoMemory 组 8/8 答对、编造率 0%。
 
-## 📦 本仓库包含两个包
+## 📦 本仓库包含三个包
 
 | 包 | 用途 | 安装 |
 |---|---|---|
 | [**`dsh-hippo-memory`**](packages/dsh-hippo-memory/README.md) | **DSH（DeepSeek Runtime）插件** —— 工具 + 自动注入 + 使用纪律 + GUI 设置卡片 | **DSH 用这个**：`dsh plugin --profile web add dsh-hippo-memory` |
-| [**`hippo-memory-core`**](https://www.npmjs.com/package/hippo-memory-core) | 框架无关的记忆引擎（可用在任意 agent 框架） | `npm install hippo-memory-core` |
+| [**`hippo-memory-core`**](https://www.npmjs.com/package/hippo-memory-core) | 框架无关的记忆引擎（可用在任意 agent 框架；Node 与 Bun 都能跑） | `npm install hippo-memory-core` |
+| [**`opencode-hippo-memory`**](packages/opencode-hippo-memory/README.md) | **opencode 插件** —— 同样是 4 个工具 + 每轮注入 + 压缩保留，宿主换成 opencode | `opencode plugin -g opencode-hippo-memory` |
 
+> 👉 **opencode 用户看这里**：[packages/opencode-hippo-memory/README.md](packages/opencode-hippo-memory/README.md)（装法 / 设置 / 召回解读 / FAQ）。
+>
 > 👉 **DSH 用户看这里**：插件说明 [packages/dsh-hippo-memory/README.md](packages/dsh-hippo-memory/README.md)（安装 / 设置 / 用法 / FAQ）
 > 👉 **详细使用说明（推荐先读）**：[docs/USER-GUIDE.zh-CN.md](docs/USER-GUIDE.zh-CN.md) —— 设置项逐条解释、对话模板、十种场景话术、16 条 FAQ。
 > **English speakers:** see [README.en.md](README.en.md).
@@ -38,7 +41,12 @@
 
 > `hippo-memory-core` 0.2.1：SQLite 驱动改成**运行时探测**（Node 用 `node:sqlite`，Bun 用 `bun:sqlite`），导入不再因运行时不同而失败。
 > **实测**：在 opencode 1.18.31（内嵌 Bun 1.3.14）里 `import("hippo-memory-core")` → `driver=bun:sqlite`，remember / recall / verify / digest / diagnostics 全部正常，**无需打包、无需垫片**。
-> Node 侧行为与数据格式不变，137→140 项测试全绿。详见 [CHANGELOG](CHANGELOG.md)。
+> Node 侧行为与数据格式不变，测试全绿。详见 [CHANGELOG](CHANGELOG.md)。
+>
+> **配套 opencode 插件已发布**：[`opencode-hippo-memory`](packages/opencode-hippo-memory/README.md)（当前 0.2.2）——
+> `opencode plugin -g opencode-hippo-memory` 一条命令装上，即得 4 个记忆工具 + 每轮 digest 注入 + 压缩保留 + 使用纪律。
+> ⚠️ 装完**重启 opencode**，并且**用副作用验证**（跑一轮后看 store 目录有没有生成 `.db`），不要只看 `opencode debug info`：
+> 该命令只是配置回显，opencode 加载失败时日志里可以一个字都没有。详见该包 README 的"一个很容易踩的坑"。
 
 ```js
 import { HippoMemory, sqliteDriver } from 'hippo-memory-core';
@@ -432,8 +440,9 @@ Agent 会读网页，网页里可能有 ignore all previous instructions 这类�
 
 - 模型参数知识本身的错误（需要工具 / RAG / 知识图谱）；
 - 纯解码随机性导致的胡言（需要采样控制）；
-- 需要跨机器共享记忆的场景（当前为单进程 SQLite；共享库文件的并发写已由 busy_timeout 保护，但尚无跨机器同步）；
-- **opencode 等非 DSH 宿主目前没有官方适配包**——引擎能在 Bun 上跑（0.2.1 起），但工具 / 自动注入 / 纪律那一层是 DSH 专属的，见 [ROADMAP](ROADMAP.md)。
+- **跨机器共享记忆**暂不支持（当前为单进程 SQLite；共享库文件的并发写已由 busy_timeout 保护，但尚无跨机器同步）。
+
+宿主适配层现有两个、**互不通用**：DSH 用 [`dsh-hippo-memory`](packages/dsh-hippo-memory/README.md)，opencode 用 [`opencode-hippo-memory`](packages/opencode-hippo-memory/README.md)（已发布 npm，`opencode plugin -g opencode-hippo-memory`）。
 
 且与人脑一样，本系统**允许遗忘与重构**——它保证凡断言有据、无据则明说，不保证永不犯错。
 

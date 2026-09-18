@@ -1,6 +1,6 @@
 # 🧠 HippoMemory 使用说明（完整版）
 
-> 适用插件：**dsh-hippo-memory 0.2.0** ｜ 核心引擎：**hippo-memory-core 0.2.0** ｜ 更新：2026-09-18
+> 适用插件：**dsh-hippo-memory 0.2.1** ｜ 核心引擎：**hippo-memory-core 0.2.1** ｜ opencode 用户见 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md)（0.2.2） ｜ 更新：2026-09-18
 > 本文写给使用的人：不写代码也能照做。想了解设计原理请看 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 目录
@@ -650,7 +650,7 @@ await mem.ensureEmbeddingMigration();   // 一次性重嵌入旧行（返回处�
 |---|---|---|
 | `dsh-hippo-memory`（DSH 插件） | ❌ 不能 | 它是 DSH profile bundle（`cordis.patch.yml` + `dsh-tools` + DSH 设置卡片），opencode 的插件 API 完全另一套 |
 | `hippo-memory-core`（引擎） | ✅ 能（0.2.1 起） | 引擎原先把 SQLite 驱动写死成 Node 的 `node:sqlite`，而 opencode 的 Bun（实测 1.3.14）还没有这个内置模块，连 `import` 都失败；现在改成运行时探测，Bun 上自动用 `bun:sqlite` |
-| 4 个记忆工具 / 自动注入 / 使用纪律 | ⏳ 需要适配包 | 计划中的 `opencode-hippo-memory`（见 [ROADMAP](../ROADMAP.md)） |
+| 4 个记忆工具 / 自动注入 / 使用纪律 | ✅ 能 —— 装适配包 | `opencode plugin -g opencode-hippo-memory`（见 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md)） |
 
 ### 14.2 为什么之前不行（一个真实的坑）
 
@@ -714,7 +714,7 @@ export const Hippo: Plugin = async () => ({
 });
 ```
 
-> 上面是**手写版**，能跑；等 `opencode-hippo-memory` 适配包发出来（工具 + digest + 纪律一步到位）再换成一行 `plugin` 配置即可。
+> 上面是**手写版**，能跑；更省事的是直接装适配包：`opencode plugin -g opencode-hippo-memory` —— 工具 + 每轮 digest + 压缩保留 + 使用纪律一步到位，不用自己写插件。
 
 ### 14.5 opencode 的钩子速查（1.18.x 实测）
 

@@ -1,0 +1,46 @@
+{
+  "name": "opencode-hippo-memory",
+  "version": "0.2.2",
+  "description": "Hippocampus-inspired long-term memory for opencode: 4 memory tools, per-turn digest injection, compaction carry-over and a usage discipline. Powered by hippo-memory-core.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "memory",
+    "long-term-memory",
+    "hippocampus",
+    "agent",
+    "llm",
+    "deepseek",
+    "bun"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guoxing2024/hippo-memory.git",
+    "directory": "packages/opencode-hippo-memory"
+  },
+  "homepage": "https://github.com/guoxing2024/hippo-memory#readme",
+  "engines": {
+    "bun": ">=1.1"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.mjs\""
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.0",
+    "hippo-memory-core": "^0.2.1"
+  }
+}
