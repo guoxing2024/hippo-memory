@@ -1,6 +1,6 @@
 {
   "name": "opencode-hippo-memory",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Hippocampus-inspired long-term memory for opencode: 4 memory tools, per-turn digest injection, compaction carry-over and a usage discipline. Powered by hippo-memory-core.",
   "type": "module",
   "main": "lib/index.js",
@@ -41,6 +41,6 @@
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.18.0",
-    "hippo-memory-core": "^0.2.1"
+    "hippo-memory-core": "^0.3.0"
   }
 }

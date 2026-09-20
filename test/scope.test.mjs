@@ -145,15 +145,23 @@ test('scope: the trace stated under the caller premises wins over a closer forei
       scope: 'service=batch importer'
     });
 
+    // Asking the api conclusion under batch premises: the premise-aware pick is
+    // the batch row (not the textually closer api one), and because that row
+    // binds the subject to another value the verdict is CONTRADICTED — the
+    // api-scope conclusion does not hold here (audit #7).
     const asBatch = await m.sourceMonitor('ZZSCOPE6 the eviction policy is least-recently-used', {
       scope: 'service=batch importer'
     });
-    assert.equal(asBatch.support.id, batch.memory.id, 'the batch-scope trace must be the answer for a batch-scope claim');
-    assert.equal(asBatch.out_of_scope, false);
+    assert.equal(asBatch.out_of_scope, false, 'a premise-aware pick is not an out-of-scope answer');
+    assert.ok(asBatch.contradiction, `the batch-scope row must be named: ${asBatch.note}`);
+    assert.equal(asBatch.contradiction.id, batch.memory.id, 'the batch-scope trace is the one that disagrees');
+    assert.equal(asBatch.contradicted, true, 'the claim does not hold under batch premises');
 
+    // Under its own premises the same conclusion is supported by its own trace.
     const asApi = await m.sourceMonitor('ZZSCOPE6 the eviction policy is least-recently-used', {
       scope: 'service=api gateway'
     });
+    assert.equal(asApi.substantiated, true, `the api-scope row must support it: ${asApi.note}`);
     assert.equal(asApi.support.id, api.memory.id);
     assert.equal(asApi.out_of_scope, false);
   } finally {

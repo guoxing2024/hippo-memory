@@ -133,7 +133,7 @@ window.__ModuleLoader__.load({
             overridden: Object.prototype.hasOwnProperty.call(value, 'sharedStore')
           },
           embedding: {
-            text: String(value.embedding ?? 'off'),
+            text: String(value.embedding ?? 'auto'),
             overridden: Object.prototype.hasOwnProperty.call(value, 'embedding')
           },
           similarityThreshold: {
@@ -403,11 +403,11 @@ window.__ModuleLoader__.load({
                         className: 'hm-input',
                         style: { width: 'auto' },
                         disabled,
-                        value: state.embedding ? state.embedding.text : 'off',
+                        value: state.embedding ? state.embedding.text : 'auto',
                         onChange: (e) => props.edit('embedding', e.target.value),
                         children: [
-                          jsx('option', { value: 'off', children: 'off' }),
-                          jsx('option', { value: 'auto', children: 'auto' })
+                          jsx('option', { value: 'off', children: 'off (hashing — weakest, no synonyms)' }),
+                          jsx('option', { value: 'auto', children: 'auto (local semantic model — recommended)' })
                         ]
                       })
                     ]

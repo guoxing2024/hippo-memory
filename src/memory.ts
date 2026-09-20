@@ -45,6 +45,7 @@ import {
   type RetrievalCue,
   type StoredMemory,
   type StoreOptions,
+  type Summarizer,
   type WriteNeighbour,
   nowIso
 } from './schema.js';
@@ -88,6 +89,65 @@ function evidenceFresh(
   return nowMs - at <= Math.max(0, ttlSec) * 1000;
 }
 
+/**
+ * Evidence standing (audit #5): the engine never executes verify.cmd, so a
+ * reported pass has two trust tiers. `attested` = the caller demonstrably ran
+ * a reproducible check (full shield + plain [VERIFIED]); `self-reported` =
+ * an honest agent assertion (renders [VERIFIED self-reported], shield
+ * degraded to a warning). Anything else is not evidence.
+ */
+function evidenceStanding(row: {
+  verify_result: string | null | undefined;
+  verified_at: string | null | undefined;
+  verify_attested?: number | null;
+}, nowMs: number, ttlSec: number): 'attested' | 'self-reported' | 'none' {
+  if (!evidenceFresh(row.verify_result, row.verified_at, nowMs, ttlSec)) return 'none';
+  return row.verify_attested === 1 ? 'attested' : 'self-reported';
+}
+
+/**
+ * Fillers that carry no value information when comparing claim values.
+ * NOTE: the article "a" is deliberately NOT a filler here. claimParts lowercases
+ * values, so an enumerator label ("cluster A" vs "cluster B") arrives as "cluster
+ * a" / "cluster b" — dropping "a" made {cluster} a subset of {cluster,b} and the
+ * clash read as a refinement (field report: single-letter values never
+ * contradicted). Keeping "a" is safe because a genuine article refinement
+ * ("a postgres" vs "postgres") is still caught by the containment test, and the
+ * copula parser already strips a leading "a/an/the" before this comparison.
+ */
+const VALUE_FILLER = new Set(['and', 'or', 'with', 'the', 'an', 'of', 'to', 'in', 'on', 'for', 'at', 'by', 'as', 'per']);
+
+/** Terms of a claim value (latin/digit runs whole, CJK per run), fillers dropped. */
+function valueTokens(s: string): Set<string> {
+  return new Set((s.toLowerCase().match(/[a-z0-9][a-z0-9._+-]*|[一-鿿]+/g) ?? []).filter((t) => !VALUE_FILLER.has(t)));
+}
+
+/**
+ * Do two claim values actually disagree? (audit #7, refined)
+ *
+ * The first cut compared raw strings, so a dropped connective ("uses github
+ * actions **and** caches node_modules" vs "…uses github actions caches
+ * node_modules") read as a value flip and manufactured CONTRADICTED verdicts
+ * on ordinary paraphrase (caught by memory.test's supported-claim case).
+ * Comparison is now token-based, mirrored on the scope-premise rule: one side
+ * containing the other is a refinement (`postgres` vs `postgres 15`), and
+ * values sharing half their terms or more are restatements, not disagreements.
+ * Only a real clash (postgres vs mysql, slow vs fast) fires.
+ */
+function valueClash(a: string, b: string): boolean {
+  if (a === b) return false;
+  const sa = valueTokens(a);
+  const sb = valueTokens(b);
+  if (sa.size === 0 || sb.size === 0) return false; // nothing to compare
+  const smaller = sa.size <= sb.size ? sa : sb;
+  const larger = smaller === sa ? sb : sa;
+  if ([...smaller].every((t) => larger.has(t))) return false; // containment = refinement
+  let inter = 0;
+  for (const t of sa) if (sb.has(t)) inter++;
+  const union = sa.size + sb.size - inter;
+  return union > 0 && inter / union < 0.5;
+}
+
 function rowToMemory(row: MemoryRow, withEmbedding: boolean): StoredMemory {
   return {
     id: row.id,
@@ -110,6 +170,7 @@ function rowToMemory(row: MemoryRow, withEmbedding: boolean): StoredMemory {
     source: row.source ?? undefined,
     verify: row.verify_json ? (JSON.parse(row.verify_json) as { cmd?: string; expect?: string; artifact?: string }) : undefined,
     verifyResult: row.verify_result === 'pass' || row.verify_result === 'fail' ? row.verify_result : undefined,
+    verifyAttested: row.verify_attested === 1 ? true : undefined,
     verifiedAt: row.verified_at ?? undefined,
     scope: row.scope ?? undefined,
     retracts: row.retracts ?? undefined,
@@ -128,7 +189,10 @@ function rowToMemory(row: MemoryRow, withEmbedding: boolean): StoredMemory {
   };
 }
 
-const NEGATION_RE = /\b(not|never|no longer|doesn'?t|isn'?t|aren'?t|no|none|dislike|reject|deny|stopped|quit)\b|[不没未非](?![a-z0-9])|((?:与|和|跟|同)[^，。,]{0,12}(?:无关|无涉|独立|不同))|(?:推翻|否证|改口)(?:了|为)?|(?:否定|排除|更正)(?:了|为|:|：)|(错误\d*)/i;
+// `no(?!-)` so hyphenated compounds ("no-code", "no-op") are not read as a
+// negation. `错误\d+` requires a digit: a bare "错误处理" (error handling) is a
+// topic, not a correction — only markers like "错误1" / "错误2" count.
+const NEGATION_RE = /\b(not|never|no longer|doesn'?t|isn'?t|aren'?t|no(?!-)|none|dislike|reject|deny|stopped|quit)\b|[不没未非](?![a-z0-9])|((?:与|和|跟|同)[^，。,]{0,12}(?:无关|无涉|独立|不同))|(?:推翻|否证|改口)(?:了|为)?|(?:否定|排除|更正)(?:了|为|:|：)|(错误\d+)/i;
 
 export class HippoMemory {
   readonly db: SqliteStore;
@@ -142,21 +206,32 @@ export class HippoMemory {
    * answers ("did recall fire on this session?") is about the live process.
    */
   private readonly digestCoverage = { turns: 0, misses: 0, guesses: 0 };
+  /** LLM consolidation hook (audit #4); template path is the fallback. */
+  private summarizer: Summarizer | null = null;
 
   /**
    * @param opts.createFile  false = open lazily: a store whose file does not
    *                         exist yet is held in memory until the first write
    *                         (default true, the historical eager behaviour).
+   * @param opts.summarizer  LLM abstraction hook used by consolidate()
+   *                         (falls back to the FACT:-template on absence or
+   *                         error — consolidation never fails the store).
    */
-  constructor(opts: { dbPath: string; options?: StoreOptions; createFile?: boolean }) {
+  constructor(opts: { dbPath: string; options?: StoreOptions; createFile?: boolean; summarizer?: Summarizer }) {
     this.db = new SqliteStore(opts.dbPath, { create: opts.createFile !== false });
     this.options = { ...DEFAULT_OPTIONS, ...opts.options };
     this.dbPath = opts.dbPath;
+    this.summarizer = opts.summarizer ?? null;
   }
 
   /** Attach (or replace) a real embedding provider. */
   setEmbedder(e: EmbeddingProvider): void {
     this.embedder = e;
+  }
+
+  /** Attach (or replace) the LLM consolidation hook. */
+  setSummarizer(s: Summarizer | null): void {
+    this.summarizer = s;
   }
 
   /**
@@ -213,6 +288,7 @@ export class HippoMemory {
         verify_json: row.verify_json,
         verify_result: row.verify_result,
         verified_at: row.verified_at,
+        verify_attested: row.verify_attested ?? 0,
         retracts: row.retracts,
         guard_json: row.guard_json,
         scope: row.scope ?? null,
@@ -320,16 +396,17 @@ export class HippoMemory {
     const isRetraction = tags.includes('retraction');
     // Evidence downgrade (suggestion 1, narrowed per R29): a numeric claim in
     // ASSERTION shape (arrow or copula — "X -> 1.5", "cache is 512 MB")
-    // without passing evidence is stored as an unverified episode, not a
-    // rule. Bare prose that merely mentions numbers ("release 2.1 shipped
-    // Tuesday") keeps its declared kind — version strings and counts are
-    // not assertions of value.
+    // is stored as a semantic rule regardless of verification status. The
+    // verification status affects rendering (e.g. [VERIFIED] vs [ASSERTED])
+    // and the strength of the retirement shield, but does NOT prevent the
+    // row from being corrected by a newer value for the same subject.
+    // Bare prose that merely mentions numbers ("release 2.1 shipped
+    // Tuesday") is NOT a value assertion and keeps its declared kind.
     let kind = payload.kind;
     let downgraded: string | undefined;
-    if (kind === 'semantic' && /\d/.test(summary) && claimParts(summary) && payload.verifyResult !== 'pass') {
-      kind = 'episode';
-      downgraded =
-        'downgraded: semantic→episode — numeric claim without passing evidence is stored as an unverified episode, not a rule';
+    if (kind === 'semantic' && /\d/.test(summary) && claimParts(summary)) {
+      // Keep semantic regardless of verifyResult — do not let self-reported
+      // "pass" prevent a later correction from overriding this value.
     }
     const guard = payload.guard && payload.guard.trigger?.trim() && payload.guard.action?.trim()
       ? { trigger: payload.guard.trigger.trim(), action: payload.guard.action.trim() }
@@ -481,6 +558,7 @@ export class HippoMemory {
         source: payload.source,
         verify: payload.verify,
         verifyResult: payload.verifyResult,
+        verifyAttested: payload.verifyAttested,
         verifiedAt: verifiedAt,
         retracts: payload.retracts,
         guard,
@@ -571,7 +649,21 @@ export class HippoMemory {
           // Spaced rehearsal: the boost scales with the time since the last
           // access (massed repetition earns little; spaced re-telling more).
           const imp = Math.min(1, r.importance + rehearsalBoost(r.last_access_at, Date.parse(now)));
-          this.db.update({ ...r, ...premiseFill(r), importance: imp, updated_at: now });
+          // A rehearsal may carry fresh evidence the incumbent lacked ("that
+          // value I logged — I just re-ran the check, it passes"). Keep the row
+          // but land the evidence, or a later verify reads it as unverified.
+          // Upgrade only: a bare re-tell never erases a result already on file.
+          const carryVerify =
+            payload.verifyResult !== undefined
+              ? {
+                  verify_result: payload.verifyResult,
+                  verified_at: payload.verifiedAt ?? (payload.verifyResult === 'pass' ? now : r.verified_at),
+                  verify_json: payload.verify !== undefined ? JSON.stringify(payload.verify) : r.verify_json,
+                  verify_attested:
+                    payload.verifyAttested !== undefined ? (payload.verifyAttested ? 1 : 0) : (r.verify_attested ?? 0)
+                }
+              : {};
+          this.db.update({ ...r, ...premiseFill(r), ...carryVerify, importance: imp, updated_at: now });
           return {
             outcome: 'none',
             memory: rowToMemory(this.db.getById(r.id)!, false),
@@ -585,20 +677,27 @@ export class HippoMemory {
         // claims and same-event episodes get overridden.
         const windowOk = r.kind === 'semantic' || r.kind === 'procedure' || this.sameEventWindowMs(payload, r);
         if (!windowOk) continue;
-        // Evidence shield (suggestion 2 + 保鲜期): a freshly-VERIFIED
-        // incumbent is retired only by a challenger that also passes
-        // evidence. Stale evidence (past TTL or unstamped) no longer shields:
-        // re-run the check to refresh verifiedAt. Otherwise both rows are
-        // kept and the caller is told how to force the replacement.
-        if (
-          evidenceFresh(r.verify_result, r.verified_at, nowMs, this.options.evidenceTtlSec) &&
-          payload.verifyResult !== 'pass'
-        ) {
-          shielded =
-            `shielded: existing VERIFIED row ${r.id.slice(0, 8)} (v${r.version}) — "` +
-            `${sanitizeMemoryText(r.summary).slice(0, 60)}" was NOT retired by this unverified write; both rows are kept. ` +
-            `To replace it, re-run its evidence and pass verifyResult:'pass' (or supersedes:[id] to force).`;
-          break;
+        // Evidence shield (suggestion 2 + 保鲜期 + audit #5): a freshly
+        // VERIFIED incumbent is retired only by a challenger that also passes
+        // evidence — and only ATTESTED evidence earns the full shield. A
+        // self-reported pass (agent asserted, never re-runnable) degrades to
+        // a visible warning: it must not guard data against a correction.
+        // Stale evidence (past TTL or unstamped) no longer shields.
+        const standing = evidenceStanding(r, nowMs, this.options.evidenceTtlSec);
+        if (standing !== 'none' && payload.verifyResult !== 'pass') {
+          if (standing === 'attested') {
+            shielded =
+              `shielded: existing VERIFIED row ${r.id.slice(0, 8)} (v${r.version}) — "` +
+              `${sanitizeMemoryText(r.summary).slice(0, 60)}" was NOT retired by this unverified write; both rows are kept. ` +
+              `To replace it, re-run its evidence and pass verifyResult:'pass' (or supersedes:[id] to force).`;
+            break;
+          }
+          // self-reported: keep the write, warn that the badge is hearsay.
+          pendingNotes.push(
+            `shield-note: incumbent ${r.id.slice(0, 8)} (v${r.version}) carries SELF-REPORTED evidence (never re-run by the engine) — ` +
+            `its retirement shield is degraded; the override proceeds, and the old revision stays in history. ` +
+            `Pass verifyAttested:true only when the check was actually executed in a reproducible environment.`
+          );
         }
         const prior = { id: r.id, version: r.version, summary: r.summary };
         const res = await this.update(r.id, {
@@ -649,7 +748,22 @@ export class HippoMemory {
     }
     if (closest && isRetell && closestClash.length === 0) {
       const imp = Math.min(1, closest.r.importance + rehearsalBoost(closest.r.last_access_at, Date.parse(now)));
-      this.db.update({ ...closest.r, ...premiseFill(closest.r), importance: imp, updated_at: now });
+      // A re-tell may carry fresh evidence the incumbent lacked ("this fact I
+      // logged earlier — I just ran the check and it passes"). Rehearsal keeps
+      // the row, but the evidence must land, or a later verify reads the row as
+      // unverified. Only upgrade: never let a bare re-tell erase a passing
+      // result already on the row.
+      const carryVerify =
+        payload.verifyResult !== undefined
+          ? {
+              verify_result: payload.verifyResult,
+              verified_at: payload.verifiedAt ?? (payload.verifyResult === 'pass' ? now : closest.r.verified_at),
+              verify_json: payload.verify !== undefined ? JSON.stringify(payload.verify) : closest.r.verify_json,
+              verify_attested:
+                payload.verifyAttested !== undefined ? (payload.verifyAttested ? 1 : 0) : (closest.r.verify_attested ?? 0)
+            }
+          : {};
+      this.db.update({ ...closest.r, ...premiseFill(closest.r), ...carryVerify, importance: imp, updated_at: now });
       return {
         outcome: 'none',
         memory: rowToMemory(this.db.getById(closest.r.id)!, false),
@@ -722,8 +836,11 @@ export class HippoMemory {
     const closestClaim = closest ? claimParts(closest.r.summary) : null;
     const sameSubject = !!(newClaim && closestClaim && closestClaim.subject === newClaim.subject);
     const oppositePolarity = closest ? this.polarityOf(closest.r.summary) !== newNegated : false;
-    // Path-3 side of the evidence shield (same rule as path-0): a freshly
-    // VERIFIED incumbent prose row is not retired by an unverified challenger.
+    // Path-3 side of the evidence shield (same rule as path-0, audit #5):
+    // only ATTESTED fresh evidence blocks; a self-reported pass warns.
+    const closestStanding = closest
+      ? evidenceStanding(closest.r, nowMs, this.options.evidenceTtlSec)
+      : ('none' as const);
     if (
       closest &&
       !isRetell &&
@@ -735,13 +852,21 @@ export class HippoMemory {
       sharesScope &&
       (sameSubject || oppositePolarity) &&
       this.sameEventWindowMs(payload, closest.r) &&
-      evidenceFresh(closest.r.verify_result, closest.r.verified_at, nowMs, this.options.evidenceTtlSec) &&
+      closestStanding !== 'none' &&
       payload.verifyResult !== 'pass'
     ) {
-      shielded =
-        `shielded: existing VERIFIED row ${closest.r.id.slice(0, 8)} (v${closest.r.version}) — "` +
-        `${sanitizeMemoryText(closest.r.summary).slice(0, 60)}" was NOT retired by this unverified write; both rows are kept. ` +
-        `To replace it, re-run its evidence and pass verifyResult:'pass' (or supersedes:[id] to force).`;
+      if (closestStanding === 'attested') {
+        shielded =
+          `shielded: existing VERIFIED row ${closest.r.id.slice(0, 8)} (v${closest.r.version}) — "` +
+          `${sanitizeMemoryText(closest.r.summary).slice(0, 60)}" was NOT retired by this unverified write; both rows are kept. ` +
+          `To replace it, re-run its evidence and pass verifyResult:'pass' (or supersedes:[id] to force).`;
+      } else {
+        pendingNotes.push(
+          `shield-note: incumbent ${closest.r.id.slice(0, 8)} (v${closest.r.version}) carries SELF-REPORTED evidence (never re-run by the engine) — ` +
+          `its retirement shield is degraded; the override proceeds, and the old revision stays in history. ` +
+          `Pass verifyAttested:true only when the check was actually executed in a reproducible environment.`
+        );
+      }
     }
     // Brink of firing: every structural condition holds. Before retiring,
     // re-measure similarity CLAIM-to-CLAIM (field report R31): the firing
@@ -829,6 +954,7 @@ export class HippoMemory {
       source: payload.source,
       verify: payload.verify,
       verifyResult: payload.verifyResult,
+      verifyAttested: payload.verifyAttested,
       verifiedAt: verifiedAt,
       retracts: payload.retracts,
       guard,
@@ -916,6 +1042,7 @@ export class HippoMemory {
         verify_json: payload.verify !== undefined ? JSON.stringify(payload.verify) : row.verify_json,
         verify_result: payload.verifyResult !== undefined ? payload.verifyResult : row.verify_result,
         verified_at: payload.verifiedAt !== undefined ? payload.verifiedAt : row.verified_at,
+        verify_attested: payload.verifyAttested !== undefined ? (payload.verifyAttested ? 1 : 0) : (row.verify_attested ?? 0),
         retracts: payload.retracts !== undefined ? payload.retracts : row.retracts,
         guard_json: payload.guard !== undefined ? JSON.stringify(payload.guard) : row.guard_json,
         scope: payload.scope !== undefined ? (payload.scope?.trim() || null) : row.scope,
@@ -944,6 +1071,7 @@ export class HippoMemory {
     source?: string;
     verify?: MemoryPayload['verify'];
     verifyResult?: MemoryPayload['verifyResult'];
+    verifyAttested?: boolean;
     verifiedAt?: string;
     retracts?: string;
     guard?: MemoryPayload['guard'];
@@ -971,6 +1099,7 @@ export class HippoMemory {
       verify_json: a.verify ? JSON.stringify(a.verify) : null,
       verify_result: a.verifyResult ?? null,
       verified_at: a.verifiedAt ?? null,
+      verify_attested: a.verifyAttested ? 1 : 0,
       retracts: a.retracts ?? null,
       guard_json: a.guard ? JSON.stringify(a.guard) : null,
       scope: a.scope ?? null,
@@ -1028,6 +1157,12 @@ export class HippoMemory {
     const exclude = new Set(cue.excludeIds ?? []);
     const entityFilter = (cue.entities ?? []).map((e) => e.toLowerCase());
     const warnings: string[] = [];
+    // Hard premise filter (audit #7/#8): rows whose stated scope disagrees
+    // with the asked one leave the candidate pool entirely — "conditional on
+    // another setup" must not surface as an answer to this question. Rows
+    // with no scope pass (absence of a premise is not a contradiction).
+    const cueScope = typeof cue.scope === 'string' && cue.scope.trim() ? cue.scope.trim() : undefined;
+    let scopeExcluded = 0;
 
     const rows = this.db.allActive();
     const hits: RetrievedMemory[] = [];
@@ -1062,6 +1197,10 @@ export class HippoMemory {
       if (sinceMs && mem.lastAccessAt && Date.parse(mem.lastAccessAt) < sinceMs) continue;
       if (occurredSinceMs && mem.occurredAt && Date.parse(mem.occurredAt) < occurredSinceMs) continue;
       if (entityFilter.length && !entityFilter.every((e) => mem.entities.includes(e))) continue;
+      if (cueScope && mem.scope && scopeDifferences(mem.scope, cueScope).length > 0) {
+        scopeExcluded++;
+        continue;
+      }
       eligible++;
 
       const sim = cosine(b, cueVec);
@@ -1238,6 +1377,9 @@ export class HippoMemory {
     if (infected.length) {
       warnings.push(`injection: ${infected.length} retrieved memory(ies) contained instruction-shaped text and were sanitized — review with memory_maintain list/history (ids: ${infected.map((h) => h.id).join(', ')})`);
     }
+    if (cueScope && scopeExcluded > 0) {
+      warnings.push(`scope: ${scopeExcluded} row(s) excluded — their stated premise disagrees with "${cueScope.slice(0, 80)}"; recall without scope to see them`);
+    }
 
     // Mark retrieved traces as accessed (usage feedback for consolidation) and
     // apply the spaced-retrieval boost: being genuinely RECALLED after a gap
@@ -1267,6 +1409,7 @@ export class HippoMemory {
         : warnings,
       scanned,
       eligible,
+      ...(cueScope ? { scopeExcluded } : {}),
       bestSimilarity: bestSim < 0 ? null : Number(bestSim.toFixed(3)),
       threshold: minSim,
       reason,
@@ -1304,56 +1447,84 @@ export class HippoMemory {
       if (mem.accessCount < minAccess && mem.importance < minImportance) continue;
       if (minAgeMs && mem.createdAt && nowMs - Date.parse(mem.createdAt) < minAgeMs) continue;
 
-      const rule = abstractToRule(mem);
-      if (!rule) continue;
+      // Real abstraction when an LLM hook is attached (audit #4): the default
+      // abstractToRule() only re-wraps the sentence with a FACT: prefix, which
+      // is copy-and-rename, not generalization. A summarizer receives the
+      // qualifying episode and returns distilled rule(s); a throw or an empty
+      // answer falls back to the template so consolidation never fails.
+      let rules: string[];
+      if (this.summarizer) {
+        try {
+          const out = await this.summarizer([
+            { summary: mem.summary, detail: mem.detail, entities: mem.entities }
+          ]);
+          rules = (out ?? []).map((s) => String(s).trim()).filter(Boolean);
+        } catch {
+          rules = [];
+        }
+        if (rules.length === 0) {
+          const fallback = abstractToRule(mem);
+          if (!fallback) continue;
+          rules = [fallback];
+        }
+      } else {
+        const rule = abstractToRule(mem);
+        if (!rule) continue;
+        rules = [rule];
+      }
       const rowVec = vecFromBlob(row.vec);
       let already = false;
-      for (const s of this.db.allActive()) {
-        if (s.kind !== 'semantic') continue;
-        if (s.summary === rule) {
-          already = true;
-          break;
-        }
-        if (rowVec) {
-          const sv = vecFromBlob(s.vec);
-          if (sv && sv.length === rowVec.length && cosine(sv, rowVec) > this.options.nearDuplicateThreshold) {
+      for (const rule of rules) {
+        for (const s of this.db.allActive()) {
+          if (s.kind !== 'semantic') continue;
+          if (s.summary === rule) {
             already = true;
             break;
           }
+          if (rowVec) {
+            const sv = vecFromBlob(s.vec);
+            if (sv && sv.length === rowVec.length && cosine(sv, rowVec) > this.options.nearDuplicateThreshold) {
+              already = true;
+              break;
+            }
+          }
         }
+        if (already) break;
       }
       if (already) continue;
 
-      const id = randomUUID();
-      const now = nowIso();
-      const vec = await this.embedOne(rule);
-      const semRow = this.buildRow({
-        id,
-        version: 1,
-        kind: 'semantic',
-        summary: rule,
-        detail: `consolidated from episode ${mem.id}`,
-        semantic: { rule },
-        entities: mem.entities,
-        tags: [...mem.tags, 'consolidated'],
-        source: mem.source,
-        confidence: mem.confidence,
-        importance: mem.importance,
-        createdAt: now,
-        updatedAt: now,
-        vec
-      });
-      this.db.insert(semRow);
-      made.push({
-        id,
-        kind: 'semantic',
-        summary: rule,
-        detail: mem.detail,
-        entities: mem.entities,
-        importance: mem.importance,
-        accessCount: mem.accessCount,
-        ageMs: nowMs - Date.parse(mem.createdAt)
-      });
+      for (const rule of rules) {
+        const id = randomUUID();
+        const now = nowIso();
+        const vec = await this.embedOne(rule);
+        const semRow = this.buildRow({
+          id,
+          version: 1,
+          kind: 'semantic',
+          summary: rule,
+          detail: `consolidated from episode ${mem.id}${this.summarizer ? ' (llm-summarized)' : ''}`,
+          semantic: { rule },
+          entities: mem.entities,
+          tags: [...mem.tags, 'consolidated'],
+          source: mem.source,
+          confidence: mem.confidence,
+          importance: mem.importance,
+          createdAt: now,
+          updatedAt: now,
+          vec
+        });
+        this.db.insert(semRow);
+        made.push({
+          id,
+          kind: 'semantic',
+          summary: rule,
+          detail: mem.detail,
+          entities: mem.entities,
+          importance: mem.importance,
+          accessCount: mem.accessCount,
+          ageMs: nowMs - Date.parse(mem.createdAt)
+        });
+      }
     }
     return made;
   }
@@ -1492,11 +1663,13 @@ export class HippoMemory {
    * `forgetAfterSec` they are soft-deleted (superseded), which keeps the
    * retrieval space clean without destroying the archived revision history.
    */
-  forget(opts: { strengthFloor?: number; now?: string; dryRun?: boolean; force?: boolean } = {}): { forgotten: string[]; decayed: string[] } {
+  forget(opts: { strengthFloor?: number; now?: string; dryRun?: boolean; force?: boolean } = {}): { forgotten: string[]; decayed: string[]; spared: string[] } {
     const strengthFloor = opts.strengthFloor ?? 0.25;
     const nowMs = Date.parse(opts.now ?? nowIso());
     const forgotten: string[] = [];
     const decayed: string[] = [];
+    /** Rows protected by the zero-recall guards (audit #7), for observability. */
+    const spared: string[] = [];
 
     for (const row of this.db.allActive()) {
       // Folded detail is already out of recall; deleting it would destroy the
@@ -1505,6 +1678,26 @@ export class HippoMemory {
       const mem = rowToMemory(row, false);
       const strength = mem.importance * (0.5 + 0.5 * Math.min(1, mem.accessCount / 5));
       if (strength >= strengthFloor) continue;
+
+      // Zero-recall protection (audit #7): break the negative-feedback loop
+      // "recall miss → accessCount stays 0 → decay → forgotten". Two guards:
+      //   1. grace period — a row younger than forgetGraceSec is simply young,
+      //      not useless; it may never have been cued yet.
+      //   2. evidence exemption — a row with passing evidence is re-checkable
+      //      fact, not noise; forgetting it discards the audit trail.
+      // force overrides both (an explicit flush means what it says).
+      if (!opts.force) {
+        const ageMs = nowMs - Date.parse(mem.createdAt);
+        if (ageMs < this.options.forgetGraceSec * 1000) {
+          spared.push(mem.id);
+          continue;
+        }
+        if (evidenceStanding(row, nowMs, this.options.evidenceTtlSec) !== 'none') {
+          spared.push(mem.id);
+          continue;
+        }
+      }
+
       const idleMs = mem.lastAccessAt ? nowMs - Date.parse(mem.lastAccessAt) : nowMs - Date.parse(mem.createdAt);
       const idleEnough = idleMs >= this.options.forgetAfterSec * 1000;
       if (idleEnough || opts.force) {
@@ -1522,7 +1715,7 @@ export class HippoMemory {
         decayed.push(mem.id);
       }
     }
-    return { forgotten, decayed };
+    return { forgotten, decayed, spared };
   }
 
   /** Hard-delete a memory and its archived revision history. Use sparingly. */
@@ -1881,6 +2074,14 @@ export class HippoMemory {
     superseded_matches: RelatedTrace[];
     /** True when the top support has a newer same-scope sibling. */
     stale_support: boolean;
+    /**
+     * Three-state upgrade of the argmax contract (audit #3): true when the
+     * substantiating argmax row is NOT the newest word on its scope, or when
+     * a related row asserts the opposite. The boolean verdict stays (an
+     * affirming exact match is still support), but a contested yes must be
+     * re-checked against contradicting[] / newer_related[] before asserting.
+     */
+    contested: boolean;
     note: string;
   }> {
     const cueVec = await this.embedOne(claim);
@@ -1934,6 +2135,7 @@ export class HippoMemory {
         newer_related: [],
         superseded_matches: [],
         stale_support: false,
+        contested: false,
         note: `UNSUBSTANTIATED: no stored trace matches this claim (best similarity ${bestSim.toFixed(2)} < ${this.options.similarityThreshold}). Do NOT assert it from memory; answer "I don't know / not in my memory".`
       };
     }
@@ -1953,6 +2155,7 @@ export class HippoMemory {
           newer_related: [],
           superseded_matches: [],
           stale_support: false,
+          contested: false,
           note:
             `OUT_OF_SCOPE: the closest trace ${best.id} (v${best.version}) is stated under "${sanitizeMemoryText(best.scope)}" ` +
             `and the claim was checked under "${sanitizeMemoryText(queryScope)}" — the key(s) ${differing.join(', ')} hold different values, ` +
@@ -1978,7 +2181,67 @@ export class HippoMemory {
         newer_related: [],
         superseded_matches: [],
         stale_support: false,
+        contested: true,
         note: `CONTRADICTED: memory asserts the opposite scope (${best.summary.slice(0, 80)} [v${best.version}]). Do not state the claim without flagging this conflict.${infectedNote}`
+      };
+    }
+
+    // Value contradiction on the SUPPORT itself: the closest trace binds the
+    // same subject to a DIFFERENT value than the claim asks to confirm. argmax
+    // alone reads this as support (same subject, high cosine, same polarity) —
+    // it is the opposite, and this is the one row the related-scan below skips
+    // (it excludes best.id). One value containing the other is a refinement,
+    // not a clash (`postgres` vs `postgres 15`), so those still substantiate.
+    const claimClaim = claimParts(claim);
+    const bestClaim = claimParts(best.summary);
+    if (
+      claimClaim &&
+      bestClaim &&
+      claimClaim.subject === bestClaim.subject &&
+      valueClash(claimClaim.value, bestClaim.value)
+    ) {
+      const bestRow = this.db.getById(best.id);
+      // The claim restates the OLD value of a row that has since moved on:
+      // the live row contradicts it, but the archived revision that said
+      // exactly this must stay reachable (S2) — a contradiction verdict with
+      // an empty history would tell the caller "never held", which is a lie.
+      const normClaimHere = normalizeText(stripAbstractPrefix(claim));
+      const archMatches: RelatedTrace[] = [];
+      if (bestRow) {
+        for (const h of this.db.historyOf(best.id)) {
+          if (normalizeText(stripAbstractPrefix(h.summary as string)) !== normClaimHere) continue;
+          archMatches.push({
+            id: best.id,
+            summary: sanitizeMemoryText(h.summary as string),
+            source: undefined,
+            confidence: (best.confidence ?? 'medium') as 'high' | 'medium' | 'low' | 'speculative',
+            version: Number(h.version),
+            updatedAt: (h.archived_at as string) ?? '',
+            entities: [],
+            similarity: 1
+          });
+        }
+        // Rows explicitly retired by (or into) the live row: the correction
+        // chain must survive the contradiction verdict too, or asking the old
+        // wording would report "never held" while the store still holds it.
+        for (const r of this.db.supersededBy(best.id)) {
+          archMatches.push(this.toRelated(r, 0));
+        }
+      }
+      const archNote = archMatches.length > 0
+        ? ` NOTE: this claim matches archived v${archMatches.map((s) => s.version).join(',v')} of ${best.id.slice(0, 8)} (retired revisions included) — the live row says otherwise. See superseded_matches.`
+        : '';
+      return {
+        substantiated: false,
+        contradicted: true,
+        out_of_scope: false,
+        contradiction: best,
+        contradicting: bestRow ? [this.toRelated(bestRow, bestSim)] : [],
+        newer_related: [],
+        superseded_matches: archMatches,
+        stale_support: false,
+        contested: true,
+        note: `CONTRADICTED: memory binds "${bestClaim.subject}" to "${sanitizeMemoryText(bestClaim.value)}" (v${best.version}), not "${sanitizeMemoryText(claimClaim.value)}". The closest trace states a different value — do not assert the claim.${infectedNote}${archNote}`
       };
     }
 
@@ -2004,7 +2267,6 @@ export class HippoMemory {
     // unrelated sentences (field report BUG-1 (a), seen again in round 8:
     // verifying an archived value flagged entity-disjoint rows at 0.6 sim).
     const supportClaim = supportRow ? claimParts(supportRow.summary) : null;
-    const claimClaim = claimParts(claim);
     const contradicting = related
       .filter(({ r }) => {
         const rowEntities = JSON.parse(r.entities_json || '[]') as string[];
@@ -2012,15 +2274,39 @@ export class HippoMemory {
         const rowClaim = claimParts(r.summary);
         const oppositePolarity = this.polarityOf(r.summary) !== claimNegated;
         const valueDisagrees =
-          !!(supportClaim && rowClaim && rowClaim.subject === supportClaim.subject && rowClaim.value !== supportClaim.value) ||
-          !!(claimClaim && rowClaim && rowClaim.subject === claimClaim.subject && rowClaim.value !== claimClaim.value);
+          !!(supportClaim && rowClaim && rowClaim.subject === supportClaim.subject && valueClash(rowClaim.value, supportClaim.value)) ||
+          !!(claimClaim && rowClaim && rowClaim.subject === claimClaim.subject && valueClash(rowClaim.value, claimClaim.value));
         return oppositePolarity || valueDisagrees;
       })
       .map(({ r, sim }) => this.toRelated(r, sim));
 
-    // (b) newer same-scope rows — the support may be stale
+    // (b) newer same-scope rows — the support may be stale. Being newer and
+    // merely clearing the cosine floor is NOT a correction (round 9 field
+    // report: 24/38 contested flags were newer-but-unrelated topical siblings,
+    // e.g. notif-queue flagged by an unrelated export-worker-queue row). A
+    // newer neighbour only makes the support stale when it is about the SAME
+    // subject: it must share an entity with the support row (the structural
+    // subject anchor), and — when BOTH sides yield a structured claim — bind
+    // that subject to a DIFFERENT value. Prose corrections ("X switched to Y")
+    // carry no extractable value, so same-entity + newer + different-text is
+    // the strongest signal available and is treated as stale.
     const newerRelated = related
       .filter(({ r }) => (supportRow ? r.updated_at > supportRow.updated_at : false))
+      .filter(({ r }) => {
+        const rowEntities = JSON.parse(r.entities_json || '[]') as string[];
+        if (!this.entitiesOverlap(supportEntities, rowEntities)) return false;
+        const rowClaim = claimParts(r.summary);
+        // Both sides structured on the same subject: require a real value clash
+        // so a reworded restatement of the same value is not called stale.
+        if (rowClaim && supportClaim && rowClaim.subject === supportClaim.subject) {
+          return valueClash(rowClaim.value, supportClaim.value);
+        }
+        if (rowClaim && claimClaim && rowClaim.subject === claimClaim.subject) {
+          return valueClash(rowClaim.value, claimClaim.value);
+        }
+        // Prose (no structured claim to compare): same-entity newer trace stands.
+        return true;
+      })
       .map(({ r, sim }) => this.toRelated(r, sim));
 
     // (c) retired rows whose supersedes edge points at the support
@@ -2038,10 +2324,20 @@ export class HippoMemory {
     if (supportRow) archiveRows.push({ id: supportRow.id, row: supportRow });
     for (const { r } of related) archiveRows.push({ id: r.id, row: r });
     let fuzzyLeft = 8;
-    for (const { id } of archiveRows) {
+    for (const { id, row } of archiveRows) {
       const live = this.db.getById(id);
       const liveNorm = live ? normalizeText(stripAbstractPrefix(live.summary)) : null;
       const liveClaim = live ? claimParts(live.summary) : null;
+      // Fuzzy-tier relevance anchor (round-9 field report: a notif-queue verify
+      // pulled deploy-target/export-worker archives at ~0.59 sim). The fuzzy
+      // branch below re-embeds an archived revision and admits it on cosine
+      // alone, so an unrelated subject that merely flipped its own value can
+      // clear the floor against this claim. Require the row to share an entity
+      // with the support (the structural subject anchor) unless it IS the
+      // support row — the exact-restatement tier stays unguarded because a
+      // literal text match is decisive on its own.
+      const rowEntities = JSON.parse(row.entities_json || '[]') as string[];
+      const fuzzyRelevant = id === best.id || this.entitiesOverlap(supportEntities, rowEntities);
       for (const h of this.db.historyOf(id)) {
         const archNorm = normalizeText(stripAbstractPrefix(h.summary as string));
         const archClaim = claimParts(h.summary as string);
@@ -2065,8 +2361,9 @@ export class HippoMemory {
         // Fuzzy tier: the archived revision binds the same subject to a
         // different value than the live row (or the claim) holds — a reworded
         // "last round" question. Relevance comes from the row already being
-        // in the related set; the score is re-measured, never invented.
-        if (fuzzyLeft <= 0) continue;
+        // in the related set AND sharing an entity with the support; the score
+        // is re-measured, never invented.
+        if (fuzzyLeft <= 0 || !fuzzyRelevant) continue;
         const flipVsLive = !!(liveClaim && archClaim && archClaim.subject === liveClaim.subject && archClaim.value !== liveClaim.value);
         const flipVsClaim = !!(claimClaim && archClaim && archClaim.subject === claimClaim.subject && archClaim.value !== claimClaim.value);
         if (!(flipVsLive || flipVsClaim) || archNorm === liveNorm) continue;
@@ -2126,6 +2423,15 @@ export class HippoMemory {
         ? ` NOTE: the support states no scope — its premise could not be checked against "${sanitizeMemoryText(queryScope)}".`
         : '';
 
+    // Audit #3: the argmax contract stays (an affirming match substantiates),
+    // but the verdict is no longer a bare boolean — when the support is not
+    // the newest word on its scope, or a related row disagrees, the caller
+    // must treat the yes as contested and read the neighbourhood evidence.
+    const contested = staleSupport || contradicting.length > 0;
+    const contestedNote = contested
+      ? ' CONTESTED: this yes is disputed (stale support or a disagreeing sibling) — weigh contradicting[] / newer_related[] before asserting.'
+      : '';
+
     return {
       substantiated: true,
       contradicted: false,
@@ -2135,7 +2441,8 @@ export class HippoMemory {
       newer_related: newerRelated,
       superseded_matches: supersededMatches,
       stale_support: staleSupport,
-      note: `SUBSTANTIATED: matches ${best.id} (v${best.version}, sim ${bestSim.toFixed(2)}).${infectedNote}${staleNote}${contradictNote}${archiveNote}${fuzzyNote}${staleEvidenceNote}${premiseNote}`
+      contested,
+      note: `SUBSTANTIATED: matches ${best.id} (v${best.version}, sim ${bestSim.toFixed(2)}).${infectedNote}${staleNote}${contradictNote}${archiveNote}${fuzzyNote}${staleEvidenceNote}${premiseNote}${contestedNote}`
     };
   }
   /* ============================ context gating ============================ */
@@ -2165,11 +2472,16 @@ export class HippoMemory {
       const kind = `[${m.kind}${m.consolidated ? '/semantic' : ''}]`;
       const occ = m.occurredAt ? ` (at ${m.occurredAt})` : '';
       // A guess carries no standing: it never cleared the floor, so it may not
-      // borrow VERIFIED/ASSERTED from the row it happens to be.
+      // borrow VERIFIED/ASSERTED from the row it happens to be. Audit #5: the
+      // engine never executes verify commands, so a reported pass is labelled
+      // by its trust tier — attested runs get the bare badge, self-reported
+      // passes are marked as such (the write-path shield degrades the same way).
       const standing = m.lowConfidence
         ? ` [low-confidence sim ${m.similarity.toFixed(2)} < floor ${rec.threshold.toFixed(2)}: the closest trace, not a memory — verify before asserting]`
         : evidenceFresh(m.verifyResult, m.verifiedAt, tagNow, this.options.evidenceTtlSec)
-          ? ' [VERIFIED]'
+          ? m.verifyAttested
+            ? ' [VERIFIED]'
+            : ' [VERIFIED self-reported]'
           : m.kind === 'semantic'
             ? ' [ASSERTED]'
             : '';

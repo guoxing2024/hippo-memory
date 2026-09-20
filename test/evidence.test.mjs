@@ -2,8 +2,9 @@
  * Suggestion round (anti-hallucination): evidence, shield, retraction,
  * guard, range priors, [recent] repair.
  *
- *  S1: numeric semantic claims without passing evidence downgrade to
- *      episodes; [VERIFIED]/[ASSERTED] render in context.
+ *  S1: numeric value assertions stay semantic regardless of verification
+ *      status (verification affects rendering + shield strength, NOT kind or
+ *      correctability); [VERIFIED]/[ASSERTED] render in context.
  *  S2: VERIFIED incumbents are retired only by passing evidence
  *      (fabrication wash); verify() sees archived revisions.
  *  S3: range priors warn (never block) on impossible values.
@@ -26,13 +27,17 @@ function freshStore(tag = 'ev', options) {
   return { m, dir };
 }
 
-test('S1: numeric semantic without evidence downgrades to episode', async () => {
+test('S1: numeric value assertion stays semantic regardless of verification', async () => {
   const { m, dir } = freshStore('s1');
   try {
+    // An unverified numeric claim keeps its semantic kind — verification is
+    // orthogonal to whether a value can later be corrected. It must NOT be
+    // downgraded to an episode (that would move it off the same-kind override
+    // path and make the wrong value un-correctable).
     const w = await m.remember({ kind: 'semantic', summary: 'D1 coverage ratio -> 1.350565', entities: [{ name: 'd1' }] });
     assert.equal(w.outcome, 'new');
-    assert.equal(w.memory.kind, 'episode', `unverified numeric claim must not become a rule: ${w.memory.kind}`);
-    assert.ok(w.warning && w.warning.includes('downgraded'), `downgrade is visible: ${w.warning}`);
+    assert.equal(w.memory.kind, 'semantic', `unverified numeric claim keeps its kind: ${w.memory.kind}`);
+    assert.ok(!w.warning || !w.warning.includes('downgraded'), `no downgrade: ${w.warning}`);
     const v = await m.remember({
       kind: 'semantic', summary: 'D1 coverage ratio -> 1.350565', entities: [{ name: 'd1' }],
       verify: { cmd: 'python check.py', expect: '1.350565' }, verifyResult: 'pass', verifiedAt: '2026-09-18T01:30:00Z'
@@ -45,46 +50,50 @@ test('S1: numeric semantic without evidence downgrades to episode', async () => 
   }
 });
 
-test('S1 narrowed (R29): prose mentioning numbers keeps its kind', async () => {
+test('S1 narrowed (R29): both prose and copula value assertions keep semantic kind', async () => {
   const { m, dir } = freshStore('s1n');
   try {
     const w = await m.remember({ kind: 'semantic', summary: 'release 2.1 shipped Tuesday', entities: [{ name: 'rel' }] });
     assert.equal(w.memory.kind, 'semantic', 'version strings are not value assertions');
     assert.ok(!w.warning || !w.warning.includes('downgraded'), 'no downgrade noise');
+    // A copula value assertion is a semantic claim too — it stays semantic so a
+    // later "cache size is 1 GB" can override it on the same-kind path.
     const c = await m.remember({ kind: 'semantic', summary: 'cache size is 512 MB', entities: [{ name: 'cache' }] });
-    assert.equal(c.memory.kind, 'episode', 'copula value assertion still downgrades');
+    assert.equal(c.memory.kind, 'semantic', 'copula value assertion keeps semantic kind');
+    assert.ok(!c.warning || !c.warning.includes('downgraded'), 'no downgrade noise');
   } finally {
     m.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('S1: context renders [VERIFIED] vs [ASSERTED]', async () => {
+test('S1: context renders [VERIFIED] vs [ASSERTED] (trust tiers, audit #5)', async () => {
   const { m, dir } = freshStore('s1b');
   try {
     await m.remember({
       kind: 'semantic', summary: 'cache limit -> 512', entities: [{ name: 'cache' }],
-      verify: { cmd: 'check.sh', expect: '512' }, verifyResult: 'pass'
+      verify: { cmd: 'check.sh', expect: '512' }, verifyResult: 'pass', verifyAttested: true
     });
     await m.remember({ kind: 'semantic', summary: 'plain policy statement here', entities: [{ name: 'policy' }] });
     const ctx = await m.composeContext('cache limit policy', { limit: 6 });
-    assert.ok(ctx.context.includes('[VERIFIED]'), `verified row tagged: ${ctx.context.slice(0, 400)}`);
+    assert.ok(ctx.context.includes('[VERIFIED]'), `attested row tagged: ${ctx.context.slice(0, 400)}`);
+    assert.ok(!ctx.context.includes('self-reported'), 'attested evidence carries the bare badge');
   } finally {
     m.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('S2: fabrication cannot retire a VERIFIED row (wash)', async () => {
+test('S2: fabrication cannot retire an ATTESTED VERIFIED row (wash)', async () => {
   const { m, dir } = freshStore('s2');
   try {
     const t = await m.remember({
       kind: 'semantic', summary: 'D1 coverage ratio -> 1.350565', entities: [{ name: 'd1' }],
-      verify: { cmd: 'python check.py', expect: '1.350565' }, verifyResult: 'pass'
+      verify: { cmd: 'python check.py', expect: '1.350565' }, verifyResult: 'pass', verifyAttested: true
     });
     assert.equal(t.memory.kind, 'semantic');
     // Numeric challengers without evidence are downgraded to episodes first:
-    // the VERIFIED rule stands either way — retirement is what must not happen.
+    // the ATTESTED rule stands either way — retirement is what must not happen.
     const f = await m.remember({ kind: 'semantic', summary: 'D1 coverage ratio -> 1.566', entities: [{ name: 'd1' }] });
     assert.notEqual(f.outcome, 'override', `unverified fabrication must not override: ${f.outcome}`);
     assert.equal(m.stats().active, 2, 'truth and challenger coexist');
@@ -101,12 +110,36 @@ test('S2: fabrication cannot retire a VERIFIED row (wash)', async () => {
   }
 });
 
-test('S2: shield fires for non-numeric challengers (same kind, no downgrade)', async () => {
+test('S2 (audit #5): a SELF-REPORTED pass shields only with a degraded warning', async () => {
+  const { m, dir } = freshStore('s2sr');
+  try {
+    await m.remember({
+      kind: 'semantic', summary: 'cache layer -> redis', entities: [{ name: 'cache' }],
+      verify: { cmd: 'check.sh', expect: 'redis' }, verifyResult: 'pass'
+    });
+    // Same-subject value flip against a self-reported VERIFIED incumbent:
+    // the override PROCEEDS (the badge is hearsay) but says so out loud —
+    // the shield degrades to a visible note instead of silently protecting
+    // an assertion the engine never verified.
+    const f = await m.remember({ kind: 'semantic', summary: 'cache layer -> memcached', entities: [{ name: 'cache' }] });
+    assert.equal(f.outcome, 'override', `self-reported shield must not block: ${f.outcome}`);
+    assert.ok(f.warning && f.warning.includes('shield-note'), `degradation is visible: ${f.warning}`);
+    assert.ok(f.warning.includes('SELF-REPORTED'), 'the warning names the trust tier');
+    // The old value survives in history — nothing is silently lost either way.
+    const v = await m.sourceMonitor('cache layer -> redis');
+    assert.ok(v.superseded_matches.length > 0 || v.contradicted, 'the archived truth is still reachable');
+  } finally {
+    m.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('S2: shield fires for non-numeric challengers (attested incumbent)', async () => {
   const { m, dir } = freshStore('s2c');
   try {
     await m.remember({
       kind: 'semantic', summary: 'gateway -> nginx', entities: [{ name: 'gateway' }],
-      verify: { cmd: 'check.sh', expect: 'nginx' }, verifyResult: 'pass'
+      verify: { cmd: 'check.sh', expect: 'nginx' }, verifyResult: 'pass', verifyAttested: true
     });
     const f = await m.remember({ kind: 'semantic', summary: 'gateway -> envoy', entities: [{ name: 'gateway' }] });
     assert.notEqual(f.outcome, 'override', `unverified challenger must not override: ${f.outcome}`);
@@ -125,7 +158,7 @@ test('S2: verify() sees archived revisions', async () => {
     assert.equal(a.outcome, 'new');
     const b = await m.remember({
       kind: 'semantic', summary: 'link speed -> fast', entities: [{ name: 'link' }],
-      verify: { cmd: 'ethtool x', expect: 'fast' }, verifyResult: 'pass'
+      verify: { cmd: 'ethtool x', expect: 'fast' }, verifyResult: 'pass', verifyAttested: true
     });
     assert.equal(b.outcome, 'override');
     const v = await m.sourceMonitor('link speed -> slow');
@@ -267,7 +300,7 @@ test('evidence TTL: stale proof loses shield and VERIFIED', async () => {
     try {
       await m2store.m.remember({
         kind: 'semantic', summary: 'gateway -> nginx', entities: [{ name: 'gateway' }],
-        verify: { cmd: 'check.sh', expect: 'nginx' }, verifyResult: 'pass', verifiedAt: new Date().toISOString()
+        verify: { cmd: 'check.sh', expect: 'nginx' }, verifyResult: 'pass', verifyAttested: true, verifiedAt: new Date().toISOString()
       });
       const f2 = await m2store.m.remember({ kind: 'semantic', summary: 'gateway -> envoy', entities: [{ name: 'gateway' }] });
       assert.ok(f2.warning && f2.warning.startsWith('shielded:'), `fresh proof shields: ${f2.warning}`);

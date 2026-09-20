@@ -53,9 +53,16 @@ const DISCIPLINE = [
   '',
   '1. WRITE - after learning a durable fact or finishing a meaningful step, call memory_remember.',
   '   Prefer a structured "<subject> -> <value>" summary for facts so corrections version cleanly.',
-  '   When a fact only holds under conditions (population, comparator, release), pass `scope`.',
-  '2. RECALL - before answering from memory (this session or an earlier one), call memory_recall.',
-  '3. VERIFY - before asserting a remembered fact, call memory_verify with the `scope` you mean.',
+  '   When a fact only holds under conditions (population, comparator, release, env, version), pass `scope`',
+  '   as "key=value; key=value" — e.g. "latency -> 40ms" scope "region=us-east; load=peak". Reach for it',
+  '   whenever the same claim could be true in one setup and false in another. Only state premises you',
+  '   actually know — never invent a scope key to look precise; a fact with no real condition takes none.',
+  '2. RECALL - before answering from memory (this session or an earlier one), call memory_recall. If the',
+  '   question is premise-bound (a specific env, region, release, dataset), pass that same `scope` so a',
+  '   fact stored under a different premise is filtered out instead of misread as the answer.',
+  '3. VERIFY - before asserting a remembered fact, call memory_verify with the `scope` you mean. Pass scope',
+  '   whenever the claim depends on a premise you can name — it answers OUT_OF_SCOPE instead of blessing a',
+  '   value stored under other conditions; do not fabricate a scope you are not actually asking about.',
   '   If it is not substantiated, say "not in my memory" instead of guessing; if contradicted,',
   '   surface the conflict; if OUT_OF_SCOPE, the stored answer belongs to other premises.',
   '4. MAINTAIN - in long sessions, occasionally call memory_maintain: status (health, and which store',
@@ -296,6 +303,11 @@ function buildTools({ tool, getStore, config }) {
           id: res.memory?.id,
           version: res.memory?.version,
           scope: res.memory?.scope ?? null,
+          // Carried evidence on the stored row: a re-tell that lands fresh
+          // verify_result must surface it, or a later verify reads the row as
+          // unverified even though the proof is on file.
+          verify_result: res.memory?.verifyResult ?? null,
+          verified_at: res.memory?.verifiedAt ?? null,
           superseded: res.superseded ?? null,
           warning: res.warning ?? null,
           neighbours: (res.neighbours ?? []).slice(0, 3),
@@ -307,19 +319,30 @@ function buildTools({ tool, getStore, config }) {
       description:
         'Retrieve memories matching a question. Call this before answering anything that depends on ' +
         'facts from earlier in this session or from a previous one. Returns similarity (raw cosine), ' +
-        'score (ranking value) and a reason when nothing matched.',
+        'score (ranking value) and a reason when nothing matched. If your question is premise-bound ' +
+        '(a specific env/region/release/dataset), pass that same scope so a fact stored under another ' +
+        'premise is filtered out instead of misread as the answer.',
       args: {
         query: s.string().describe?.('The question / retrieval cue.') ?? s.string(),
         limit: s.number().optional?.() ?? s.number(),
+        scope: (s.string().optional?.().describe?.(
+          'The premise your question is bound to, as "key=value; key=value". Rows whose stated scope disagrees are excluded entirely, so a fact stored under a different premise (another env/region/release) is filtered out instead of misread as the answer.',
+        ) ?? s.string()),
       },
       async execute(args, context) {
         const store = await getStore(context?.directory);
-        const res = await store.recall({ query: args.query }, Math.min(args.limit ?? 8, 20));
+        const res = await store.recall(
+          { query: args.query, scope: typeof args.scope === 'string' ? args.scope : undefined },
+          Math.min(args.limit ?? 8, 20),
+        );
         return json({
           hits: res.hits.map(hitView),
           reason: res.reason,
           threshold: res.threshold,
           bestSimilarity: res.bestSimilarity,
+          // How many rows the scope hard-filter dropped (only meaningful when a
+          // scope was passed). >0 confirms premise filtering actually ran.
+          scopeExcluded: res.scopeExcluded ?? null,
           nearMisses: (res.nearMisses ?? []).slice(0, 3),
           nearDuplicates: (res.nearDuplicates ?? []).slice(0, 3),
           warnings: res.warnings ?? [],
@@ -350,6 +373,7 @@ function buildTools({ tool, getStore, config }) {
           newer_related: v.newer_related ?? [],
           superseded_matches: v.superseded_matches ?? [],
           stale_support: v.stale_support ?? false,
+          contested: v.contested === true,
           note: v.note,
         });
       },

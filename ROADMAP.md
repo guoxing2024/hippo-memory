@@ -4,6 +4,8 @@ Open, living plan — ordered by expected user impact. PRs welcome on any item.
 
 ## v0.2.x — recall quality & trust
 
+- [x] **二轮审计落地（2026-09-20）**：嵌入默认 `auto`（语义召回成为默认，`off` 为退出项）；`verifyAttested` 信任分级（`[VERIFIED]` vs `[VERIFIED self-reported]`，护盾只保护可复核证据）；`sourceMonitor.contested` 三态裁决；`summarizer` LLM 巩固钩子（模板为回退）；`forget` 零召回保护（`forgetGraceSec` + 证据豁免，打断"召不回→被遗忘"负反馈环）；`recall({ scope })` 前提硬过滤（`scopeExcluded`）；bench 增加朴素 RAG 对照臂（RAG 编造率 63% vs hippo 25%，量化版本化纠正链的增量）。
+- [ ] **真实 LLM 端到端基准**：现有 bench 的答题臂是字符串匹配模拟器（检索臂模拟，n=8）。需要一个真模型跑 LongMemEval 式任务 + 朴素 RAG 对照，产出可引用的幻觉率数字。
 - [x] Explicit correction edges + write-time neighbour echo (`supersedes` / `superseded_by`, `neighbours[]`)
 - [x] Observability: `diagnostics()` / `health` / `override-audit` / `memory_maintain status`
 - [x] Evidence, retraction and prospective guards (verify_* + TTL, `retracts`, `guard`)

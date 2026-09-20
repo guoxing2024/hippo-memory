@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — 前提作用域 `scope`（版本号待定）
+## [0.3.0] — 2026-09-20（需要引擎 `hippo-memory-core@^0.3.0`）
 
 ### Added
 
@@ -9,7 +9,13 @@
 - **`memory_recall` 命中带 `scope`**（`hitView` 透出），同一主题多个前提各一行时可分辨。
 - **注入的使用纪律更新**：写入一条要求"只在条件下成立就带 `scope`"；查证一条要求"`out_of_scope` 说明记忆里的答案属于别的前提，不得搬用"。
 
-> 依赖引擎带 `scope` 的新版本（当前 `hippo-memory-core: ^0.2.1`，发布时需提高下限）。配旧引擎不报错：`scope` 被忽略、`out_of_scope` 恒为 `false`。
+> 依赖引擎带 `scope` 的新版本，下限已提到 `hippo-memory-core@^0.3.0`（带 `scope` 与 fuzzy 归档修复）。配旧引擎不报错：`scope` 被忽略、`out_of_scope` 恒为 `false`。
+
+### Fixed — 第九轮实测反馈：适配层两处透传缺口（与 DSH 同构）
+
+- **`memory_recall` 补 `scope` 参数并透传引擎**：此前 recall 工具**根本没有 `scope` 入参**，传给 `store.recall` 的 cue 也不含它——前提硬过滤在工具面完全不生效。现在加 `scope` 入参、透传给 cue，返回补 `scopeExcluded`（`?? null` 规范空值），description 补一句"问题带前提就传 scope"。
+- **`memory_remember` 回显 `verify_result` / `verified_at`**：原样复述并带新证据时，证据落到存储行但返回对象不透出，调用方看不到复述是否带上了证据。现补齐两字段。
+- 均为适配层透传修复；`sourceMonitor` 的 fuzzy 归档误报订正在 `hippo-memory-core`（见根 CHANGELOG）。本包与 DSH 适配层为结构同构改动。
 
 ### Added — ② 重复合并：`memory_maintain merge` / `undemote`
 

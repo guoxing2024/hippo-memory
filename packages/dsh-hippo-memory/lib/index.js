@@ -61,8 +61,16 @@ const SettingsSchema = z.object({
   enabled: z.boolean().default(true),
   contextLimit: z.number().min(1).max(20).default(6),
   sharedStore: z.boolean().default(false),
-  /** 'auto' = lazily load a local embedding model for stronger recall (CJK/paraphrase); 'off' = built-in hashing embedder. */
-  embedding: z.union(['off', 'auto']).default('off'),
+  /**
+   * Embedder choice. Default 'auto': the built-in hashing embedder has no
+   * synonym ability (an audit flagged the old 'off' default as the single
+   * biggest cause of false "not in my memory" answers — CJK paraphrase recall
+   * was near zero), so semantic recall is the default and 'off' is the opt-out
+   * for constrained environments. 'auto' lazily loads a local
+   * bge-small-zh-v1.5 (~24MB, cached under storages/hippo-memory/models) and
+   * falls back to hashing if loading fails.
+   */
+  embedding: z.union(['off', 'auto']).default('auto'),
   /** recall similarity floor; lower = more lenient recall, higher = stricter. Leave unset for engine default (0.32). */
   similarityThreshold: z.number().min(0.05).max(0.95).required(false)
 });
@@ -73,9 +81,9 @@ const GUIDANCE = `## Long-term memory (hippocampus-inspired)
 
 You have an explicit long-term memory store. Follow this discipline instead of relying on the raw transcript for old facts:
 
-1. WRITE — after learning a durable fact or finishing a meaningful event, call memory_remember (kind: semantic = rules, episode = events, procedure = skills). Prefer a structured summary "<subject> -> <value>" so later corrections version cleanly instead of conflicting. When a fact holds only under conditions (population, comparator, release), pass scope as "key=value; key=value" — the same sentence under a different scope is kept as its own trace instead of overwriting that one.
-2. RECALL — before answering anything that depends on facts from earlier in this session (or a past session), call memory_recall with the question as the query.
-3. VERIFY — before asserting a remembered fact as current, call memory_verify with the claim and the scope you mean. If it returns substantiated=false, answer "not in my memory / I don't know" — never confabulate. If contradicted, flag the conflict and use the newest revision. If out_of_scope, the stored answer is about different premises: do not carry it over.
+1. WRITE — after learning a durable fact or finishing a meaningful event, call memory_remember (kind: semantic = rules, episode = events, procedure = skills). Prefer a structured summary "<subject> -> <value>" so later corrections version cleanly instead of conflicting. When a fact holds only under conditions (population, comparator, release, environment, version), pass scope as "key=value; key=value" — the same sentence under a different scope is kept as its own trace instead of overwriting that one. Reach for scope whenever the same claim could be true in one setup and false in another: "latency -> 40ms" with scope "region=us-east; load=peak", "auth flow -> oauth" with scope "env=prod". Only state conditions you actually know — never invent a scope key to look precise; a fact with no real premise takes no scope.
+2. RECALL — before answering anything that depends on facts from earlier in this session (or a past session), call memory_recall with the question as the query. If your question is itself premise-bound (a specific environment, region, release, dataset), pass that same scope so a fact stored under a different premise is filtered out instead of misread as the answer.
+3. VERIFY — before asserting a remembered fact as current, call memory_verify with the claim and the scope you mean. Pass scope whenever the claim's truth depends on a premise you can name (env, region, version, population) — it makes the check answer OUT_OF_SCOPE instead of blessing a value stored under different conditions. Do not fabricate a scope you are not actually asking about. If it returns substantiated=false, answer "not in my memory / I don't know" — never confabulate. If contradicted, flag the conflict and use the newest revision. If out_of_scope, the stored answer is about different premises: do not carry it over.
 4. MAINTAIN — in long sessions call memory_maintain so the store stays readable: status (one-line health, plus which store file actually answered), duplicates (read-only report of restatements; inside a group marked mixedPremises the rows stated under different premises are not restatements of each other), then merge on a group you confirmed — merge folds the extras into the survivor, they stay in the store and undemote restores them, while delete also destroys the version history. consolidate / forget as usual.
 5. The [hippo-memory digest] runtime-context block (when present) lists memories retrieved automatically for the current task with provenance — treat them as retrieved evidence, never as license to invent more. A line tagged [low-confidence …] is the closest trace *below* the recall floor: a guess about what you may have meant, not a memory — verify before asserting it and never repeat it as stored fact. They may lag one step behind a memory_remember write; trust memory_verify for authoritative checks.`;
 
@@ -245,7 +253,11 @@ function apply(ctx, config = {}) {
     enabled: config.enabled !== false,
     contextLimit: config.contextLimit ?? 6,
     sharedStore: config.sharedStore === true,
-    embedding: config.embedding ?? 'off',
+    // Audit #0: semantic recall is the DEFAULT. The hashing embedder has no
+    // synonym ability, and defaulting to it turned "I don't remember" into the
+    // normal answer for paraphrased (especially CJK) questions. 'off' stays
+    // available for constrained environments.
+    embedding: config.embedding ?? 'auto',
     similarityThreshold: config.similarityThreshold ?? undefined
   };
 
@@ -547,6 +559,11 @@ function apply(ctx, config = {}) {
           kind: res.memory.kind,
           summary: res.memory.summary,
           scope: res.memory.scope ?? null,
+          // Carried evidence on the stored row: a re-tell that passes fresh
+          // verify_result must surface it (field report scenario D: the proof
+          // lived in storage but never reached the caller's return object).
+          verify_result: res.memory.verifyResult ?? null,
+          verified_at: res.memory.verifiedAt ?? null,
           // An override archives the previous revision instead of erasing it.
           // Say so explicitly: silent versioning reads as data loss.
           superseded: res.superseded
@@ -589,14 +606,15 @@ function apply(ctx, config = {}) {
         entities: { type: 'array', items: { type: 'string' }, description: 'Restrict to memories about these entities.' },
         kind: { type: 'string', enum: ['episode', 'semantic', 'procedure'], description: 'Restrict to one kind.' },
         limit: { type: 'number', description: 'Max hits (default 8, max 20).' },
-        include_demoted: { type: 'boolean', description: 'Also surface compress-folded rows (default false: their invariant covers them).' }
+        include_demoted: { type: 'boolean', description: 'Also surface compress-folded rows (default false: their invariant covers them).' },
+        scope: { type: 'string', description: 'The premise your question is bound to, as `key=value; key=value`. Rows whose stated scope disagrees are excluded entirely, so a fact stored under a different premise (another env/region/release) is filtered out instead of misread as the answer.' }
       },
       output: outputOf(),
       async execute(args, exec) {
         await embedderReadyForQuery();
         const store = storeFor(sanitize(agentIdOf(exec)));
         const res = await store.recall(
-          { query: args.query, entities: args.entities, kind: args.kind, includeDemoted: args.include_demoted === true },
+          { query: args.query, entities: args.entities, kind: args.kind, includeDemoted: args.include_demoted === true, scope: typeof args.scope === 'string' ? args.scope : undefined },
           Math.min(args.limit ?? 8, 20)
         );
         return cleanJson({
@@ -634,6 +652,9 @@ function apply(ctx, config = {}) {
           bestSimilarity: res.bestSimilarity,
           threshold: res.threshold,
           nearMisses: res.nearMisses,
+          // How many rows the scope hard-filter dropped (only present when a
+          // scope was passed). >0 confirms premise filtering actually ran.
+          scopeExcluded: res.scopeExcluded,
           // Non-conflicting overlap with the top hit (newer/older siblings on
           // the same topic). Kept OUT of warnings on purpose: a warning must
           // mean "check before asserting", so temporal neighbours live here.
@@ -666,6 +687,7 @@ function apply(ctx, config = {}) {
           newer_related: v.newer_related ?? [],
           superseded_matches: v.superseded_matches ?? [],
           stale_support: v.stale_support ?? false,
+          contested: v.contested === true,
           note: v.note
         });
       },

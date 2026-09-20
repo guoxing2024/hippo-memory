@@ -1,6 +1,29 @@
 # Changelog
 
-## [Unreleased] — 前提作用域 `scope` + 重复合并 + 兜底提示 + 库分裂可见（版本号待定）
+## [0.3.0] — 2026-09-20
+
+### Added — 第二轮专家审计落地（信任分级 / 三态裁决 / LLM 巩固钩子 / 遗忘保护 / scope 读取过滤）
+
+- **信任分级（审计 #5）**：`remember` 新增 `verifyAttested`。引擎从不执行 `verify_cmd`，因此 `pass` 分两档：**attested**（调用方声明检查在可复现环境中实际执行过）→ 渲染 `[VERIFIED]`、保留完整退休护盾；**self-reported**（默认，诚实但自我声明）→ 渲染 `[VERIFIED self-reported]`，护盾**降级为显式警告**（`shield-note: … SELF-REPORTED …`），覆盖照常进行、旧版本留在历史。空口徽章不再守护数据。
+- **三态裁决（审计 #3）**：`sourceMonitor` 返回值新增 `contested`。布尔契约不变（肯定匹配仍 substantiated），但当支撑行不是其前提下的最新结论、或邻域存在反方时 `contested: true` 并在 note 里标注 `CONTESTED:`——"是"不再是一个裸布尔。
+- **LLM 巩固钩子（审计 #4）**：`new HippoMemory({ summarizer })` / `setSummarizer()`。`consolidate()` 优先把合格 episode 交给 summarizer 做真正的泛化（可返回多条规则），抛错或返回空回退到原 `FACT:` 模板——巩固永不失败。文档此前声称的"接口已预留"现在真实存在。
+- **遗忘零召回保护（审计 #7）**：`forget()` 新增两道窄守卫——`forgetGraceSec`（默认 14 天）内的新行**既不遗忘也不衰减**；带新鲜证据的行豁免（证据行被遗忘等于丢弃审计链）。`force` 仍是显式冲洗的逃生门。返回值新增 `spared[]` 以便观察。这打断了"弱嵌入器 → 召回失败 → access 不涨 → 衰减 → 遗忘"的负反馈环。
+- **scope 读取硬过滤（审计 #7/#8 收敛步）**：`recall(cue, { scope })` 把前提冲突的行**排除出结果**（计数进新字段 `scopeExcluded` 并附 `scope:` 警告）；未声明前提的行照常通过（没写前提 ≠ 反对前提）。opt-in，默认读取路径不变。
+- **bench 对照臂（审计 #6 部分）**：`anti-hallucination-bench` 新增**朴素全文 RAG 臂**（同嵌入器、同抽取规则）。当前读数：RAG 编造率 63%（自信召回被更正前的旧值）vs HippoMemory 25%——量化"版本化纠正链"相对朴素向量检索的增量。INTRO 的效果数字同步改为对照结构口径（检索臂模拟、n=8，真实 LLM 端到端基准仍待补）。
+- **审计 #0**：DSH 适配层嵌入默认从 `off` 翻转为 `auto`（本地语义模型，懒加载，失败回退哈希）；`off` 成为显式退出项。GUI 选项文案同步标注推荐值。
+- **值矛盾判定精化（承接上轮审计 #7）**：same-subject 值比较从裸字符串改为**词元级**（去掉连接词、包含即精化、IoU<0.5 才算冲突）——"uses github actions **and** caches node_modules" 与漏掉 and 的复述不再被误判为矛盾（修复了 memory.test 的 supported-claim 误报）；值矛盾的早返回现在**携带 supersedes 链与归档版本**（`superseded_matches` + `archived vN` 注记），问旧值不再得到"从未存在"的假答案。
+
+### Fixed — 上轮审计遗留的两处测试-实现冲突
+
+- `scope.test`"前提感知选择"用例按新契约改写：换口径追问同主体异值结论现在正确判 `CONTRADICTED`（点名不同意的那行），其自身口径下仍 `SUBSTANTIATED`。
+- `evidence.test` S2 系列按信任分级改写；新增 `test/audit2-round.test.mjs`（11 项）锁定本轮全部新契约。
+
+### Fixed — 第九轮实测反馈：`sourceMonitor` fuzzy 归档层误报（`contested` 假阳）
+
+- **fuzzy 归档匹配加主体相关性闸门**：`sourceMonitor` 的模糊归档层此前只按 cosine 收录归档修订——一个**自身值翻转过、又与 claim 有词面重叠的无关主体**（实测 `backup queue` vs `primary queue`，sim ~0.62）会被塞进 `superseded_matches`，连带把 `contested` / `stale_support` 误置为 `true`。现在 fuzzy 分支要求该行**与支持行共享实体**（除非它就是支持行本身）才纳入；exact 复述层（similarity=1）不设闸——字面全等本身即决定性证据。支持行**自己的**归档修订照常带出，不受影响。
+- 新增两项回归用例（`audit2-round.test.mjs`，共 15 项）：`fuzzy-archived flip on an unrelated subject never contests`（用词面兄弟主体复现实测误报，关闸即红）与 `support row's own archived flip still surfaces`（防闸门过宽误伤支持行自身历史）。
+
+## [0.3.0]（续）— 前提作用域 `scope` + 重复合并 + 兜底提示 + 库分裂可见
 
 > 四条改动来自同一份外部实测反馈，共同点是**把"看起来没有"和"其实不是那样"区分开**：verify 不再拿旧口径的答案给新问题盖章（① `scope`）；重复报告不再诱使你把两种前提下的同一句话折成一条（② `merge` + `mixedPremises`）；召回没过门槛时不再静默空白，而是把最接近的痕迹标明身份给出（③）；一条记忆都没召回时，先看清是不是读错了库文件（④）。
 

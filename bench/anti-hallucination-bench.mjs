@@ -115,7 +115,46 @@ async function answerWithRawDump(dump, q) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Runtime 2: HippoMemory                                               */
+/* Runtime 2: naive RAG baseline (audit #6 control arm)                  */
+/*                                                                       */
+/* The claim "hippo beats no-memory" is only meaningful if the           */
+/* alternative is not a bounded window but the standard fix everyone     */
+/* actually ships: embed every transcript line and retrieve top-1.      */
+/* This arm does exactly that with the SAME embedder and the SAME       */
+/* answer extraction as the no-memory arm — no provenance, no version   */
+/* chain, no source monitoring. It shows what the hippocampal machinery */
+/* adds beyond plain vector search (mainly: corrections resolve to the  */
+/* newest value instead of whichever line scores higher).               */
+/* ------------------------------------------------------------------ */
+
+const ragDocs = []; // { line, vec }
+
+function indexForRag(line) {
+  ragDocs.push({ line, vec: embedHashing(line) });
+}
+
+async function answerWithRag(q) {
+  const qVec = embedHashing(q);
+  let best = '';
+  let bestSim = 0;
+  for (const d of ragDocs) {
+    const sim = cosine(qVec, d.vec);
+    if (sim > bestSim) {
+      bestSim = sim;
+      best = d.line;
+    }
+  }
+  if (bestSim < 0.35) return { answer: null, confident: false };
+  // Same extraction precedence as the no-memory arm.
+  const migrated = best.match(/\bfrom\s+[\w\d .-]+\s+to\s+([\w\d .-]+)\b/);
+  if (migrated) return { answer: migrated[1].trim(), confident: true };
+  const is = best.match(/\b(?:is|are|written in|hosted by|retained for|stored in|backed by|deploys)\s+(?:the\s+)?([\w\d .-]+)\b/);
+  if (is) return { answer: is[1].trim(), confident: true };
+  return { answer: best, confident: bestSim >= 0.5 };
+}
+
+/* ------------------------------------------------------------------ */
+/* Runtime 3: HippoMemory                                               */
 /* ------------------------------------------------------------------ */
 
 async function answerWithHippo(mem, q) {
@@ -141,9 +180,12 @@ const dumpLines = [];
 for (const t of turns) {
   if (t.kind === 'noise') {
     dumpLines.push(t.line);
+    indexForRag(t.line);
     continue;
   }
-  dumpLines.push(`[user] ${t.line}`);
+  const line = `[user] ${t.line}`;
+  dumpLines.push(line);
+  indexForRag(line); // the RAG arm indexes the SAME transcript, nothing more
   await mem.remember({
     kind: 'semantic',
     summary: `${t.correction ? t.correction.q : t.fact.q} -> ${t.correction ? t.correction.a : t.fact.a}`,
@@ -175,6 +217,9 @@ const answers = facts.map((f) => {
 let noMemCorrect = 0;
 let noMemRefused = 0;
 let noMemWrong = 0;
+let ragCorrect = 0;
+let ragRefused = 0;
+let ragWrong = 0;
 let hippoCorrect = 0;
 let hippoRefused = 0;
 let hippoWrong = 0;
@@ -185,6 +230,11 @@ for (const { q, gold } of answers) {
   if (!raw.answer) noMemRefused++;
   else if (raw.answer === gold) noMemCorrect++;
   else noMemWrong++;
+
+  const rag = await answerWithRag(q);
+  if (!rag.answer) ragRefused++;
+  else if (rag.answer === gold) ragCorrect++;
+  else ragWrong++;
 
   const hip = await answerWithHippo(mem, q);
   if (!hip.answer) hippoRefused++;
@@ -213,6 +263,11 @@ console.log(`  correct      ${noMemCorrect}/${total}  ${pct(noMemCorrect)}`);
 console.log(`  wrong/confab ${noMemWrong}/${total}  ${pct(noMemWrong)}`);
 console.log(`  refused      ${noMemRefused}/${total}  ${pct(noMemRefused)}`);
 console.log('');
+console.log('naive RAG over the full transcript (control arm, same embedder):');
+console.log(`  correct      ${ragCorrect}/${total}  ${pct(ragCorrect)}`);
+console.log(`  wrong/confab ${ragWrong}/${total}  ${pct(ragWrong)}`);
+console.log(`  refused      ${ragRefused}/${total}  ${pct(ragRefused)}`);
+console.log('');
 console.log('HippoMemory-backed:');
 console.log(`  correct      ${hippoCorrect}/${total}  ${pct(hippoCorrect)}`);
 console.log(`  wrong/confab ${hippoWrong}/${total}  ${pct(hippoWrong)}`);
@@ -220,8 +275,10 @@ console.log(`  refused      ${hippoRefused}/${total}  ${pct(hippoRefused)}`);
 console.log('');
 console.log('anti-hallucination (correct or refused, never wrong):');
 console.log(`  plain context  ${pct(noMemCorrect + noMemRefused)}`);
+console.log(`  naive RAG      ${pct(ragCorrect + ragRefused)}`);
 console.log(`  hippo          ${pct(hippoCorrect + hippoRefused)}`);
 console.log('');
 console.log('hallucination rate (wrong asserted answers):');
 console.log(`  plain context  ${pct(noMemWrong)}`);
+console.log(`  naive RAG      ${pct(ragWrong)}`);
 console.log(`  hippo          ${pct(hippoWrong)}`);

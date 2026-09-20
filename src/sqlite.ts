@@ -76,6 +76,8 @@ export interface MemoryRow {
   demoted_to: string | null;
   /** ISO time of the demotion (nullable, audit only). */
   demoted_at: string | null;
+  /** 1 = the passing evidence was attested by a reproducible run, not self-reported (audit #5). */
+  verify_attested: number;
   vec: Uint8Array | null;
 }
 
@@ -125,6 +127,7 @@ CREATE TABLE IF NOT EXISTS memories (
   demoted INTEGER NOT NULL DEFAULT 0,
   demoted_to TEXT,
   demoted_at TEXT,
+  verify_attested INTEGER NOT NULL DEFAULT 0,
   vec BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind);
@@ -158,6 +161,7 @@ CREATE TABLE IF NOT EXISTS memory_history (
   retracts TEXT,
   guard_json TEXT,
   scope TEXT,
+  verify_attested INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (id, version)
 );
 `;
@@ -192,11 +196,13 @@ export class SqliteStore {
       if (!have.has(col)) this.db.exec(`ALTER TABLE memories ADD COLUMN ${col} TEXT;`);
     }
     if (!have.has('demoted')) this.db.exec('ALTER TABLE memories ADD COLUMN demoted INTEGER NOT NULL DEFAULT 0;');
+    if (!have.has('verify_attested')) this.db.exec('ALTER TABLE memories ADD COLUMN verify_attested INTEGER NOT NULL DEFAULT 0;');
     const hcols = this.db.prepare('PRAGMA table_info(memory_history)').all() as { name: string }[];
     const hhave = new Set(hcols.map((c) => c.name));
     for (const col of ['verify_json', 'verify_result', 'verified_at', 'retracts', 'guard_json', 'scope']) {
       if (!hhave.has(col)) this.db.exec(`ALTER TABLE memory_history ADD COLUMN ${col} TEXT;`);
     }
+    if (!hhave.has('verify_attested')) this.db.exec('ALTER TABLE memory_history ADD COLUMN verify_attested INTEGER NOT NULL DEFAULT 0;');
   }
 
   constructor(private readonly path: string, opts: { create?: boolean; busyTimeoutMs?: number } = {}) {
@@ -313,8 +319,8 @@ export class SqliteStore {
           source, confidence, importance, access_count, last_access_at,
           created_at, updated_at, superseded, superseded_by, verify_json,
           verify_result, verified_at, retracts, guard_json, scope, demoted,
-          demoted_to, demoted_at, vec
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+          demoted_to, demoted_at, verify_attested, vec
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
         row.id, row.version, row.kind, row.summary, row.detail,
@@ -324,6 +330,7 @@ export class SqliteStore {
         row.created_at, row.updated_at, row.superseded, row.superseded_by ?? null,
         row.verify_json, row.verify_result, row.verified_at, row.retracts,
         row.guard_json, row.scope, row.demoted, row.demoted_to ?? null, row.demoted_at ?? null,
+        row.verify_attested ?? 0,
         row.vec
       );
   }
@@ -339,7 +346,7 @@ export class SqliteStore {
           importance = ?, access_count = ?, last_access_at = ?, updated_at = ?,
           superseded = ?, superseded_by = ?, verify_json = ?, verify_result = ?,
           verified_at = ?, retracts = ?, guard_json = ?, scope = ?, demoted = ?,
-          demoted_to = ?, demoted_at = ?, vec = ?
+          demoted_to = ?, demoted_at = ?, verify_attested = ?, vec = ?
          WHERE id = ?`
       )
       .run(
@@ -350,7 +357,7 @@ export class SqliteStore {
         row.superseded, row.superseded_by ?? null, row.verify_json,
         row.verify_result, row.verified_at, row.retracts, row.guard_json,
         row.scope, row.demoted, row.demoted_to ?? null, row.demoted_at ?? null,
-        row.vec, row.id
+        row.verify_attested ?? 0, row.vec, row.id
       );
   }
 
@@ -366,8 +373,8 @@ export class SqliteStore {
           participants_json, rule, entities_json, tags_json, occurred_at,
           source, confidence, importance, access_count, last_access_at,
           created_at, updated_at, archived_at, verify_json, verify_result,
-          verified_at, retracts, guard_json, scope
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+          verified_at, retracts, guard_json, scope, verify_attested
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
         row.id, row.version, row.kind, row.summary, row.detail,
@@ -375,7 +382,8 @@ export class SqliteStore {
         row.entities_json, row.tags_json, row.occurred_at, row.source,
         row.confidence, row.importance, row.access_count, row.last_access_at,
         row.created_at, row.updated_at, archivedAt, row.verify_json,
-        row.verify_result, row.verified_at, row.retracts, row.guard_json, row.scope
+        row.verify_result, row.verified_at, row.retracts, row.guard_json, row.scope,
+        row.verify_attested ?? 0
       );
   }
 

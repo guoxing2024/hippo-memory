@@ -97,6 +97,18 @@ export interface MemoryPayload {
    * detection to catch (measured: ~0.60 similarity vs. the 0.86 bar).
    */
   supersedes?: string[];
+  /**
+   * Attested evidence (audit #5): set true only when the caller actually
+   * executed `verify.cmd` (or an equivalent reproducible check) in an
+   * environment the engine can reason about — CI run id, command exit code,
+   * artifact hash. When true AND verifyResult==='pass', the row earns the
+   * full VERIFIED standing (renders `[VERIFIED]`, shields against retirement
+   * by unverified writes). When false/omitted, a reported pass is honest but
+   * self-asserted: it renders `[VERIFIED self-reported]` and the retirement
+   * shield degrades to a visible warning — the engine never executes
+   * commands, so it must not let an unverifiable badge guard data.
+   */
+  verifyAttested?: boolean;
 }
 
 export interface StoredMemory {
@@ -138,6 +150,8 @@ export interface StoredMemory {
   demoted: boolean;
   /** Invariant row this trace was folded into. */
   demotedTo?: string;
+  /** See MemoryPayload.verifyAttested — attested vs self-reported evidence. */
+  verifyAttested?: boolean;
 }
 
 export interface RetrievalCue {
@@ -157,6 +171,14 @@ export interface RetrievalCue {
   minImportance?: number;
   /** Include compress-demoted rows (default false: invariant covers them). */
   includeDemoted?: boolean;
+  /**
+   * Hard premise filter (audit #7/#8, convergent namespace step): rows whose
+   * stored `scope` DISAGREES with this string on a shared key are excluded
+   * from the result entirely (counted in `scopeExcluded`). Rows that state
+   * no scope, or state compatible values, pass through — absence of a premise
+   * is not a contradiction. Opt-in; the default read path stays unchanged.
+   */
+  scope?: string;
 }
 
 export interface RetrievedMemory extends StoredMemory {
@@ -216,6 +238,12 @@ export interface RecallBundle {
   scanned: number;
   /** Rows passing structural filters (kind/entities/importance/time). */
   eligible: number;
+  /**
+   * Rows dropped by the cue's hard scope filter (`RetrievalCue.scope`) because
+   * their stated premise disagrees with the asked one. Present only when the
+   * filter was given; its count keeps "filtered out" distinct from "absent".
+   */
+  scopeExcluded?: number;
   /** Best cosine seen among eligible rows (null when none was comparable). */
   bestSimilarity: number | null;
   /** Similarity floor in force for this query. */
@@ -328,6 +356,19 @@ export interface StoreOptions {
    * (evidence rots; re-run the check and refresh verifiedAt).
    */
   evidenceTtlSec?: number;
+  /**
+   * Zero-recall protection (audit #7: the forget negative-feedback loop).
+   * Rows younger than this many seconds are NEVER forgotten or decayed,
+   * however weak their strength — a trace that was simply never cued yet is
+   * not a useless trace. Breaks the loop "weak embedder → recall miss →
+   * accessCount stays 0 → importance decays → forgotten".
+   */
+  forgetGraceSec?: number;
+  /**
+   * Milliseconds of access-count history the rehearsal boost looks at.
+   * (Reserved; the boost window is currently derived from lastAccessAt.)
+   */
+  rehearsalWindowMs?: number;
 }
 
 /** Embedding provider contract: anything that maps text to a float vector. */
@@ -335,6 +376,19 @@ export interface EmbeddingProvider {
   readonly dim: number;
   embed(texts: string[]): Promise<number[][]>;
 }
+
+/**
+ * LLM consolidation hook (audit #4): the default `consolidate()` promotes a
+ * qualifying episode by re-wrapping its summary as `FACT: …` — no real
+ * abstraction happens. Attach a summarizer (typically a call into the host
+ * agent's own model) to replace that template with a true generalization:
+ * given the qualifying episodes, return a list of distilled semantic rules.
+ * Returning an empty array skips the candidate; throwing falls back to the
+ * template path (consolidation must never fail the store).
+ */
+export type Summarizer = (
+  episodes: { summary: string; detail?: string; entities: string[] }[]
+) => Promise<string[]>;
 
 export const DEFAULT_OPTIONS: Required<StoreOptions> = {
   nearDuplicateThreshold: 0.92,
@@ -348,7 +402,9 @@ export const DEFAULT_OPTIONS: Required<StoreOptions> = {
   topK: 20,
   forgetAfterSec: 60 * 60 * 24 * 120, // 120 days
   maxVersionsPerId: 8,
-  evidenceTtlSec: 60 * 60 * 24 * 30 // 30 days: passing evidence older than this is stale
+  evidenceTtlSec: 60 * 60 * 24 * 30, // 30 days: passing evidence older than this is stale
+  forgetGraceSec: 60 * 60 * 24 * 14, // 14 days: young rows are never forgotten, however quiet
+  rehearsalWindowMs: 0
 };
 
 /** Small branded-ish helper used across modules. */

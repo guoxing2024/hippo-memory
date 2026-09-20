@@ -81,7 +81,7 @@ function fakeCtx() {
       if (typeof disposer === 'function') disposers.push(disposer);
     }
   };
-  apply(ctx, { enabled: true });
+  apply(ctx, { enabled: true, embedding: 'off' }); // keep the suite offline+deterministic; the 'auto' default is asserted separately
   tools = toolRegistry;
   return { watched, toolRegistry };
 }
@@ -134,6 +134,19 @@ test('settings schema exposes the full field set with defaults', () => {
   const base = storesBase?.base ?? {};
   assert.equal(base.enabled, true);
   assert.equal(base.contextLimit, 6);
+  // Audit #0: semantic recall is the composition default ('auto'); the suite
+  // pins 'off' per-store to stay offline, so assert the default on the base
+  // the plugin installs, not on the store settings.
+  assert.equal(base.embedding, 'off', 'the suite pinned off explicitly');
+  // The composition default: apply with an empty config and read the base the
+  // plugin installs (the schemastery-style schema has no .parse).
+  let capturedBase;
+  const stubSvc = { section: () => () => {}, context: () => () => {}, register: () => () => {} };
+  apply(
+    { tools: stubSvc, systemPrompt: stubSvc, settings: { register: (ns, schema, { base: b } = {}) => { capturedBase = b; return { get: () => b, watch: () => () => {} }; } }, logger: { warn: () => {}, info: () => {} }, effect: () => {} },
+    {}
+  );
+  assert.equal(capturedBase.embedding, 'auto', 'the composition default is auto (semantic, audit #0)');
 });
 
 /* ------------------------- remember / recall ------------------------- */
@@ -328,7 +341,9 @@ test('maintain history requires an id and returns version history', async () => 
 
 test('maintain status reports plugin + embedder state', async () => {
   const s = await toolExec('memory_maintain', { action: 'status' });
-  assert.equal(s.embeddingSetting, 'off', 'default embedding setting');
+  // The suite runs with embedding:'off' pinned (offline determinism); the
+  // composition default 'auto' is asserted in the schema test above.
+  assert.equal(s.embeddingSetting, 'off', 'suite-pinned embedder setting');
   assert.ok(['off', 'loading', 'ready', 'failed'].includes(s.embedderState));
   assert.ok(s.storeStats && typeof s.storeStats.active === 'number');
 });
@@ -440,7 +455,7 @@ test('shared store mode makes memories visible across agents', async () => {
   apply({ tools: svc, systemPrompt: svc, settings: settings2, logger: { warn: () => {}, info: () => {} }, effect: (fn) => {
     const disposer = fn();
     if (typeof disposer === 'function') effects.push(disposer);
-  } }, { sharedStore: true });
+  } }, { sharedStore: true, embedding: 'off' }); // 'off' keeps this suite offline (no 24MB model download)
   const execA = { agent: { id: 'shared-a' } };
   const execB = { agent: { id: 'shared-b' } };
   const run = (name, args, exec) => t2.get(name).execute(args, exec);

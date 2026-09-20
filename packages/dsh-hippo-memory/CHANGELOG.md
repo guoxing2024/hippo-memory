@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — 需要引擎支持 `scope`（版本号待定）
+## [0.3.0] — 2026-09-20（需要引擎 `hippo-memory-core@^0.3.0`）
 
 ### Added — 前提作用域透传到工具面
 
@@ -10,7 +10,13 @@
 - **`memory_maintain list` / `history` 透出 `scope`**（与其它文本同样过注入清洗），审查"这条是在什么口径下测的"不用回到对话里翻。
 - **注入的记忆纪律更新**：第 1 条要求"只在条件下成立的结论要带 `scope`"，第 3 条要求"带 scope 去 verify，`out_of_scope` 时不得把那个答案搬到当前前提下"。
 
-> `scope` / `out_of_scope` 依赖引擎带该字段的新版本。配旧引擎不会报错：`scope` 被忽略、`out_of_scope` 恒为 `false`，其余行为与本版之前一致。**发布时需把 `hippo-memory-core` 的依赖下限提到带 `scope` 的版本**（当前为 `^0.2.0`）。
+> `scope` / `out_of_scope` 依赖引擎带该字段的新版本。配旧引擎不会报错：`scope` 被忽略、`out_of_scope` 恒为 `false`，其余行为与本版之前一致。依赖下限已提到 `hippo-memory-core@^0.3.0`（即带 `scope` 与 fuzzy 归档修复的引擎）。
+
+### Fixed — 第九轮实测反馈：适配层两处透传缺口
+
+- **`memory_recall` 补 `scope` 参数并透传引擎**：此前工具 schema 没有 `scope` 入参，传给 `store.recall` 的 cue 也不含它——引擎从没收到，前提硬过滤在工具面**完全不生效**（`scopeExcluded` 恒为 `undefined`）。现在加 `scope` 入参、透传给 cue，返回补 `scopeExcluded`（前提冲突行被排除时计数，`warnings` 附 `scope:` 说明）。实测：带 `scope=env=prod` 查询不再把 `env=test` 的行当答案（`scopeExcluded=2`）。
+- **`memory_remember` 回显 `verify_result` / `verified_at`**：原样复述并带新证据（`verify_result:"pass"`）时，证据已正确落到存储行，但返回对象没透出这两个字段，调用方看不到复述是否带上了证据。现补齐（`cleanJson` 把 `undefined` 规范为 `null`，故键恒在、无证据时为 `null`）。
+- 均为适配层透传修复，`sourceMonitor` 的 fuzzy 归档误报订正在 `hippo-memory-core`（见根 CHANGELOG）。
 
 ### Added — ② 重复可以合并：`memory_maintain merge`
 

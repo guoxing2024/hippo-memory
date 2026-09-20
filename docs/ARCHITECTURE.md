@@ -1,7 +1,7 @@
 # HippoMemory 架构：受海马体启发的 Agent 长时记忆
 
 > 为什么线性上下文会让 Agent 的记忆混乱，以及本插件如何用人脑的分层方案根治它。
-> 版本：引擎 `hippo-memory-core` 0.2.0 / 适配层 `dsh-hippo-memory` 0.2.0（2026-09-18）
+> 版本：引擎 `hippo-memory-core` 0.3.0 / 适配层 `dsh-hippo-memory` 0.3.0（已发布到 npm）
 
 ---
 
@@ -141,7 +141,7 @@ boost = 0.01 + 0.03·log2(1 + 间隔天数)     （上限 0.12）
 
 ### 4.3 证据、撤回、前瞻
 
-- **证据**：`verify {cmd, expect, artifact}` + `verifyResult` + `verifiedAt`。引擎**从不执行命令**，只存档 + enforcement：数字主张句（箭头 / 系表）无 passing 证据 → 降级存 episode（`downgraded:` 注记）；渲染按 `evidenceTtlSec`（默认 30 天）区分 `[VERIFIED]` / `[ASSERTED]`；新鲜 VERIFIED 是**护盾**（只能被 passing 证据退休）。
+- **证据**：`verify {cmd, expect, artifact}` + `verifyResult` + `verifiedAt`。引擎**从不执行命令**，只存档 + enforcement：数字主张句（箭头 / 系表）无 passing 证据 → 降级存 episode（`downgraded:` 注记）；渲染按 `evidenceTtlSec`（默认 30 天）区分证据等级。**信任分级（二轮审计 #5）**：`verifyAttested: true`（调用方声明检查实际执行过）才有完整 `[VERIFIED]` 与退休护盾；默认的自报 pass 渲染 `[VERIFIED self-reported]`，护盾降级为显式警告——引擎不能让一个无法复核的徽章守护数据。
 - **撤回**：`retracts: <id>` + `tags: ["retraction"]`，撤回行永不被覆盖；命中被撤回 id 的行渲染 `[retracted: …]` 且排序置顶。
 - **前瞻守卫**：`guard {trigger, action}` + `tags: ["guard"]`；cue 命中触发词即注入 `[GUARD]`。
 
@@ -246,7 +246,7 @@ boost = 0.01 + 0.03·log2(1 + 间隔天数)     （上限 0.12）
 
 因此 `sourceMonitor` **不是**"更强的召回入口"：它只取单条最佳（外加邻域证据）、不做重要性加权、也不返回候选列表。它是断言前的是非裁决，不是检索器。
 
-### 5.3 这道门本身是否在起作用（未发布）
+### 5.3 这道门本身是否在起作用（0.3.0）
 
 读出问题有两个层次：库里有什么，以及**这个读通道是否正常**。`diagnostics()` 现在同时回答后者：
 
@@ -285,7 +285,7 @@ compress(计划式，人工把关)
     非代表成员 demoted=1（默认召回排除，includeDemoted 展开）
   undemote(ids) 可恢复；invariant 行带 tag:invariant 且 detail 具名全部成员 id。
 
-mergeDuplicates({ ids, into?, dryRun? })（未发布）
+mergeDuplicates({ ids, into?, dryRun? })（0.3.0）
   输入只吃**一个** duplicates 组的 id（≥2）。四条拒绝先于任何写入：
     id 少于 2 / 行不存在或已 superseded → 抛错
     行带 retraction / guard / invariant 标记 → 抛错（它们本身就是浓缩结果）
@@ -324,7 +324,7 @@ mergeDuplicates({ ids, into?, dryRun? })（未发布）
 2. **查无实据则明说**（UNSUBSTANTIATED → 显式拒答，而不是脑补）；
 3. **新旧冲突浮出水面**（recall 冲突警告 + verify 邻域证据 + 显式纠正边），而不是让模型二选一靠猜；
 4. **前提不核对就不套结论**（支持行属于别的前提 → `OUT_OF_SCOPE`；提问没带前提而支持行带 → `CONDITIONAL SCOPE` 注记），而不是把旧口径下的数字当成新口径的事实。
-5. **没过门槛的东西不借用过了门槛的身份**（未发布）：零命中时 digest 可以端出最接近的那一条，但它拿不到 `[VERIFIED]` / `[ASSERTED]`，行内自标 `sim 0.31 < floor 0.32 … not a memory`，`items[0].lowConfidence` 让程序侧也能判。旧行为里"库里没东西"与"最像的只打了 0.31"输出同一句话，而后者才是值得看的信号；同时 `coverage.turns / misses / guesses` 让这个取舍本身可读数（见 [5.3](#53-这道门本身是否在起作用未发布)）。**没有**用近况回填来填空（那会让通道看起来健康）。
+5. **没过门槛的东西不借用过了门槛的身份**（0.3.0）：零命中时 digest 可以端出最接近的那一条，但它拿不到 `[VERIFIED]` / `[ASSERTED]`，行内自标 `sim 0.31 < floor 0.32 … not a memory`，`items[0].lowConfidence` 让程序侧也能判。旧行为里"库里没东西"与"最像的只打了 0.31"输出同一句话，而后者才是值得看的信号；同时 `coverage.turns / misses / guesses` 让这个取舍本身可读数（见 [5.3](#53-这道门本身是否在起作用030)）。**没有**用近况回填来填空（那会让通道看起来健康）。
 
 神经科学上这也说得通：真正的记忆系统不会"记得一切"，海马负责快速编码与情境绑定，新皮层负责慢慢抽出规律，前额叶负责"我记得吗"的判别。把这三件事塞进一个线性上下文里，模型只能同时当编码器、存储器和判别器——而**判别器缺位**恰恰是幻觉率上升的直接原因。本插件的设计重点不是"记住更多"，而是给模型补上缺失的**判别回路**：`sourceMonitor` + 证据等级 + 邻域可见性 + 前提门。
 
@@ -395,12 +395,12 @@ const d = mem.diagnostics();
 ## 9. 已知局限与路线图
 
 - **嵌入质量**：默认的 feature-hash bag-of-words 是同义词弱的粗略相似度。生产环境应 `setEmbedder()` 接入真实嵌入模型（Transformers.js / 本地 ONNX），或开启插件的 `embedding: auto`；接口已预留，不影响其他逻辑。
-- **语义规则提取**：`consolidate()` 目前用规则模板抽象；真正的"事件 → 可泛化知识"应由 LLM 离线摘要完成（给 `HippoMemory` 一个 summarizer 回调即可，当前为朴素实现）。
+- **语义规则提取**：`consolidate()` 现在接受 `summarizer` 回调（构造参数或 `setSummarizer()`）做真正的 LLM 抽象，抛错/返回空回退到模板路径；默认无钩子时仍是 `FACT:` 模板（诚实标注为占位实现）。
 - **否定与反事实**：`sourceMonitor` 用否定词启发式判断矛盾（含中文否定词），对"并非所有 X 都是 Y"这类量词否定会误判——需要真实语义模型。
-- **scope 判定（前提作用域已落地；命名空间仍未做）**：行上的 `scope` 已把"在什么条件下成立"变成契约——写入前提门、`sourceMonitor` 的 `OUT_OF_SCOPE` 与 `[scope: …]` 渲染都走它（见 [4.4](#44-前提门换口径的重测不是同一句话)）。**尚未做**的是把它当项目 / 仓库 / 会话组的**命名空间**用：`recall` 不按 scope 硬过滤，库级隔离仍由 `sharedStore` + 每会话一个文件承担。另外它不认 key 改名与整段换语言的同一前提（`pop` vs `population`）。
+- **scope 判定（前提作用域已落地；读取硬过滤已落地；命名空间仍未做）**：行上的 `scope` 已把"在什么条件下成立"变成契约——写入前提门、`sourceMonitor` 的 `OUT_OF_SCOPE` 与 `[scope: …]` 渲染都走它（见 [4.4](#44-前提门换口径的重测不是同一句话)）。**读取侧**：`recall(cue, { scope })` 可硬过滤前提冲突的行（计数 `scopeExcluded` + 警告，未声明前提的行通过）——这是通往命名空间的收敛步，不是终点。**尚未做**的是把它当项目 / 仓库 / 会话组的**命名空间**用：库级隔离仍由 `sharedStore` + 每会话一个文件承担。另外它不认 key 改名与整段换语言的同一前提（`pop` vs `population`）。
 - **多 agent / 共享记忆**：`sharedStore: true` 下多个 agent 共用一个库（WAL + busy_timeout 已解决并发写），但**跨机器同步与冲突合并尚未实现**。
-- **库分裂：能诊断，不能打通（未发布）**：`sibling_stores` / `scope_rule` / `emptyWhileSiblingsFull` 让"记在隔壁文件"不再长得像"没记住"（见 [5.3](#53-这道门本身是否在起作用未发布)），但记忆**仍然不跨库文件流动**，也没有"把隔壁那个库并进来"的动作。这是刻意的：自动合并两个宿主维度（DSH 的 agent id × opencode 的项目目录）等于替用户决定作用域，而误并比空库难查得多。
-- **重复判定只认逐字重述（未发布）**：`duplicates()` 按归一化文本相等分组（剥 `FACT: `、忽略大小写与标点），所以换了说法的重述不会出现在报告里。`mergeDuplicates` 也因此**不引入新的相似度阈值**——它只接受"同一组里点名的 id"，把是否近似的判断留给调用方。宁可漏并，不可错并：错并会把两条不同断言变成一条。
+- **库分裂：能诊断，不能打通（0.3.0）**：`sibling_stores` / `scope_rule` / `emptyWhileSiblingsFull` 让"记在隔壁文件"不再长得像"没记住"（见 [5.3](#53-这道门本身是否在起作用030)），但记忆**仍然不跨库文件流动**，也没有"把隔壁那个库并进来"的动作。这是刻意的：自动合并两个宿主维度（DSH 的 agent id × opencode 的项目目录）等于替用户决定作用域，而误并比空库难查得多。
+- **重复判定只认逐字重述（0.3.0）**：`duplicates()` 按归一化文本相等分组（剥 `FACT: `、忽略大小写与标点），所以换了说法的重述不会出现在报告里。`mergeDuplicates` 也因此**不引入新的相似度阈值**——它只接受"同一组里点名的 id"，把是否近似的判断留给调用方。宁可漏并，不可错并：错并会把两条不同断言变成一条。
 - **折叠行的可见性在两家里不等**：被 merge / compress 折叠的行由 `list()` 一律列出（带 `demoted: true`），但**从召回侧展开**只有引擎 `recall(..., { includeDemoted: true })` 与 DSH 的 `include_demoted` 参数；opencode 的 `memory_recall` 目前没有这个参数，要找回折叠行只能用 `memory_maintain { action: "list" }` 读 id 再 `undemote`。
 - **情感 / 情绪标签**：人脑记忆强度受杏仁核调制；本插件用 `importance`（可显式声明）近似，暂未实现情绪维度。
 - **召回策略的取舍**：当前以"诚实性 > 召回率"为原则：宁可拒答（refuse）也不编造（confabulate）。③ 之后这条有了边界：门槛**本身没动**（`recall` 的 hits 仍然一个都不放），只是零命中的 digest 不再假装库里没有别的东西可看——端出来的那一行带 `low-confidence` 身份，因此"宁可拒答"约束的是**裁决**，不是**可见性**。

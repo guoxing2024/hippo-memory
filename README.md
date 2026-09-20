@@ -37,16 +37,17 @@
 
 ---
 
-## 🆕 未发布 —— 前提作用域 `scope` + 重复合并 + 兜底提示 + 库分裂可见（版本号待定）
+## 🆕 0.3.0（已发布到 npm）—— 前提作用域 `scope` + 重复合并 + 兜底提示 + 库分裂可见 + fuzzy 误报订正
 
-> 四条改动同源于外部实测反馈，主线是一件事：**把"看起来没有"和"其实不是那样"分开**。
+> 五组改动同源于外部实测反馈，主线是一件事：**把"看起来没有"和"其实不是那样"分开**。
 >
-> - **① 前提作用域 `scope`（P0-1b）**：同一句话在不同口径下真假相反时，一行扁平摘要会把两次结论折成一条，`verify` 于是拿旧口径的答案给新口径的问题盖章 `substantiated: true`。现在记忆可以声明自己成立的前提（`scope: "population=all records; comparator=instruction start"`）。判定**纯结构化、不新增相似度阈值**（`diagnostics().thresholds` 不变）：前提冲突的写入不覆盖、不合并，各存自己的痕迹（`different-scope:` 警告）；`sourceMonitor(claim, { scope })` 优先采用前提一致的支持，冲突时答 **`OUT_OF_SCOPE`**，前提没被核对时注记 `CONDITIONAL SCOPE`。digest / recall 都会打出 `[scope: …]`。旧库走 `ensureColumns()` 自动补列，无需迁移。
+> - **① 前提作用域 `scope`（P0-1b）**：同一句话在不同口径下真假相反时，一行扁平摘要会把两次结论折成一条，`verify` 于是拿旧口径的答案给新口径的问题盖章 `substantiated: true`。现在记忆可以声明自己成立的前提（`scope: "population=all records; comparator=instruction start"`）。判定**纯结构化、不新增相似度阈值**（`diagnostics().thresholds` 不变）：前提冲突的写入不覆盖、不合并，各存自己的痕迹（`different-scope:` 警告）；`sourceMonitor(claim, { scope })` 优先采用前提一致的支持，冲突时答 **`OUT_OF_SCOPE`**，前提没被核对时注记 `CONDITIONAL SCOPE`。digest / recall 都会打出 `[scope: …]`；`recall(cue, { scope })` 对前提冲突的行**硬过滤**并回 `scopeExcluded` 计数（两个适配层的 `memory_recall` 也已透传 `scope`）。旧库走 `ensureColumns()` 自动补列，无需迁移。
 > - **② 重复可以合并了（`mergeDuplicates` / `memory_maintain merge`）**：以前 `duplicates` 只能看一眼再手动 `delete`（连版本历史一起删）。现在预览 → 落地一步到位，多余行**折叠**进幸存行（还在库里、默认召回不出现、`undemote` 可恢复），实体 / 标签 / 更长的 detail / 更高 importance 先结转再退役。**两种前提下的同一句话不算重复**：`duplicates()` 每组现在带 `mixedPremises`，为真表示组里至少有一对前提互斥——`merge` 永远不折那些冲突行（它们带着冲突的 key 进 `blocked[]`）；若组内每条都与幸存行冲突，则一条都不折、`survivor` 返回 `null`。
 > - **③ 门槛没过也不再空白**：召回全部低于门槛时，过去只回一句"没有相关记忆"，与"库里根本没东西"同形。现在最接近的那条会以**第 1 行 + `[low-confidence sim 0.31 < floor 0.32 …]`** 给出，明确它不是记忆、断言前须复查，也不借用 `[VERIFIED]` / `[ASSERTED]`；相似度为 0 或空库仍然不给猜。零命中时不再回填 `[recent]` 装样子。`diagnostics().coverage` 记录本进程的 `turns / misses / guesses`。
 > - **④ `status` 看得见隔壁那个库**：DSH 按 agent id 分库、opencode 按项目目录分库，于是"没记住"与"记在另一个文件里"在输出上完全同形。`diagnostics()` 现在带 `sibling_stores`（同目录每个 `.db` 的行数 / demoted / 最后写入时间，并标出哪个是本次应答的库）与 `scope_rule`（契约写在引擎里一处）；两家 `status` 各加 `path_rule`，`health` 第一件事就是判"本库空、隔壁满"。
+> - **⑤ fuzzy 归档误报订正 + 适配层透传补齐**：`sourceMonitor` 的模糊归档匹配此前只按余弦收录，一个自身值翻转过、又与 claim 有词面重叠的**无关主体**会被塞进 `superseded_matches` 并误置 `contested` / `stale_support`；现要求该归档行**与支持行共享实体**（除非它本身就是支持行）才纳入，exact 复述层不受影响。适配层同时补齐两处：`memory_recall` 透传 `scope` 并回 `scopeExcluded`、`memory_remember` 回显 `verify_result` / `verified_at`。
 >
-> **引擎 + 两个适配层 + 文档已就绪（194 项测试全绿：引擎 142 + DSH 35 + opencode 17），尚未提交、未发布**；版本号待定（加性 schema 变更）。详见 [CHANGELOG](CHANGELOG.md) 与各专题节：[前提作用域](#前提作用域-scope换个条件就不是同一句话)、[重复怎么清](#重复从哪来怎么清)、[空结果给得出理由](#空结果一定给得出理由)、[并发写与可观测性](#并发写与可观测性)。
+> **引擎 + 两个适配层 + 文档已就绪（215 项测试全绿：引擎 163 + DSH 35 + opencode 17）；0.3.0 已发布到 npm**（加性 schema 变更）。详见 [CHANGELOG](CHANGELOG.md) 与各专题节：[前提作用域](#前提作用域-scope换个条件就不是同一句话)、[重复怎么清](#重复从哪来怎么清)、[空结果给得出理由](#空结果一定给得出理由)、[并发写与可观测性](#并发写与可观测性)。
 
 ## 🆕 0.2.1 —— 引擎支持 Bun（可在 opencode 里直接用）
 
@@ -54,7 +55,7 @@
 > **实测**：在 opencode 1.18.31（内嵌 Bun 1.3.14）里 `import("hippo-memory-core")` → `driver=bun:sqlite`，remember / recall / verify / digest / diagnostics 全部正常，**无需打包、无需垫片**。
 > Node 侧行为与数据格式不变，测试全绿。详见 [CHANGELOG](CHANGELOG.md)。
 >
-> **配套 opencode 插件已发布**：[`opencode-hippo-memory`](packages/opencode-hippo-memory/README.md)（当前 0.2.2）——
+> **配套 opencode 插件已发布**：[`opencode-hippo-memory`](packages/opencode-hippo-memory/README.md)（已发布 0.2.2；0.3.0 待发布）——
 > `opencode plugin -g opencode-hippo-memory` 一条命令装上，即得 4 个记忆工具 + 每轮 digest 注入 + 压缩保留 + 使用纪律。
 > ⚠️ 装完**重启 opencode**，并且**用副作用验证**（跑一轮后看 store 目录有没有生成 `.db`），不要只看 `opencode debug info`：
 > 该命令只是配置回显，opencode 加载失败时日志里可以一个字都没有。详见该包 README 的"一个很容易踩的坑"。
@@ -378,7 +379,7 @@ npm run bench
 
 配套字段：`eligible`（通过结构筛选的条数）、`bestSimilarity`（这批里最高的原始余弦）、`threshold`（本次生效门槛）、`nearMisses`（最接近的几条，含分值与摘要）。
 
-**digest 也不再空白**（未发布）：`composeContext` 在命中为空且原因是 `below-threshold` 时，把最接近的那条作为**第 1 行**给出，标明身份——
+**digest 也不再空白**（0.3.0）：`composeContext` 在命中为空且原因是 `below-threshold` 时，把最接近的那条作为**第 1 行**给出，标明身份——
 
 ```
 1. [semantic] [source: user] [low-confidence sim 0.31 < floor 0.32: the closest trace, not a memory — verify before asserting] v1 billing service database -> postgres
@@ -456,14 +457,14 @@ await mem.remember({ kind: 'semantic', summary: 'P(X==disp) ≈ 独立性基线'
 - **写入端**：与更接近的存量行前提冲突时不覆盖、不合并，`outcome: 'new'` + `different-scope:` 警告点名被顶住的行与冲突 key（**同一句话换个条件不是复述**）；前提一致则照常走强化 / 版本化覆盖；重述时若存量行缺前提而新写带了，就把前提**补到原行**上，不额外起一行。`scope` 进嵌入文本，因此同时影响召回排序。
 - **读取端** `sourceMonitor(claim, { scope })`：过门槛的候选里**优先选前提一致的那条**当支持（字面更接近的外前提行让位）；前提冲突 → `out_of_scope: true` 且 `substantiated`/`contradicted` 双假、四组证据清空，note 以 `OUT_OF_SCOPE` 开头；调用方没给 scope 而支持行带前提 → 结论照给，note 追加 `CONDITIONAL SCOPE` 说明该前提**没被核对**。
 - **透出**：`recall` 命中与 `StoredMemory` 带 `scope`，`composeContext` 渲染 `[scope: …]`（同样过注入清洗），`update()` 换前提时旧前提进 `history`。
-- **不是**什么：不是权限 / 隔离边界（那是 `sharedStore` 与库文件），不是 `recall` 的硬过滤，也不识别换 key 名或整段换语言的同一前提（`pop` vs `population`）——要判为同一前提得复用 key。
+- **不是**什么：不是权限 / 隔离边界（那是 `sharedStore` 与库文件），也不识别换 key 名或整段换语言的同一前提（`pop` vs `population`）——要判为同一前提得复用 key。（`recall(cue, { scope })` 现在**会**按前提硬过滤冲突行并回 `scopeExcluded`；不传 `scope` 的读取路径行为不变。）
 
 旧库零成本：`scope` 走 `ensureColumns()` 的 `ALTER TABLE` 补列，存量行读作"未声明前提"。
 
 ### 证据、撤回、前瞻、纠正：让上下文分清知道与以为知道
 
 - **可复算的出处**：写 semantic 时带 `verify_cmd`（怎么重跑）/ `verify_expect`（期望输出）/ `verify_artifact`（读件），自己跑完回填 `verify_result: pass|fail`。引擎**不执行命令**，只存档并把关：数字**主张句**（箭头 / 系表如 `X -> 1.5`、`cache is 512 MB`）无 passing 证据 → 降级存 episode；散文里顺带提到数字（版本号、计数）不动。注入时 `[VERIFIED]`（跑通过**且在保鲜期内**）对 `[ASSERTED]`。`pass` 不带时间戳视为刚跑过（自动盖章）；`evidenceTtlSec`（默认 30 天）过期 → 回 `[ASSERTED]` + `verify` 注记过期，无证据挑战可正常退休它——重跑刷新 `verifiedAt` 即续命。
-- **证据门**：新鲜 VERIFIED 的行只能被 passing 证据退休；无证据挑战只能并存 + `shielded:` 警告。查旧值用 `verify`：精确命中归档版（sim 1）或同主体换值的模糊命中（复测余弦）都会进 `superseded_matches` + 注记。
+- **证据门**：新鲜 VERIFIED 的行只能被 passing 证据退休；无证据挑战只能并存 + `shielded:` 警告。查旧值用 `verify`：精确命中归档版（sim 1）或同主体换值的模糊命中（复测余弦）都会进 `superseded_matches` + 注记。**模糊命中带主体相关性闸门**：该归档行必须与支持行共享实体（除非它本身就是支持行）才纳入——否则一个只是词面相近、自身值翻转过的无关主体会被误收，连带把 `contested` / `stale_support` 误置为真（精确复述层 sim 1 不设闸，字面全等即决定性证据）。
 - **path-3 双口径门**：覆盖除内容余弦外还要主张余弦（summary-to-summary）过线（`claimThreshold` 默认 0.75）——长 detail 主导 content 向量时不再误杀；警告印双值（`content-sim X + claim-sim Y`），content 过而主张不过 → `new` + `withheld-contradiction:` 警告。
 - **撤回**：`tags: ["retraction"]` + `retracts: <id>`，正文写清撤回判据。撤回行永不被覆盖；命中被撤回 id 的行强制带 `[retracted: …]` 且排序置顶。恢复 = 再写一条（注明恢复判据）。
 - **前瞻守卫**：`tags: ["guard"]` + `guard_trigger`（未来情形）/ `guard_action`（到时做什么）。cue 撞上触发词即注入 `[GUARD]` 行——注册一次，不再重犯。
@@ -502,7 +503,7 @@ Agent 会读网页，网页里可能有 ignore all previous instructions 这类�
 
 - **共享库并发写**：SQLite 连接统一加 `PRAGMA busy_timeout = 5000`（可经 `busyTimeoutMs` 配置），`sharedStore: true` 下多个 agent 同时写不再直接抛 `SQLITE_BUSY`。
 - **深度诊断**：`diagnostics()` 暴露 store_path / embedder kind+dim / 存量向量维度直方图 / `dimMismatch` / 全部阈值 / access 统计 / `suspicious` 汇总 / `coverage`；适配器 `memory_maintain status` 给出一句话 `health`。它专门捕捉那个计数看起来全对、召回永远为空的静默杀手。
-- **隔壁那个库（未发布）**：记忆**不跨库文件流动**——DSH 一个 agent id 一个 `.db`，opencode 一个项目目录一个 `.db`。这让"没记住"和"记在另一个文件里"在工具输出里完全同形，而只有一种是记忆问题。`diagnostics().sibling_stores` 把同目录每个 `.db` 都数一遍（`rows` 同 `stats().active` 口径、`demoted` 单列、`lastWrite`、`current` 标出应答方），打不开的文件进 `unreadable[]` 而不是让整份报告消失；`suspicious.emptyWhileSiblingsFull` 是本库空、隔壁满；`scope_rule` 把这条契约写在引擎一处，两家 `status` 各自只补一句本宿主的命名规则（`path_rule`）。`:memory:` 库不扫目录。
+- **隔壁那个库（0.3.0）**：记忆**不跨库文件流动**——DSH 一个 agent id 一个 `.db`，opencode 一个项目目录一个 `.db`。这让"没记住"和"记在另一个文件里"在工具输出里完全同形，而只有一种是记忆问题。`diagnostics().sibling_stores` 把同目录每个 `.db` 都数一遍（`rows` 同 `stats().active` 口径、`demoted` 单列、`lastWrite`、`current` 标出应答方），打不开的文件进 `unreadable[]` 而不是让整份报告消失；`suspicious.emptyWhileSiblingsFull` 是本库空、隔壁满；`scope_rule` 把这条契约写在引擎一处，两家 `status` 各自只补一句本宿主的命名规则（`path_rule`）。`:memory:` 库不扫目录。
 
 ```ts
 mem.diagnostics().sibling_stores;
@@ -543,9 +544,10 @@ mem.diagnostics().sibling_stores;
   - ⏳ **opencode 工具结果的清洗覆盖**：`list` / `history` / `recall` 命中仍出原文（digest 与本次新增的 duplicates / merge 已清洗），补齐后两家出口口径才真的一致；
   - ⏳ GUI 记忆浏览器：设置卡片里的记忆清单 / 检索 / 删除；
   - ⏳ store 的 JSON 导出导入（备份与迁移）。
-- **v0.3（规划中）**
+- **v0.3（已落地并发布到 npm）**
   - ✅ **`scope` 字段（前提作用域）已落地**：为记忆声明"在什么条件下成立"（`population=` / `comparator=` / `release=`…），冲突检测不再把换口径的重测折成一条，`verify` 会答 `OUT_OF_SCOPE`；
-  - ⏳ `scope` 的**命名空间**用法（项目 / 仓库 / 会话组）与 `recall` 侧的硬过滤：当前 `scope` 表达的是"前提"，只用于写入判定、verify 与排序，不承担库级隔离（那是 `sharedStore`）；
+  - ✅ **`recall` 侧硬过滤已落地**：`recall(cue, { scope })` 把前提冲突的行排除出结果并回 `scopeExcluded`，两个适配层的 `memory_recall` 也已透传 `scope`；
+  - ⏳ `scope` 的**命名空间**用法（项目 / 仓库 / 会话组）仍待办：当前 `scope` 表达的是"前提"，用于写入判定、verify、排序与 recall 过滤，不承担库级隔离（那是 `sharedStore`）；
   - LLM 辅助 `consolidate()`：当前摘要是启发式模板；接入模型后由 LLM 归纳稳定模式（保留启发式降级路径）；
   - 跨会话项目记忆命名空间；episodic 时间衰减（偏好近期但不删旧版）。
 

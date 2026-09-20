@@ -1,7 +1,7 @@
 # 🧠 HippoMemory 使用说明（完整版）
 
-> 适用插件：**dsh-hippo-memory 0.2.1** ｜ 核心引擎：**hippo-memory-core 0.2.1** ｜ opencode 用户见 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md)（0.2.2） ｜ 更新：2026-09-19
-> 本文同时覆盖**本批未发布**的四项改动（前提作用域 `scope`、重复合并 `merge`、门槛未过的兜底提示、库分裂可见），在各处标有"未发布"。**当前已发布的 0.2.x 装上没有这些接口**，读到标了"未发布"的小节时请对照 [CHANGELOG](../CHANGELOG.md)。
+> 适用插件：**dsh-hippo-memory 0.3.0** ｜ 核心引擎：**hippo-memory-core 0.3.0** ｜ opencode 用户见 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md)（0.3.0） ｜ 更新：2026-09-20
+> 本文覆盖 **0.3.0** 的五组改动（前提作用域 `scope` + recall 硬过滤、重复合并 `merge`、门槛未过的兜底提示、库分裂可见、fuzzy 归档误报订正 + 适配层透传补齐），相关小节标有"0.3.0"。**0.3.0 已发布到 npm**；此前 npm 上的 0.2.x 装上没有这些接口，读到标了"0.3.0"的小节时请对照 [CHANGELOG](../CHANGELOG.md)。
 > 本文写给使用的人：不写代码也能照做。想了解设计原理请看 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 目录
@@ -201,7 +201,7 @@ hippo-memory:
 
 ### 4.2 记忆纪律（系统提示段落）
 
-插件注入一段使用手册，教 agent 按 **WRITE → RECALL → VERIFY → MAINTAIN** 的顺序使用记忆，并明确要求：查无实据就回答记忆里没有，**不许编**。本批（未发布）里 MAINTAIN 一条点名了 `duplicates` → `merge` 的整理路径（含"混合前提的一组不算重复"），digest 段落则说明 `[low-confidence …]` 那行是猜测、不许当成存过的事实复述。
+插件注入一段使用手册，教 agent 按 **WRITE → RECALL → VERIFY → MAINTAIN** 的顺序使用记忆，并明确要求：查无实据就回答记忆里没有，**不许编**。本批（0.3.0）里 MAINTAIN 一条点名了 `duplicates` → `merge` 的整理路径（含"混合前提的一组不算重复"），digest 段落则说明 `[low-confidence …]` 那行是猜测、不许当成存过的事实复述。
 
 ### 4.3 每轮自动摘要（`[hippo-memory digest]`）
 
@@ -226,7 +226,7 @@ hippo-memory:
 3. 带前提的结论会打出 `[scope: …]`，让 agent 看得到这条只在什么条件下成立（见 [9.10](#910-前提作用域-scope同一句话换个条件就不成立)）；
 4. 末尾那句自检提示帮助 agent 少犯"该记不记"。
 
-**一条都没过门槛时（未发布）**：digest 不再一句"没有相关记忆"就完事，而是把**最接近的那条**作为第 1 行端出来，并当场标明它的身份——
+**一条都没过门槛时（0.3.0）**：digest 不再一句"没有相关记忆"就完事，而是把**最接近的那条**作为第 1 行端出来，并当场标明它的身份——
 
 ```
 (no memory above threshold for this task; 12 stored — the closest trace is shown below, as a guess)
@@ -252,7 +252,7 @@ hippo-memory:
 | **WRITE 写** | 学到持久结论、做完决策 → 立刻 `memory_remember` | 这轮结束时结论随上下文一起消失 |
 | **RECALL 查** | 被问到旧事实、旧决策 → 先 `memory_recall` | 凭印象答 → 记混、记旧 |
 | **VERIFY 验** | 断言记忆里的东西之前 → `memory_verify` | 记忆没把握却说得像真的 → 幻觉 |
-| **MAINTAIN 理** | 长会话里定期 `status` / `duplicates`（确认后 `merge` 折叠，未发布）/ `consolidate` / `forget` | 库越堆越乱、重复条目互相干扰 |
+| **MAINTAIN 理** | 长会话里定期 `status` / `duplicates`（确认后 `merge` 折叠，0.3.0）/ `consolidate` / `forget` | 库越堆越乱、重复条目互相干扰 |
 
 写记忆时的三条额外建议：
 
@@ -338,7 +338,7 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 | `retracts` | 本写入撤回的 id（配合 `tags: ["retraction"]`） |
 | `guard_trigger` + `guard_action` | 前瞻守卫（配合 `tags: ["guard"]`）：未来情形 → 到时做什么 |
 
-**返回**：`outcome`（`new` / `none` / `override` / `merge` / `supersede`）、`id`、`version`、`scope`（写进去的前提，没带就是 `null`）、`superseded`（被替换的旧版信息）、`neighbours[]`（最接近的 3 条 + 相似度 + `suspectedConflict`）、`warning`、`scope_only_matches`。
+**返回**：`outcome`（`new` / `none` / `override` / `merge` / `supersede`）、`id`、`version`、`scope`（写进去的前提，没带就是 `null`）、`verify_result` / `verified_at`（复述时带上新证据会回显；没带证据为 `null`）、`superseded`（被替换的旧版信息）、`neighbours[]`（最接近的 3 条 + 相似度 + `suspectedConflict`）、`warning`、`scope_only_matches`。
 
 用自然语言即可，不必自己写参数：
 
@@ -358,6 +358,7 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 | `kind` | 只看 `episode` / `semantic` / `procedure` |
 | `limit` | 条数（默认 8，上限 20） |
 | `include_demoted` | 展开被压缩折叠的细目（默认只给不变量） |
+| `scope`（0.3.0） | 你这次问的是哪个前提下的事（`key=value; …`）。传了就按前提**硬过滤**：属于别的前提的行整条排除出结果，不会被当成答案；返回里 `scopeExcluded` 计数被排除了几条，并附一条 `scope:` 警告。不传则读取路径与以前一致 |
 
 三个分数怎么读见 [9.1](#91-三个分数别混着看)。每个命中带 `scope`（该条自己的前提，没带为 `null`）——同一主题在不同前提下各有一行时，靠这个字段分辨说的是哪一个。
 
@@ -392,7 +393,7 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 | `delete` | **永久删除**某条（含版本历史） | ⚠️ 不可恢复 |
 | `prune` | 清理空库文件（历史版本遗留的 0 行文件） | 只删空文件 |
 | `duplicates` | 近似重复报告（跨 kind，自动忽略 `FACT: ` 前缀）。每组带每行的 `scope` 和一个组级标记 `mixedPremises` | 只读 |
-| `merge`（未发布） | 对**一组** `duplicates` 报告动手：`ids:[该组 id]`，默认**预览**谁留下、谁被折、带哪些 `carried`；`dry_run:false` 才落地。可选 `into` 点名要保留的 id | 折叠而非删除：仍在库里、默认召回不出现、`undemote` 可恢复 |
+| `merge`（0.3.0） | 对**一组** `duplicates` 报告动手：`ids:[该组 id]`，默认**预览**谁留下、谁被折、带哪些 `carried`；`dry_run:false` 才落地。可选 `into` 点名要保留的 id | 折叠而非删除：仍在库里、默认召回不出现、`undemote` 可恢复 |
 | `override-audit` | 覆盖事故审计：筛出被覆盖的两条内容几乎无关的可疑记录 | 只读 |
 | `status` | 嵌入器状态 + 深度诊断（含 `sibling_stores` / `coverage` / `scope_rule`）+ 本宿主的 `path_rule` + 一句话 `health` | 只读 |
 
@@ -428,10 +429,10 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 | `[recent]` | 最近写入的尾巴（**有命中时**才作为补充带出；零命中不再充数，见 [9.2](#92-空结果一定给得出理由)） |
 | `[retracted: …]` | 这条被某条撤回针对 |
 | `[scope: …]` | 这条只在写出的前提下成立（digest 与召回都透出） |
-| `[low-confidence sim … < floor …]` | digest 的第 1 行可能是**最接近的痕迹、不是记忆**（未发布）：它没过召回门槛，不配 `[VERIFIED]` / `[ASSERTED]`，断言前必须 verify |
-| `mixedPremises` | `duplicates` 的组级标记（未发布）：组内各行写在互斥前提下，**不算重复** |
-| `carried` / `blocked` | `merge` 预览里（未发布）：结转到幸存行的信息 / 因前提冲突而没被折进去的行 |
-| `sibling_stores` / `path_rule` | `status`（未发布）：同目录还有哪些 `.db` 各装了多少 / 本宿主按什么规则分库 |
+| `[low-confidence sim … < floor …]` | digest 的第 1 行可能是**最接近的痕迹、不是记忆**（0.3.0）：它没过召回门槛，不配 `[VERIFIED]` / `[ASSERTED]`，断言前必须 verify |
+| `mixedPremises` | `duplicates` 的组级标记（0.3.0）：组内各行写在互斥前提下，**不算重复** |
+| `carried` / `blocked` | `merge` 预览里（0.3.0）：结转到幸存行的信息 / 因前提冲突而没被折进去的行 |
+| `sibling_stores` / `path_rule` | `status`（0.3.0）：同目录还有哪些 `.db` 各装了多少 / 本宿主按什么规则分库 |
 | `[sanitized-*]` | 渲染时清洗了可疑的指令类文本（存储原文不动） |
 | `[demoted]` | 已被折叠（`compress` 或 `merge`）：默认不出现在召回里，`undemote` 恢复 |
 
@@ -473,10 +474,10 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 > 记住：命中率 -> 1.35%，scope 是 population=前 4096 行; comparator=指令起始。
 > 后来在全量、以解码完成为基准又测出一个数：**再写一条**，scope 换成 `population=全部记录; comparator=解码完成`——两条会各自成立并存，`memory_verify` 带着对应 scope 问就各自给出自己的答案；不带 scope 问，它会说明这次核对**没有覆盖那个前提**，而不是把上一个数字直接判定为真。
 
-**⑫ "明明记过却查不到"排查（未发布）**
+**⑫ "明明记过却查不到"排查（0.3.0）**
 > 先别问"你忘了吗"，先跑 `memory_maintain { action: "status" }`，把 `health`、`path_rule`、`diagnostics.sibling_stores` 三样报给我。如果 health 说本库是空的而同目录另一个 `.db` 有货，那是**记在另一个文件里**（DSH 按 agent id 分库 / opencode 按项目目录分库），不是记忆没工作：告诉我那个文件叫什么、里面那条在不在，别把它当"没记住"重述一遍。
 
-**⑬ digest 里那行 `[low-confidence …]`（未发布）**
+**⑬ digest 里那行 `[low-confidence …]`（0.3.0）**
 > 这行是**门槛以下的猜测**，不是记忆。不要直接引用它的内容；先 `memory_verify` 复核，或者告诉我"库里只有一条不像的，我去查工具"。也不要因为出现了这行就认为记忆系统记住了这件事。
 
 ---
@@ -506,7 +507,7 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 
 配套字段：`eligible`（通过筛选的条数）、`bestSimilarity`、`threshold`、`nearMisses`（最接近的几条含分值摘要）。
 
-**`memory_recall` 早就给理由，digest 现在也给（未发布）**。以前自动注入那块只会说"这条线索没命中相关记忆"，与"这个库是空的"在形状上完全一样，而两者的处置办法相反（前者是问法/门槛问题，后者可能是**记在别的库里**，见 [9.12](#912-库分裂没记住-vs-记在另一个文件里未发布)）。现在：
+**`memory_recall` 早就给理由，digest 现在也给（0.3.0）**。以前自动注入那块只会说"这条线索没命中相关记忆"，与"这个库是空的"在形状上完全一样，而两者的处置办法相反（前者是问法/门槛问题，后者可能是**记在别的库里**，见 [9.12](#912-库分裂没记住-vs-记在另一个文件里030)）。现在：
 
 - 端出来的那一行**当场标明身份**：`[low-confidence sim 0.31 < floor 0.32: the closest trace, not a memory — verify before asserting]`。它不带原行的 `[VERIFIED]` / `[ASSERTED]`（没过门槛就没有资格声称证据等级），程序侧用 `items[0].lowConfidence === true` 判断；
 - 词面毫无重叠（相似度 0）、库里 0 条、或调用方关了 `lowConfidenceTop1` 时**仍然不给猜**——宁缺毋滥，猜出来的东西被复述一遍就是幻觉加固；
@@ -571,7 +572,7 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 3. 引擎负责校验（成员是否存在、是否活着、代表是否是子集），**不替你想正文**；
 4. 非代表的成员标 `demoted`：活着、可检索、默认不出现；`include_demoted:true` 展开，`undemote` 恢复，`forget` 永不删折叠行。
 
-`merge`（[9.11](#911-重复合并-merge折叠而不是删除未发布)）用的是**同一套折叠机制**，区别只在谁起草正文：`compress` 的不变量由你写，`merge` 什么都不改写，只是把一组重述收成一条现行结论。
+`merge`（[9.11](#911-重复合并-merge折叠而不是删除030)）用的是**同一套折叠机制**，区别只在谁起草正文：`compress` 的不变量由你写，`merge` 什么都不改写，只是把一组重述收成一条现行结论。
 
 ### 9.9 投毒防护
 
@@ -634,9 +635,9 @@ value 兼容性是**词集合**比较：去掉英文停用词后，latin / 数�
 | `scope_only_matches` | 写入时的**主体键闸门**（撞了 `<主体> ->` 却没撞实体，因而没被覆盖的行）——名字里有 scope，与本节无关 |
 | 共享存储 `sharedStore` | 记忆放在**哪个库文件**里（会话库 / 全局库） |
 
-**边界**：`scope` 不是权限或隔离边界，也不是加密；`recall` 目前不按 scope 硬过滤（只影响排序，硬隔离用在 verify 上）；换 key 名（`pop` vs `population`）或整段换语言（`全部记录` vs `all records`）会被当成"只有一方写了这个 key"，即**不冲突**；value 改写掉一半以上的字会被判成新前提。想让它认成同一个前提：**key 复用、value 里保留共同的词**。
+**边界**：`scope` 不是权限或隔离边界，也不是加密；`recall(cue, { scope })` 从 0.3.0 起**会**按 scope 硬过滤（前提冲突的行整条排除、回 `scopeExcluded`），不传 scope 的读取路径仍只影响排序；换 key 名（`pop` vs `population`）或整段换语言（`全部记录` vs `all records`）会被当成"只有一方写了这个 key"，即**不冲突**；value 改写掉一半以上的字会被判成新前提。想让它认成同一个前提：**key 复用、value 里保留共同的词**。
 
-### 9.11 重复合并 merge：折叠而不是删除（未发布）
+### 9.11 重复合并 merge：折叠而不是删除（0.3.0）
 
 **重复从哪来**：主要来源是**整合本身**——`consolidate()` 把 episode 抽象成规则时，规则正文可能与原事件逐字相同、只多一个 `FACT: ` 前缀，于是两条并存（该前缀在跨类型比对时已被统一剥离，所以只会报历史遗留的）。同主体反复写入、以及"换口径重测"故意留下的两条，也都长得像重复，但**只有第一种是该合的**。
 
@@ -675,7 +676,7 @@ memory_maintain { action: "merge", ids: ["4960eafe", "480afcbd"] }
 
 > **别和写入端的 `outcome: 'merge'` 搞混**：那个是**写入时**引擎自动判的"episode 逐字复述了一条 semantic 规则"（见 [9.3](#93-写入的五种结局)），不需要你参与；本节的 `merge` 是**整理时**你对着 `duplicates` 报告点名一组，只有 `dry_run: false` 之后才动手。
 
-### 9.12 库分裂：没记住 vs 记在另一个文件里（未发布）
+### 9.12 库分裂：没记住 vs 记在另一个文件里（0.3.0）
 
 记忆**不跨库文件流动**。DSH 一个 agent id 一个 `.db`，opencode 一个项目目录一个 `.db`（开了 `sharedStore` 才各自归拢成 `shared.db`）。于是这两种情况在工具输出里**完全同形**：
 
@@ -717,7 +718,7 @@ Windows 上 `~` 是 `C:\Users\<你>`。opencode 侧没有 GUI 卡片，设置写
 - **清空某个会话**：退出 dsh 后删对应的 `.db`（连同 `.db-wal` / `.db-shm`）；
 - **迁移到别的机器**：带上目录即可，纯本地文件、无外部依赖；
 - **格式**：SQLite（WAL 模式）。想自己查可以直接用 `sqlite3` 打开，表结构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
-- **一个目录里好几个 `.db` 是正常的**：记忆不跨库文件流动，所以"这条线索没命中"和"记在隔壁文件里"以前长得一样。现在 `memory_maintain` → `status` 会把同目录的库都数一遍（未发布），见 [9.12](#912-库分裂没记住-vs-记在另一个文件里未发布)。
+- **一个目录里好几个 `.db` 是正常的**：记忆不跨库文件流动，所以"这条线索没命中"和"记在隔壁文件里"以前长得一样。现在 `memory_maintain` → `status` 会把同目录的库都数一遍（0.3.0），见 [9.12](#912-库分裂没记住-vs-记在另一个文件里030)。
 
 ---
 
@@ -730,7 +731,7 @@ Windows 上 `~` 是 `C:\Users\<你>`。opencode 侧没有 GUI 卡片，设置写
 按顺序排查：安装命令有没有报错 → profile 名字对不对（`dsh plugin --profile web list`）→ 有没有**完整退出** dsh 再启动（刷新页面不算）。
 
 **Q3 会多花很多 token 吗？**
-不会。工具调用只有 agent 主动触发才产生成本；自动摘要**命中才注入**（每条约 20–40 token），一条都不命中通常就是 0。唯一的例外是本批（未发布）的兜底：全部低于门槛时可能多出一行 `[low-confidence …]` 猜测，代价一行换一次"别答成没有"。条数上限可调。
+不会。工具调用只有 agent 主动触发才产生成本；自动摘要**命中才注入**（每条约 20–40 token），一条都不命中通常就是 0。唯一的例外是本批（0.3.0）的兜底：全部低于门槛时可能多出一行 `[low-confidence …]` 猜测，代价一行换一次"别答成没有"。条数上限可调。
 
 **Q4 agent 不怎么用记忆工具？**
 工具调用是模型自主决定的。把 6.1 的引导语发给它，或在会话预设 / 系统提示里固化纪律，效果很明显。
@@ -748,7 +749,7 @@ Windows 上 `~` 是 `C:\Users\<你>`。opencode 侧没有 GUI 卡片，设置写
 检查是否开了共享存储，以及两条记忆是否属于不同版本的同一主体（看 `version`）。跨会话冲突可以用 `memory_verify` 看 `newer_related`。
 
 **Q9 记忆里出现重复条目？**
-跑 `memory_maintain` → `duplicates`（只读报告）。重复主要来自整合时段产生的 `FACT: ` 规则副本，写入路径已修，不会再生新的。**先看组上的 `mixedPremises`**：为 `true` 的是同一句话写在两种口径下，那不是重复，别合（见 [9.10](#910-前提作用域-scope同一句话换个条件就不成立)）。真要合用 `merge`（未发布）：默认预览谁留下、结转了什么，`dry_run:false` 才落地，多余行只是折叠、`undemote` 可恢复。`delete` 会把版本历史一起删掉，只在确实要销毁一条（比如被投毒的行）时用。详见 [9.11](#911-重复合并-merge折叠而不是删除未发布)。
+跑 `memory_maintain` → `duplicates`（只读报告）。重复主要来自整合时段产生的 `FACT: ` 规则副本，写入路径已修，不会再生新的。**先看组上的 `mixedPremises`**：为 `true` 的是同一句话写在两种口径下，那不是重复，别合（见 [9.10](#910-前提作用域-scope同一句话换个条件就不成立)）。真要合用 `merge`（0.3.0）：默认预览谁留下、结转了什么，`dry_run:false` 才落地，多余行只是折叠、`undemote` 可恢复。`delete` 会把版本历史一起删掉，只在确实要销毁一条（比如被投毒的行）时用。详见 [9.11](#911-重复合并-merge折叠而不是删除030)。
 
 **Q10 怎么知道记忆库是健康的？**
 `memory_maintain` → `status`：给出一句话 `health` 结论 + 深度诊断（库路径、嵌入器类型与维度、存量向量维度直方图、`dimMismatch`、阈值、访问统计、`coverage`、`sibling_stores`）。看到 `WARN: embedder mismatch` 就说明模型向量库被哈希回退查询了（会导致永久零命中，而且计数看起来一切正常）；看到 `WARN: this store is empty while a sibling file…` 是**记到隔壁库去了**，见 Q19。`coverage.misses / turns` 高则是问法或门槛的问题（见 [9.2](#92-空结果一定给得出理由)）。
@@ -782,10 +783,10 @@ node -e "const s=require('fs').readFileSync(process.argv[1],'utf8');console.log(
 不是。`scope` 是新加的一列，旧库首次打开时自动 `ALTER TABLE` 补上（存量行读作"没写前提"），不需要重建、不会丢数据。之前存的两条同主体结论仍按老规则判；只有新写入声明了前提才会走上面那套判定。
 
 **Q19 明明让它记过，换个会话（或换个 agent）却查不到？**
-先分清是"没记住"还是"记在另一个库里"——这两种在以前输出一模一样。跑 `memory_maintain` → `status`：本批（未发布）里 `health` 第一件事就是判这个，命中时会说 `this store is empty while a sibling file in the same directory holds memories`；`diagnostics().sibling_stores` 列出同目录每个 `.db` 各有多少条、哪一个是**现在应答你的**（`current: true`），`path_rule` 说明本宿主的命名规则（DSH 按 agent id、opencode 按项目目录）。是分裂就**不是记忆问题**：写到共享库、或者回到当初写入的那个 agent / 项目里问。详见 [9.12](#912-库分裂没记住-vs-记在另一个文件里未发布)。
+先分清是"没记住"还是"记在另一个库里"——这两种在以前输出一模一样。跑 `memory_maintain` → `status`：本批（0.3.0）里 `health` 第一件事就是判这个，命中时会说 `this store is empty while a sibling file in the same directory holds memories`；`diagnostics().sibling_stores` 列出同目录每个 `.db` 各有多少条、哪一个是**现在应答你的**（`current: true`），`path_rule` 说明本宿主的命名规则（DSH 按 agent id、opencode 按项目目录）。是分裂就**不是记忆问题**：写到共享库、或者回到当初写入的那个 agent / 项目里问。详见 [9.12](#912-库分裂没记住-vs-记在另一个文件里030)。
 
 **Q20 digest 里那行 `[low-confidence …]` 是什么？能信吗？**
-（未发布）它是"最接近的痕迹、不是记忆"：这条线索下一条都没过召回门槛时，引擎把余弦最高的那条端出来，免得整块空白看起来像"库里没东西"。它**不带**原行的 `[VERIFIED]` / `[ASSERTED]` 标记，附带的 warning 也说明这块里有一行是猜的。用法：拿它当**复查线索**（去 verify、去问用户），不要当存过的事实复述。相似度为 0、库里根本没东西时连这行都不给。见 [9.2](#92-空结果一定给得出理由)。
+（0.3.0）它是"最接近的痕迹、不是记忆"：这条线索下一条都没过召回门槛时，引擎把余弦最高的那条端出来，免得整块空白看起来像"库里没东西"。它**不带**原行的 `[VERIFIED]` / `[ASSERTED]` 标记，附带的 warning 也说明这块里有一行是猜的。用法：拿它当**复查线索**（去 verify、去问用户），不要当存过的事实复述。相似度为 0、库里根本没东西时连这行都不给。见 [9.2](#92-空结果一定给得出理由)。
 
 ---
 
@@ -814,7 +815,7 @@ await mem.remember({
 
 // ② 组 prompt 片段（工作记忆门控）
 const { items, context } = await mem.composeContext('fix billing connection', { limit: 5 });
-// items[0]?.lowConfidence === true → 这一行是"最接近的痕迹"，不是记忆（未发布）
+// items[0]?.lowConfidence === true → 这一行是"最接近的痕迹"，不是记忆（0.3.0）
 // 不想要这行兜底：{ lowConfidenceTop1: false }
 
 // ②b 只在条件下成立的结论：带 scope，两条前提不同的行各存各的
@@ -841,7 +842,7 @@ const plan = await mem.mergeDuplicates({ ids: g.memories.map((m) => m.id) });
 // await mem.mergeDuplicates({ ids: g.memories.map((m) => m.id), dryRun: false });  // 落地
 // mem.undemote(plan.retired.map((r) => r.id));                                     // 反悔
 
-// ④c 体检：隔壁那个库里有没有我要找的东西（未发布）
+// ④c 体检：隔壁那个库里有没有我要找的东西（0.3.0）
 mem.diagnostics().sibling_stores;   // { dir, stores: [{ file, rows, demoted, lastWrite, current }], unreadable }
 mem.diagnostics().coverage;         // { turns, misses, guesses, scope: 'process' }
 ```
@@ -907,7 +908,7 @@ digest   -> [memory data …] 数据框架正常
 ```bash
 # 项目级：.opencode/plugins/，全局：~/.config/opencode/plugins/
 # .opencode/package.json 里声明依赖，opencode 启动时会 bun install：
-{ "dependencies": { "hippo-memory-core": "^0.2.1" } }
+{ "dependencies": { "hippo-memory-core": "^0.3.0" } }
 ```
 
 ```ts

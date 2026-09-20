@@ -21,6 +21,7 @@ export type {
   SourceConfidence,
   StoredMemory,
   StoreOptions,
+  Summarizer,
 } from './schema.js';
 export { DEFAULT_OPTIONS, nowIso } from './schema.js';
 export {

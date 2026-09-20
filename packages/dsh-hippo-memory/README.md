@@ -8,9 +8,9 @@
 ```
 
 > 引擎（框架无关）是独立包 [`hippo-memory-core`](https://www.npmjs.com/package/hippo-memory-core)；本包是 DSH 适配层：工具 + 自动注入 + 使用纪律 + GUI 设置卡片。
-> ⚠️ 本包是 **DSH 专属**适配层，**不能在 opencode 等其它宿主里安装**。引擎 `hippo-memory-core` 自 0.2.1 起可在 Bun 上运行（opencode 用 Bun）；面向 opencode 的适配包 `opencode-hippo-memory` 在本仓库 `packages/` 下开发中。
+> ⚠️ 本包是 **DSH 专属**适配层，**不能在 opencode 等其它宿主里安装**。引擎 `hippo-memory-core` 自 0.2.1 起可在 Bun 上运行（opencode 用 Bun）；面向 opencode 的适配包 `opencode-hippo-memory` 已发布（同在本仓库 `packages/` 下）。
 >
-> 当前版本：**0.2.1**（与引擎 0.2.0 同步）。详细使用说明见 [完整中文使用说明](https://github.com/guoxing2024/hippo-memory/blob/master/docs/USER-GUIDE.zh-CN.md)。
+> 当前版本：**0.3.0**（与引擎 `hippo-memory-core@0.3.0` 同步）。详细使用说明见 [完整中文使用说明](https://github.com/guoxing2024/hippo-memory/blob/master/docs/USER-GUIDE.zh-CN.md)。
 
 ---
 
@@ -19,14 +19,14 @@
 | 能力 | 说明 | 何时触发 |
 |---|---|---|
 | **4 个记忆工具** | `memory_remember` 写 / `memory_recall` 查 / `memory_verify` 校验 / `memory_maintain` 维护（13 个动作） | agent 自主判断（有使用纪律引导） |
-| **每轮自动回忆** | 用你这一轮的话当线索，把相关旧结论注入一条 `[hippo-memory digest]` 块；**命中才耗 token**（约 20–40 tok/条）。全部低于门槛时不再空白：最接近的那条会以 `[low-confidence …]` 端出并标明"这不是记忆"（待发布） | 每轮开工前自动 |
+| **每轮自动回忆** | 用你这一轮的话当线索，把相关旧结论注入一条 `[hippo-memory digest]` 块；**命中才耗 token**（约 20–40 tok/条）。全部低于门槛时不再空白：最接近的那条会以 `[low-confidence …]` 端出并标明"这不是记忆"（0.3.0） | 每轮开工前自动 |
 | **记忆纪律** | 系统提示教 agent：何时记、何时查、何时验（WRITE → RECALL → VERIFY → MAINTAIN） | 插件启用即注入 |
 | **纠正链** | `memory_verify` 返回 `contradicting[]` / `newer_related[]` / `superseded_matches[]` / `stale_support`；`memory_remember` 回显 `neighbours[]` 并接受 `supersedes` | 0.2.0 起 |
-| **前提作用域** | `memory_remember` 接受 `scope`（`key=value; …`）声明结论成立的条件；`memory_verify` 接受 `scope` 并返回 `out_of_scope`——换口径的重测不再被当成同一句话 | 写入时可选（待发布） |
-| **重复合并** | `memory_maintain { action: "duplicates" }` 只读报告同一句话的重述（每组带 `mixedPremises`），确认后 `{ action: "merge", ids: [...] }` 折叠成一条；多余行不删、`undemote` 可恢复 | 长会话整理时（待发布） |
+| **前提作用域** | `memory_remember` / `memory_verify` / `memory_recall` 都接受 `scope`（`key=value; …`）：写入声明结论成立的条件、verify 返回 `out_of_scope`、recall 按前提**硬过滤**冲突行并回 `scopeExcluded`——换口径的重测不再被当成同一句话 | 写入 / 查证 / 召回时可选（0.3.0） |
+| **重复合并** | `memory_maintain { action: "duplicates" }` 只读报告同一句话的重述（每组带 `mixedPremises`），确认后 `{ action: "merge", ids: [...] }` 折叠成一条；多余行不删、`undemote` 可恢复 | 长会话整理时（0.3.0） |
 | **证据与前瞻** | `verify_cmd` / `verify_expect` / `verify_artifact` + 保鲜期；`retracts` 撤回；`guard_trigger` / `guard_action` 前瞻守卫 | 写入时可选 |
 | **防投毒护栏** | 渲染出口统一清洗指令劫持文本为 `[sanitized-*]`，digest 整体包 `[memory data]` 数据框架；**存储原文不动**，可疑行由 `injection:` 警告点名 | 引擎自动 |
-| **可观测性** | `status` 返回一句话 `health` + 深度诊断（嵌入器类型/维度、向量维度直方图、`dimMismatch`、阈值、访问统计）。待发布新增：`path_rule`（本 agent 的库文件名是怎么来的）、`sibling_stores`（同目录每个 `.db` 各有多少行）、`coverage`（本进程召回门槛开合了几次、几次什么都没放行）；`health` 第一判据改成"本库空、隔壁满" | 怀疑召回坏了时 |
+| **可观测性** | `status` 返回一句话 `health` + 深度诊断（嵌入器类型/维度、向量维度直方图、`dimMismatch`、阈值、访问统计）。0.3.0 新增：`path_rule`（本 agent 的库文件名是怎么来的）、`sibling_stores`（同目录每个 `.db` 各有多少行）、`coverage`（本进程召回门槛开合了几次、几次什么都没放行）；`health` 第一判据改成"本库空、隔壁满" | 怀疑召回坏了时 |
 | **间隔重复** | 复述 / 召回按距上次访问的间隔对数加权强化；`importance` 可显式声明 | 引擎自动 |
 | **GUI 设置卡片** | 设置 → 插件 → 插件配置 → HippoMemory 记忆 | 随时开关、调参 |
 
@@ -79,7 +79,7 @@ dsh web
 
 - 库文件在 `~/.dsh/storages/hippo-memory/<agent-id>.db`，实测最常见的是 `session-<id>.db`；开 `sharedStore` 后所有 agent id 合并写 `shared.db`；
 - 记忆不会因会话删除 / 上下文清空而丢失；插件关闭再开启，数据仍在；
-- **代价**：A 会话记下的东西 B 会话查不到——它们在两个文件里。`memory_maintain { action: "status" }` 的 `path_rule` 说明本 agent 的文件名怎么来的，`sibling_stores` 列出同目录每个 `.db` 各有多少行（待发布）。
+- **代价**：A 会话记下的东西 B 会话查不到——它们在两个文件里。`memory_maintain { action: "status" }` 的 `path_rule` 说明本 agent 的文件名怎么来的，`sibling_stores` 列出同目录每个 `.db` 各有多少行（0.3.0）。
 
 ---
 
@@ -101,11 +101,11 @@ dsh web
 | `retracts` | 本写入撤回的 id（配合 `tags: ["retraction"]`） |
 | `guard_trigger` + `guard_action` | 前瞻守卫（配合 `tags: ["guard"]`） |
 
-返回：`outcome`（new / none / merge / override / supersede）、`id`、`version`、`scope`、`superseded`、`neighbours[]`、`warning`、`scope_only_matches`。
+返回：`outcome`（new / none / merge / override / supersede）、`id`、`version`、`scope`、`verify_result` / `verified_at`（复述带上新证据时回显，无证据为 `null`）、`superseded`、`neighbours[]`、`warning`、`scope_only_matches`。
 
 ### `memory_recall` —— 检索
 
-`query` 必填；`entities` / `kind` / `limit`（默认 8，上限 20）/ `include_demoted` 可选。命中带 `scope`（该条自己的前提）。
+`query` 必填；`entities` / `kind` / `limit`（默认 8，上限 20）/ `include_demoted` / `scope` 可选。传 `scope`（`key=value; …`）时按前提**硬过滤**冲突行、返回 `scopeExcluded` 计数并附 `scope:` 警告；命中带 `scope`（该条自己的前提）。
 
 ### `memory_verify` —— 断言前查证
 
@@ -166,13 +166,13 @@ dsh web
 哈希嵌入对同义不同词的召回偏弱（尤其中文）。**推荐开启设置里的嵌入模型 = auto**。也可看 `closest`（最接近的候选是谁）、用更接近原 summary 的措辞再查，或带上实体名。
 
 **Q：同一句话换个测量口径测出不同数字，会被当成同一条记忆吗？**
-会——除非写入时带 `scope`（本包的"前提作用域"一行，随下个版本发布）。`scope: "population=…; comparator=…"` 声明条件后，前提对不上的两条结论各自留存、互不覆盖；查问时也要带 `scope`，否则 `memory_verify` 会用 `CONDITIONAL SCOPE` 告诉你那条支持的前提**没被核对**。不带 `scope` 仍按老规则判（同主体换值 → 覆盖），所以关键是别让 agent 省掉这个参数。
+会——除非写入时带 `scope`（本包的"前提作用域"一行，0.3.0）。`scope: "population=…; comparator=…"` 声明条件后，前提对不上的两条结论各自留存、互不覆盖；查问时也要带 `scope`，否则 `memory_verify` 会用 `CONDITIONAL SCOPE` 告诉你那条支持的前提**没被核对**（`memory_recall` 传 `scope` 则直接把前提冲突的行硬过滤掉）。不带 `scope` 仍按老规则判（同主体换值 → 覆盖），所以关键是别让 agent 省掉这个参数。
 
 **Q：recall 只给 0.4 多，是不是没记住？**
 不一定。先看 `similarity`（原始余弦，与阈值可直接比）与 `relativeScore`（1.0 = 本次最佳）。余弦被压缩，0.45 也可能全库最佳。若 `reason` 是 `below-threshold`，看 `nearMisses` 判断是真没有还是阈值偏高。
 
 **Q：怎么知道记忆库健康？**
-`memory_maintain` → `status`：一句话 `health` + 深度诊断。看到 `WARN: embedder mismatch` 说明模型向量库被哈希回退查询了（会导致永久零命中）。**空库时先看 `health` 是不是先说"写在另一个库里"**（待发布）：`sibling_stores` 里隔壁有货而本库 0 行，那是分库路径问题，不是记忆没工作。
+`memory_maintain` → `status`：一句话 `health` + 深度诊断。看到 `WARN: embedder mismatch` 说明模型向量库被哈希回退查询了（会导致永久零命中）。**空库时先看 `health` 是不是先说"写在另一个库里"**（0.3.0）：`sibling_stores` 里隔壁有货而本库 0 行，那是分库路径问题，不是记忆没工作。
 
 **Q：会不会很费 token？**
 不会。写入 / 查询是 agent 主动调用才发生；自动注入只在命中相关记忆时产生约 20–40 tok/条，无命中为 0。条数上限可调。
