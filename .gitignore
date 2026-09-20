@@ -8,6 +8,7 @@ dist/
 # test / bench scratch
 .tmp-build/
 bench/.cache/
+bench/e2e/
 .hippo/
 *.tmp
 *.log
