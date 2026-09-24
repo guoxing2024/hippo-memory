@@ -2,45 +2,49 @@
 /**
  * dsh-hippo-memory — browser half.
  *
- * Contributes the "hippo-memory" plugin card to the Web GUI Plugins settings
- * section (设置 → 插件 → 插件配置). The card edits the `hippo-memory`
- * settings namespace registered by the host half of this package:
+ * Contributes the configuration page for the `hippo-memory` row of this bundle
+ * to the Web GUI Plugins sidebar (插件 → dsh-hippo-memory → hippo-memory). The
+ * page edits the volatile Config section the host half of this package exports,
+ * addressed by this bundle's profile entry id:
  *
- *   enabled       toggle — mounts/unmounts the memory tools, guidance section,
- *                 and digest context on the host (live)
- *   contextLimit  number — max digest items auto-injected per assembly
- *   sharedStore   toggle — share one store across sessions instead of one per
- *                 session (requires the host setting; per-agent store stays
- *                 the default)
+ *   enabled              toggle — mounts/unmounts the memory tools, guidance
+ *                        section, and digest context on the host (live)
+ *   contextLimit         number — max digest items auto-injected per assembly
+ *   sharedStore          toggle — one store for all sessions instead of one per
+ *                        session
+ *   embedding            select — 'auto' local semantic model, 'off' hashing
+ *   similarityThreshold  number — recall similarity floor, empty for the engine
+ *                        default
  *
- * The card is a staged form: nothing writes until Save; Save writes one
- * revision-fenced mutation through the settings scope.
+ * The page is a staged form: nothing writes until Save; Save writes one
+ * revision-fenced mutation through the entry's configuration form.
  *
  * Module format: browser client modules are `window.__ModuleLoader__.load`
  * bundles (the web shell's CJS-like facade). `@deepseek-ai/*` UI packages,
- * react and react/jsx-runtime resolve through the shell's static module table.
+ * react and react/jsx-runtime resolve through the shell's static module table,
+ * which `dsh.client.inject` in package.json has to declare.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-hippo-memory',
   factory: (require) => {
     'use strict';
 
-    const React = require('react');
     const { jsx } = require('react/jsx-runtime');
-    const cordis = require('@deepseek-ai/cordis');
-    const storePkg = require('@deepseek-ai/dsh-client-store');
 
+    /** Locale dictionary namespace owned by this card. */
     const NS = 'hippo-memory';
+    /** Host profile entry id — since 0.1.7 also the settings namespace. */
+    const ENTRY_ID = 'hippo-memory';
+    /** The Plugins page slot this row's configuration registers into. */
+    const SLOT = 'plugins.row.config';
+    const SLOT_KEY = 'dsh-hippo-memory#hippo-memory';
 
     /* ------------------------------------------------------------------ */
     /* locale dictionaries (zh + en)                                       */
     /* ------------------------------------------------------------------ */
 
     const en = {
-      title: 'HippoMemory',
       description: 'Hippocampus-inspired long-term memory: tools, guidance, and per-assembly digest for DSH agents.',
-      expandLabel: 'Expand settings',
-      collapseLabel: 'Collapse settings',
       enabledLabel: 'Enabled',
       enabledHint: 'Mount the memory tools, guidance section, and automatic digest injection.',
       contextLimitLabel: 'Context limit',
@@ -62,10 +66,7 @@ window.__ModuleLoader__.load({
       dirty: 'unsaved changes'
     };
     const zh = {
-      title: 'HippoMemory 记忆',
       description: '海马体式长期记忆：为 DSH agent 提供记忆工具、使用纪律与每轮自动注入的记忆摘要。',
-      expandLabel: '展开设置',
-      collapseLabel: '收起设置',
       enabledLabel: '启用',
       enabledHint: '挂载记忆工具、纪律提示段与自动记忆摘要注入。',
       contextLimitLabel: '上下文条数上限',
@@ -149,7 +150,7 @@ window.__ModuleLoader__.load({
           }
         }
         cachedSnapshot = {
-          available: snap.available !== false,
+          available: snap.status === 'ready',
           writable,
           saving: false,
           failed: false,
@@ -182,20 +183,32 @@ window.__ModuleLoader__.load({
         }
       };
 
-      let revision = scope.getSnapshot().revision ?? 0;
+      // The Host form is the only thing that knows when the section moved under
+      // us — another tab saved, or the Loader committed a new revision. Without
+      // this hop the page keeps showing what it rendered first, since nothing
+      // else tells React that getSnapshot() now answers differently.
+      const unsubscribe = scope.subscribe?.(() => notify());
+      store.dispose = () => unsubscribe?.();
+
+      // The write fence is taken when the first edit of a batch is staged, not
+      // when the form is built: the form activates before the Host has answered
+      // its first describe, so a fence read here would be undefined.
+      let fence;
+      const stage = (field, entry) => {
+        if (Object.keys(draft).length === 0) fence = scope.getSnapshot().revision;
+        draft[field] = entry;
+        notify();
+      };
       return {
         store,
         edit(field, text) {
-          draft[field] = { text, clear: false };
-          notify();
+          stage(field, { text, clear: false });
         },
         toggle(field, current) {
-          draft[field] = { text: String(!current), clear: false };
-          notify();
+          stage(field, { text: String(!current), clear: false });
         },
         resetField(field) {
-          draft[field] = { clear: true };
-          notify();
+          stage(field, { clear: true });
         },
         async save() {
           const ops = [];
@@ -212,13 +225,13 @@ window.__ModuleLoader__.load({
             }
           }
           if (ops.length === 0) return;
-          try {
-            await scope.mutate(ops, revision);
+          // A refused write keeps its drafts so the user corrects them instead
+          // of retyping; the next accepted save re-seeds from the Host.
+          if (await scope.mutate(ops, fence)) {
             draft = {};
-          } finally {
-            revision = scope.getSnapshot().revision ?? revision;
-            notify();
+            fence = undefined;
           }
+          notify();
         },
         discard() {
           draft = {};
@@ -237,8 +250,7 @@ window.__ModuleLoader__.load({
         'dsh-hippo-memory: dictionaries'
       );
 
-      const scope = ctx.settingsScope.bind({ namespace: NS });
-      const form = createCardForm(scope);
+      const form = createCardForm(ctx.configForms.get(ENTRY_ID));
 
       ctx.effect(
         () => () => {
@@ -254,23 +266,22 @@ window.__ModuleLoader__.load({
         edit: (field, text) => form.edit(field, text),
         toggle: (field, current) => form.toggle(field, current),
         resetField: (field) => form.resetField(field),
-        save: () => {
-          form.save();
-        },
+        save: () => form.save(),
         discard: () => form.discard()
       });
 
-      ctx.slots.inject('settings.plugin.item', function* () {
-        yield ctx.slots.register(
-          {
-            name: 'settings.plugin.item',
-            key: NS,
-            locale: NS,
-            inject: injected
-          },
-          Card
-        );
-      });
+      // Mounted only while the Host actually serves the entry: a profile that
+      // never composes the host half of this package shows no trace of the page.
+      ctx.effect(
+        () =>
+          ctx.configForms.whileServed([ENTRY_ID], () =>
+            ctx.slots.inject(
+              SLOT,
+              () => ctx.slots.register({ name: SLOT, key: SLOT_KEY, locale: NS, inject: injected }, Card)
+            )
+          ),
+        'dsh-hippo-memory: page'
+      );
     }
 
     /* ------------------------------------------------------------------ */
@@ -278,18 +289,9 @@ window.__ModuleLoader__.load({
     /* ------------------------------------------------------------------ */
 
     const cardCss = `
-.hm-card{list-style:none;border:.5px solid var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-layer-3);border-radius:16px;transition:border-color .16s,background .16s;margin:0;padding:0}
-.hm-card:hover{border-color:var(--dsw-alias-label-dimmed)}
-.hm-cardOpen{background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-label-dimmed)}
-.hm-header{appearance:none;width:100%;font:inherit;color:inherit;text-align:left;cursor:pointer;background:0 0;border:0;border-radius:12px;align-items:center;gap:12px;padding:14px 16px;display:flex;margin:0}
-.hm-header:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}
-.hm-headText{flex-direction:column;flex:1;gap:4px;min-width:0;display:flex}
-.hm-name{color:var(--dsw-alias-label-primary);font-size:15px;font-weight:600;line-height:1.4}
-.hm-description{color:var(--dsw-alias-label-tertiary);font-size:13px;line-height:1.5}
-.hm-chevron{color:var(--dsw-alias-label-tertiary);flex:none;transition:transform .16s}
-.hm-chevronOpen{transform:rotate(180deg)}
+.hm-card{border:.5px solid var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-layer-3);border-radius:16px;margin:0;padding:0 16px}
 .hm-pending{white-space:nowrap;background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-secondary);border-radius:999px;flex:none;padding:1px 8px;font-size:11px;font-weight:500;line-height:17px}
-.hm-body{border-top:.5px solid var(--dsw-alias-border-l2);margin:0 16px;padding-bottom:8px}
+.hm-body{padding:8px 0}
 .hm-field{flex-direction:column;gap:6px;padding:12px 0;display:flex}
 .hm-field+.hm-field{border-top:.5px solid var(--dsw-alias-border-l2)}
 .hm-row{align-items:center;gap:8px;display:flex}
@@ -323,48 +325,20 @@ window.__ModuleLoader__.load({
       document.head.appendChild(tag);
     }
 
-    const chevronPath = 'M11.8486 5.5L11.4238 5.92383L8.69727 8.65137C8.44157 8.90706 8.21562 9.13382 8.01172 9.29785C7.79912 9.46883 7.55595 9.61756 7.25 9.66602C7.08435 9.69222 6.91565 9.69222 6.75 9.66602C6.44405 9.61756 6.20088 9.46883 5.98828 9.29785C5.78438 9.13382 5.55843 8.90706 5.30273 8.65137L2.57617 5.92383L2.15137 5.5L3 4.65137L3.42383 5.07617L6.15137 7.80273C6.42595 8.07732 6.59876 8.24849 6.74023 8.3623C6.87291 8.46904 6.92272 8.47813 6.9375 8.48047C6.97895 8.48703 7.02105 8.48703 7.0625 8.48047C7.07728 8.47813 7.12709 8.46904 7.25977 8.3623C7.40124 8.24849 7.57405 8.07732 7.84863 7.80273L10.5762 5.07617L11 4.65137L11.8486 5.5Z';
-
     function Card(props) {
       const { t } = props;
       const state = props.useHippoMemory((snapshot) => snapshot);
-      const [open, setOpen] = React.useState(false);
       if (!state || state.available === false) return null;
+      // The row page asks for two views of one entry: a one-liner under the row
+      // title, then the form. Only the form is interactive, so the summary stays
+      // plain text — a control inside that paragraph would be invalid markup.
+      if (props.view === 'summary') return t('description');
       const disabled = !state.writable;
       const invalidDraft = state.invalid === true;
-      const label = open ? t('collapseLabel') : t('expandLabel');
-      return jsx('li', {
-        className: 'hm-card' + (open ? ' hm-cardOpen' : ''),
+      return jsx('div', {
+        className: 'hm-card',
         children: [
-          jsx('button', {
-            type: 'button',
-            className: 'hm-header',
-            'aria-expanded': open,
-            'aria-label': label + ': ' + t('title'),
-            onClick: () => setOpen((v) => !v),
-            children: [
-              jsx('span', {
-                className: 'hm-headText',
-                children: [
-                  jsx('span', {
-                    className: 'hm-name',
-                    children: [t('title'), state.dirty ? jsx('span', { className: 'hm-pending', children: t('dirty') }) : null]
-                  }),
-                  jsx('span', { className: 'hm-description', children: t('description') })
-                ]
-              }),
-              jsx('svg', {
-                width: '14',
-                height: '14',
-                viewBox: '0 0 14 14',
-                fill: 'none',
-                xmlns: 'http://www.w3.org/2000/svg',
-                className: 'hm-chevron' + (open ? ' hm-chevronOpen' : ''),
-                children: jsx('path', { d: chevronPath, fill: 'currentColor' })
-              })
-            ]
-          }),
-          open ? jsx('div', {
+          jsx('div', {
             className: 'hm-body',
             children: [
               fieldRow(t, 'enabled', t('enabledLabel'), t('enabledHint'), state.enabled !== undefined ? state.enabled.text === 'true' : true, !disabled && !state.saving, (checked) => props.toggle('enabled', checked)),
@@ -441,6 +415,7 @@ window.__ModuleLoader__.load({
               jsx('div', {
                 className: 'hm-footer',
                 children: [
+                  state.dirty ? jsx('span', { className: 'hm-pending', children: t('dirty') }) : null,
                   jsx('button', {
                     type: 'button',
                     className: 'hm-discard',
@@ -458,7 +433,7 @@ window.__ModuleLoader__.load({
                 ]
               })
             ]
-          }) : null
+          })
         ]
       });
     }
@@ -488,6 +463,6 @@ window.__ModuleLoader__.load({
       });
     }
 
-    return { apply, inject: ['locale', 'slots', 'settingsScope'] };
+    return { apply, inject: ['locale', 'slots', 'configForms'] };
   }
 });

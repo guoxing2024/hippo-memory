@@ -22,7 +22,7 @@ dsh plugin --profile web add dsh-hippo-memory
 dsh web
 ```
 
-重启后：**设置 → 插件 → 插件配置 → HippoMemory 记忆**，默认已启用。
+重启后：**插件 → dsh-hippo-memory → hippo-memory 行**，默认已启用。
 
 ## 它给你的 agent 加了什么？
 
@@ -31,7 +31,7 @@ dsh web
 | 🛠 4 个记忆工具 | `memory_remember` / `memory_recall` / `memory_verify` / `memory_maintain`，agent 自主调用 |
 | ⚡ 每轮自动回忆 | 开工前自动注入与当前任务相关的旧结论（`[hippo-memory digest]`），**命中才耗 token**（约 20–40 tok/条） |
 | 📏 记忆纪律 | 系统提示教 agent：何时该记、该查、该验证（WRITE → RECALL → VERIFY → MAINTAIN） |
-| 🎛 GUI 设置卡片 | 一键开关、注入条数、共享存储（跨会话协作 / 隔离）、嵌入模型、召回阈值 |
+| 🎛 GUI 设置页 | 一键开关、注入条数、共享存储（跨会话协作 / 隔离）、嵌入模型、召回阈值 |
 | 🔒 纯本地 | SQLite 存储（`~/.dsh/storages/hippo-memory/`），**零外部服务、零网络请求**，数据自己掌控 |
 | ♻️ 纠错链 | 用户纠正时旧记忆自动版本化存档，永不覆盖丢历史；也可用 `supersedes` 显式点名退役错误条目 |
 | 🔍 召回可解释 | 每个命中给三个分数（原始余弦 / 排序分 / 本次相对分）；**查不到时说明原因**并列出最接近的几条 |

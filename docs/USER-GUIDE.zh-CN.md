@@ -8,7 +8,7 @@
 
 1. [它解决什么问题](#1-它解决什么问题)
 2. [安装、升级与卸载](#2-安装升级与卸载)
-3. [设置项详解（GUI 卡片）](#3-设置项详解gui-卡片)
+3. [设置项详解（GUI 配置页）](#3-设置项详解gui-配置页)
 4. [装上之后会自动发生什么](#4-装上之后会自动发生什么)
 5. [四条使用纪律](#5-四条使用纪律)
 6. [对话模板（可直接复制）](#6-对话模板可直接复制)
@@ -89,7 +89,7 @@ dsh web
 
 确认方式（三选一）：
 
-1. 打开 **设置 → 插件 → 插件配置**，能看到 **HippoMemory 记忆** 卡片；
+1. 打开 **插件 → dsh-hippo-memory → hippo-memory 行**，能看到它的配置页；
 2. 在会话里让 agent 调一次 `memory_maintain`（`action: "status"`），有返回即安装成功；
 3. 观察运行时上下文里是否出现 `[hippo-memory digest]` 块。
 
@@ -114,19 +114,21 @@ dsh plugin --profile web remove dsh-hippo-memory
 
 ---
 
-## 3. 设置项详解（GUI 卡片）
+## 3. 设置项详解（GUI 配置页）
 
-打开 **设置 → 插件 → 插件配置 → HippoMemory 记忆**。
+打开 **插件 → dsh-hippo-memory → hippo-memory 行**。
 
 | 设置项 | 默认 | 说明 |
 |---|---|---|
 | **启用** | 开 | 总开关。关掉后 agent 立即失去 4 个记忆工具、纪律段落与自动摘要（**数据不会丢**，重新打开即恢复） |
 | **上下文条数上限** | 6 | 每轮自动注入的记忆摘要最多几条，范围 1–20。调大 = 背景更全但更耗 token；调小 = 更省，但可能漏掉相关结论 |
 | **共享存储** | 关 | 开 = 该 profile 内**所有会话共用一个库**（`shared.db`）；关 = **每个会话各记各的** |
-| **嵌入模型** | off | `off` = 内置哈希嵌入（按字面词匹配，零依赖、零下载）；`auto` = 懒加载本地中文语义模型 bge-small-zh-v1.5（量化约 24MB），按意思召回 |
+| **嵌入模型** | auto | `auto` = 懒加载本地中文语义模型 bge-small-zh-v1.5（量化约 24MB），按意思召回；`off` = 内置哈希嵌入（按字面词匹配，零依赖、零下载，同义改写召回不到） |
 | **召回阈值** | 留空 | 召回/验证的相似度下限（0.05–0.95）。留空 = 引擎默认 0.32。调低 = 更宽松；调高 = 更严格 |
 
-改完点 **保存**。有未保存改动时卡片会提示。
+改完点 **保存**。有未保存改动时页面会标出"有未保存修改"，此时 **放弃** 可回到已保存的值。
+
+> 这一页要求宿主 ≥ 0.1.7：0.1.7 起配置面改成 volatile `Config` + 插件页的 `plugins.row.config` 槽位，旧的「设置 → 插件 → 插件配置」卡片已不存在（旧版插件在 0.1.7 上会整机启动失败）。
 
 ### 3.1 启用要不要关？
 
@@ -712,7 +714,7 @@ per DSH every agent id has its own store, so the write went to another agent (se
 | opencode 的库 | `<缓存根>/opencode/hippo-memory/<项目目录 slug>.db`（`sharedStore: true` 时是同一个 `shared.db`） |
 | opencode 缓存根 | `$XDG_CACHE_HOME/opencode/hippo-memory`；Windows 上是 `%LOCALAPPDATA%\opencode\hippo-memory`；其余 `~/.cache/opencode/hippo-memory` |
 
-Windows 上 `~` 是 `C:\Users\<你>`。opencode 侧没有 GUI 卡片，设置写在 `opencode.jsonc` 的插件条目里（见 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md)）。
+Windows 上 `~` 是 `C:\Users\<你>`。opencode 侧没有 GUI 配置页，设置写在 `opencode.jsonc` 的插件条目里（见 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md)）。
 
 - **备份**：复制整个 `storages/hippo-memory/` 目录（建议先退出 dsh，避免 WAL 半写）；
 - **清空某个会话**：退出 dsh 后删对应的 `.db`（连同 `.db-wal` / `.db-shm`）；
@@ -870,7 +872,7 @@ await mem.ensureEmbeddingMigration();   // 一次性重嵌入旧行（返回处�
 
 | 东西 | opencode 里能用吗 | 说明 |
 |---|---|---|
-| `dsh-hippo-memory`（DSH 插件） | ❌ 不能 | 它是 DSH profile bundle（`cordis.patch.yml` + `dsh-tools` + DSH 设置卡片），opencode 的插件 API 完全另一套 |
+| `dsh-hippo-memory`（DSH 插件） | ❌ 不能 | 它是 DSH profile bundle（`cordis.patch.yml` + `dsh-tools` + DSH 设置页），opencode 的插件 API 完全另一套 |
 | `hippo-memory-core`（引擎） | ✅ 能（0.2.1 起） | 引擎原先把 SQLite 驱动写死成 Node 的 `node:sqlite`，而 opencode 的 Bun（实测 1.3.14）还没有这个内置模块，连 `import` 都失败；现在改成运行时探测，Bun 上自动用 `bun:sqlite` |
 | 4 个记忆工具 / 自动注入 / 使用纪律 | ✅ 能 —— 装适配包 | `opencode plugin -g opencode-hippo-memory`（见 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md)） |
 

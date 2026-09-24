@@ -25,7 +25,7 @@
 
 | 包 | 用途 | 安装 |
 |---|---|---|
-| [**`dsh-hippo-memory`**](packages/dsh-hippo-memory/README.md) | **DSH（DeepSeek Runtime）插件** —— 工具 + 自动注入 + 使用纪律 + GUI 设置卡片 | **DSH 用这个**：`dsh plugin --profile web add dsh-hippo-memory` |
+| [**`dsh-hippo-memory`**](packages/dsh-hippo-memory/README.md) | **DSH（DeepSeek Runtime）插件** —— 工具 + 自动注入 + 使用纪律 + GUI 设置页 | **DSH 用这个**：`dsh plugin --profile web add dsh-hippo-memory` |
 | [**`hippo-memory-core`**](https://www.npmjs.com/package/hippo-memory-core) | 框架无关的记忆引擎（可用在任意 agent 框架；Node 与 Bun 都能跑） | `npm install hippo-memory-core` |
 | [**`opencode-hippo-memory`**](packages/opencode-hippo-memory/README.md) | **opencode 插件** —— 同样是 4 个工具 + 每轮注入 + 压缩保留，宿主换成 opencode | `opencode plugin -g opencode-hippo-memory` |
 
@@ -542,7 +542,7 @@ mem.diagnostics().sibling_stores;
   - ✅ **门槛没过不再空白**（digest 标明身份给出最接近痕迹 + `coverage` 计数）；
   - ✅ **库分裂可见**（`sibling_stores` / `scope_rule` / `path_rule` / `emptyWhileSiblingsFull`）；
   - ⏳ **opencode 工具结果的清洗覆盖**：`list` / `history` / `recall` 命中仍出原文（digest 与本次新增的 duplicates / merge 已清洗），补齐后两家出口口径才真的一致；
-  - ⏳ GUI 记忆浏览器：设置卡片里的记忆清单 / 检索 / 删除；
+  - ⏳ GUI 记忆浏览器：设置页里的记忆清单 / 检索 / 删除；
   - ⏳ store 的 JSON 导出导入（备份与迁移）。
 - **v0.3（已落地并发布到 npm）**
   - ✅ **`scope` 字段（前提作用域）已落地**：为记忆声明"在什么条件下成立"（`population=` / `comparator=` / `release=`…），冲突检测不再把换口径的重测折成一条，`verify` 会答 `OUT_OF_SCOPE`；

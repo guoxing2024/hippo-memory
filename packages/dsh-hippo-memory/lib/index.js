@@ -10,9 +10,10 @@
  *                   verify / maintain (source-monitoring discipline)
  *   runtime context a [hippo-memory digest] block auto-injected per assembly
  *                   (working-memory gate; synchronous cache + async refresh)
- *   settings        a `hippo-memory` settings namespace (enabled, contextLimit,
- *                   sharedStore) editable from the Web GUI plugin card; the
- *                   card is contributed by the browser half of this package.
+ *   configuration   a volatile Config section (enabled, contextLimit,
+ *                   sharedStore, embedding, similarityThreshold) that the Web
+ *                   GUI edits and saves; the browser half of this package
+ *                   contributes that card.
  *
  * Resolution notes (DSH profile mechanics):
  *   - The plugin row comes from this package's cordis.patch.yml insert.
@@ -52,15 +53,23 @@ if (typeof sanitizeMemoryText !== 'function') sanitizeMemoryText = (t) => String
 if (typeof looksInjected !== 'function') looksInjected = () => false;
 
 const name = 'hippo-memory';
-const inject = ['systemPrompt', 'tools', 'settings'];
+const inject = ['systemPrompt', 'tools'];
 
-/** Settings namespace owned by this plugin (the key its GUI card edits). */
-const SETTINGS_NS = 'hippo-memory';
-/** Composition schema of the settings section; the user layer overrides it. */
-const SettingsSchema = z.object({
-  enabled: z.boolean().default(true),
-  contextLimit: z.number().min(1).max(20).default(6),
-  sharedStore: z.boolean().default(false),
+/**
+ * Plugin configuration. Every field is `.volatile()`, which is what makes it
+ * editable from the Web GUI: the settings service projects the volatile subset
+ * of a plugin's Config under its profile entry id (`hippo-memory`, declared by
+ * this package's cordis.patch.yml), a save writes that section, and the Loader
+ * commits the new value into the reference below and emits
+ * `loader/volatile-update` instead of remounting the plugin.
+ *
+ * Replaces the pre-0.1.7 `settings.register()` namespace, which this plugin
+ * called and which no longer exists.
+ */
+const Config = z.object({
+  enabled: z.boolean().default(true).volatile(),
+  contextLimit: z.number().min(1).max(20).default(6).volatile(),
+  sharedStore: z.boolean().default(false).volatile(),
   /**
    * Embedder choice. Default 'auto': the built-in hashing embedder has no
    * synonym ability (an audit flagged the old 'off' default as the single
@@ -70,12 +79,10 @@ const SettingsSchema = z.object({
    * bge-small-zh-v1.5 (~24MB, cached under storages/hippo-memory/models) and
    * falls back to hashing if loading fails.
    */
-  embedding: z.union(['off', 'auto']).default('auto'),
+  embedding: z.union(['off', 'auto']).default('auto').volatile(),
   /** recall similarity floor; lower = more lenient recall, higher = stricter. Leave unset for engine default (0.32). */
-  similarityThreshold: z.number().min(0.05).max(0.95).required(false)
+  similarityThreshold: z.number().min(0.05).max(0.95).required(false).volatile()
 });
-/** Plugin Config (patch-row layer) — same shape; installed as section base. */
-const Config = SettingsSchema;
 
 const GUIDANCE = `## Long-term memory (hippocampus-inspired)
 
@@ -242,50 +249,29 @@ function cleanJson(value) {
 function apply(ctx, config = {}) {
   const t = ctx.tools;
   const sp = ctx.systemPrompt;
-  const settings = ctx.settings;
   if (!t || !sp) {
     ctx.logger?.warn?.('hippo-memory: tools/systemPrompt services unavailable; plugin idle');
     return;
   }
 
-  /** Composition default (patch row / Config) — installed as the settings base. */
-  const entry = {
-    enabled: config.enabled !== false,
-    contextLimit: config.contextLimit ?? 6,
-    sharedStore: config.sharedStore === true,
-    // Audit #0: semantic recall is the DEFAULT. The hashing embedder has no
-    // synonym ability, and defaulting to it turned "I don't remember" into the
-    // normal answer for paraphrased (especially CJK) questions. 'off' stays
-    // available for constrained environments.
-    embedding: config.embedding ?? 'auto',
-    similarityThreshold: config.similarityThreshold ?? undefined
+  /**
+   * The effective section, read fresh: one Config field per schema key, taken
+   * through its Loader reference and falling back to the schema's own default.
+   * Iterating the schema keeps this correct when a field is added, and the
+   * fallback is what keeps the plugin alive on a host whose config shape moves
+   * again — a plain value reads as itself, an absent one as its default.
+   */
+  const current = () => {
+    const section = {};
+    for (const [key, field] of Object.entries(Config.dict)) {
+      const reference = config[key];
+      const value = reference && typeof reference.get === 'function' ? reference.get() : reference;
+      section[key] = value === undefined ? field.meta?.default : value;
+    }
+    return section;
   };
 
-  // Register the settings namespace when the settings service is present so the
-  // Web GUI plugin card can read/override this section. The browser half of this
-  // package contributes the card under the same key.
-  const sectionScope = settings ? settings.register(SETTINGS_NS, SettingsSchema, { base: entry }) : undefined;
-
-  /** Current effective settings: the settings section when served, else the
-   *  composition entry (patch row / Config). The settings.register base IS the
-   *  composition entry, so sectionScope.get() already folds user overrides. */
-  const current = () => (sectionScope ? sectionScope.get() : entry);
-
-  if (sectionScope) {
-    sectionScope.watch(() => {
-      const next = sectionScope.get();
-      setEnabled(next.enabled);
-      // embedding / threshold changes require rebuilt engine instances
-      // (engine options are fixed at construction; DB files persist).
-      const sig = `${next.embedding}:${next.similarityThreshold ?? 'def'}`;
-      if (sig !== lastSig) {
-        lastSig = sig;
-        for (const key of [...stores.keys()]) stores.delete(key);
-        digestCache.clear();
-        void applyStoreSettings();
-      }
-    });
-  }
+  const entry = current();
 
   /** Registered-store registry (agent key -> instance) + digest cache. */
   const stores = new Map();
@@ -954,6 +940,26 @@ function apply(ctx, config = {}) {
     if (enabled && disposers.length === 0) installRuntime();
   };
 
+  // A save from the Web GUI writes the section and the Loader commits it into
+  // the references in place; this is where the plugin notices, replacing the
+  // `sectionScope.watch()` of the pre-0.1.7 settings API. Registered only once
+  // the state its handler touches exists: cordis delivers emits synchronously,
+  // so a host that moves the section during mount would otherwise reach into
+  // the temporal dead zone and abort the whole plugin.
+  ctx.on?.('loader/volatile-update', () => {
+    const next = current();
+    setEnabled(next.enabled);
+    // embedding / threshold changes require rebuilt engine instances
+    // (engine options are fixed at construction; DB files persist).
+    const sig = `${next.embedding}:${next.similarityThreshold ?? 'def'}`;
+    if (sig !== lastSig) {
+      lastSig = sig;
+      for (const key of [...stores.keys()]) stores.delete(key);
+      digestCache.clear();
+      void applyStoreSettings();
+    }
+  });
+
   if (enabled) {
     installRuntime();
     // Deliberately NO embedding warm-up here: importing @xenova/transformers
@@ -996,4 +1002,4 @@ function apply(ctx, config = {}) {
   );
 }
 
-export { Config, GUIDANCE, SETTINGS_NS, SettingsSchema, apply, inject, latestUserCue, name };
+export { Config, GUIDANCE, apply, inject, latestUserCue, name };

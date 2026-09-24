@@ -10,7 +10,8 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { apply, SettingsSchema, latestUserCue } from '../lib/index.js';
+import { apply, Config, latestUserCue } from '../lib/index.js';
+import { loaderConfig } from './fake-host.mjs';
 // Engine resolved relative to the repo (same file the adapter falls back to).
 const { HippoMemory } = await import(new URL('../../../dist/index.js', import.meta.url).href);
 
@@ -34,14 +35,10 @@ let ctx;
 let tools = new Map();
 let sections = [];
 let contexts = [];
-let storesBase;
-
 /** Minimal fake of the DSH host services the adapter consumes. */
 let disposers = [];
 function fakeCtx() {
   const toolRegistry = new Map();
-  const watched = [];
-  let cfg = {};
   const service = {
     section: (s) => {
       sections.push(s);
@@ -56,34 +53,18 @@ function fakeCtx() {
       return () => toolRegistry.delete(t.name);
     }
   };
-  const settings = {
-    register(ns, schema, { base } = {}) {
-      storesBase = { ns, schema, base };
-      return {
-        get: () => ({ ...base, ...cfg }),
-        watch: (cb) => {
-          watched.push(cb);
-          return () => {};
-        },
-        update: (patch) => {
-          cfg = { ...cfg, ...patch };
-        }
-      };
-    }
-  };
   ctx = {
     tools: service,
     systemPrompt: service,
-    settings,
     logger: { warn: () => {}, info: () => {}, error: () => {} },
     effect: (fn) => {
       const disposer = fn();
       if (typeof disposer === 'function') disposers.push(disposer);
     }
   };
-  apply(ctx, { enabled: true, embedding: 'off' }); // keep the suite offline+deterministic; the 'auto' default is asserted separately
+  apply(ctx, loaderConfig()); // 'off' keeps the suite offline+deterministic; the 'auto' default is asserted separately
   tools = toolRegistry;
-  return { watched, toolRegistry };
+  return { toolRegistry };
 }
 
 function toolExec(name, args, exec = { agent: { id: 'test-agent' } }) {
@@ -124,29 +105,19 @@ test('guidance tells the agent how to clean duplicates and how to read a guess',
   assert.match(text, /low-confidence/, 'explains the digest line that is a guess, not a memory');
 });
 
-test('settings schema exposes the full field set with defaults', () => {
-  const shape = SettingsSchema.toString();
+test('config schema exposes the full field set with defaults', () => {
+  const shape = Config.toString();
   assert.match(shape, /enabled/);
   assert.match(shape, /contextLimit/);
   assert.match(shape, /sharedStore/);
   assert.match(shape, /embedding/);
   assert.match(shape, /similarityThreshold/);
-  const base = storesBase?.base ?? {};
-  assert.equal(base.enabled, true);
-  assert.equal(base.contextLimit, 6);
+  assert.equal(Config.dict.enabled.meta.default, true);
+  assert.equal(Config.dict.contextLimit.meta.default, 6);
   // Audit #0: semantic recall is the composition default ('auto'); the suite
-  // pins 'off' per-store to stay offline, so assert the default on the base
-  // the plugin installs, not on the store settings.
-  assert.equal(base.embedding, 'off', 'the suite pinned off explicitly');
-  // The composition default: apply with an empty config and read the base the
-  // plugin installs (the schemastery-style schema has no .parse).
-  let capturedBase;
-  const stubSvc = { section: () => () => {}, context: () => () => {}, register: () => () => {} };
-  apply(
-    { tools: stubSvc, systemPrompt: stubSvc, settings: { register: (ns, schema, { base: b } = {}) => { capturedBase = b; return { get: () => b, watch: () => () => {} }; } }, logger: { warn: () => {}, info: () => {} }, effect: () => {} },
-    {}
-  );
-  assert.equal(capturedBase.embedding, 'auto', 'the composition default is auto (semantic, audit #0)');
+  // pins 'off' per-store to stay offline, so assert the default on the schema
+  // the plugin ships, not on the resolved config it was mounted with.
+  assert.equal(Config.dict.embedding.meta.default, 'auto', 'the composition default is auto (semantic, audit #0)');
 });
 
 /* ------------------------- remember / recall ------------------------- */
@@ -444,18 +415,10 @@ test('shared store mode makes memories visible across agents', async () => {
       return () => {};
     }
   };
-  const settings2 = {
-    register(ns, schema, { base } = {}) {
-      return {
-        get: () => ({ ...base, sharedStore: true }),
-        watch: () => () => {}
-      };
-    }
-  };
-  apply({ tools: svc, systemPrompt: svc, settings: settings2, logger: { warn: () => {}, info: () => {} }, effect: (fn) => {
+  apply({ tools: svc, systemPrompt: svc, logger: { warn: () => {}, info: () => {} }, effect: (fn) => {
     const disposer = fn();
     if (typeof disposer === 'function') effects.push(disposer);
-  } }, { sharedStore: true, embedding: 'off' }); // 'off' keeps this suite offline (no 24MB model download)
+  } }, loaderConfig({ sharedStore: true })); // 'off' comes from loaderConfig: keeps this suite offline (no 24MB model download)
   const execA = { agent: { id: 'shared-a' } };
   const execB = { agent: { id: 'shared-b' } };
   const run = (name, args, exec) => t2.get(name).execute(args, exec);

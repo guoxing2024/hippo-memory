@@ -4,9 +4,18 @@
 #   dsh plugin --profile web add link:../hippo-memory/packages/dsh-hippo-memory
 #   (or the absolute path to this package directory)
 #
-# The row is a bare plugin by package name: the node half (exports ".") runs
-# in the host process and registers the memory tools + guidance + dynamic
-# context on the system prompt. No browser half.
+# The row is a bare plugin by package name. Both halves hang off its id:
+#
+#   node half (exports ".")     runs in the host process and registers the
+#     memory tools + guidance + dynamic context on the system prompt. Its
+#     exported Config is volatile, so the Web GUI serves it as the settings
+#     namespace named after this row id.
+#   browser half (exports "./client")
+#     contributes that namespace's configuration page to the Web GUI Plugins
+#     sidebar, keyed `<package name>#<row id>`.
+#
+# Renaming the id below therefore requires the same rename in lib/client.js
+# (ENTRY_ID / SLOT_KEY) — test/browser-card.test.mjs pins that coupling.
 - insert:
     - id: hippo-memory
       name: 'dsh-hippo-memory'

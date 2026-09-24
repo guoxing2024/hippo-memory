@@ -7,10 +7,11 @@
 有本插件： 重要结论自动沉淀 → 每轮按需唤起 → 断言前先查证 → 不再凭空编造
 ```
 
-> 引擎（框架无关）是独立包 [`hippo-memory-core`](https://www.npmjs.com/package/hippo-memory-core)；本包是 DSH 适配层：工具 + 自动注入 + 使用纪律 + GUI 设置卡片。
+> 引擎（框架无关）是独立包 [`hippo-memory-core`](https://www.npmjs.com/package/hippo-memory-core)；本包是 DSH 适配层：工具 + 自动注入 + 使用纪律 + GUI 设置页。
 > ⚠️ 本包是 **DSH 专属**适配层，**不能在 opencode 等其它宿主里安装**。引擎 `hippo-memory-core` 自 0.2.1 起可在 Bun 上运行（opencode 用 Bun）；面向 opencode 的适配包 `opencode-hippo-memory` 已发布（同在本仓库 `packages/` 下）。
+> ⚠️ 配置面（GUI 那一页）要求宿主 **DSH ≥ 0.1.7**：0.1.7 起插件导出 volatile `Config`、浏览器半侧走 `ctx.configForms` 注册到插件页的 `plugins.row.config`，旧的 `settings.register()` / `settingsScope` / `settings.plugin.item` 已全部删除。四个记忆工具本身不依赖配置面。
 >
-> 当前版本：**0.3.0**（与引擎 `hippo-memory-core@0.3.0` 同步）。详细使用说明见 [完整中文使用说明](https://github.com/guoxing2024/hippo-memory/blob/master/docs/USER-GUIDE.zh-CN.md)。
+> 当前版本：**0.3.0**（与引擎 `hippo-memory-core@0.3.0` 同步；适配 0.1.7 宿主的那批改动尚未发号）。详细使用说明见 [完整中文使用说明](https://github.com/guoxing2024/hippo-memory/blob/master/docs/USER-GUIDE.zh-CN.md)。
 
 ---
 
@@ -28,7 +29,7 @@
 | **防投毒护栏** | 渲染出口统一清洗指令劫持文本为 `[sanitized-*]`，digest 整体包 `[memory data]` 数据框架；**存储原文不动**，可疑行由 `injection:` 警告点名 | 引擎自动 |
 | **可观测性** | `status` 返回一句话 `health` + 深度诊断（嵌入器类型/维度、向量维度直方图、`dimMismatch`、阈值、访问统计）。0.3.0 新增：`path_rule`（本 agent 的库文件名是怎么来的）、`sibling_stores`（同目录每个 `.db` 各有多少行）、`coverage`（本进程召回门槛开合了几次、几次什么都没放行）；`health` 第一判据改成"本库空、隔壁满" | 怀疑召回坏了时 |
 | **间隔重复** | 复述 / 召回按距上次访问的间隔对数加权强化；`importance` 可显式声明 | 引擎自动 |
-| **GUI 设置卡片** | 设置 → 插件 → 插件配置 → HippoMemory 记忆 | 随时开关、调参 |
+| **GUI 设置页** | 插件 → dsh-hippo-memory → hippo-memory 行 | 随时开关、调参 |
 
 ---
 
@@ -45,7 +46,7 @@ dsh plugin --profile web update dsh-hippo-memory
 dsh web
 ```
 
-装完打开 **设置 → 插件 → 插件配置**，应能看到 HippoMemory 记忆 卡片（默认启用）。
+装完打开 **插件 → dsh-hippo-memory → hippo-memory 行**，应能看到它的配置页（默认启用）。
 
 > 其它 profile 把 `web` 换成对应名字（如 `headless`）。升级 0.2.0 是**数据零迁移**：旧记忆库照常读取，新字段只对新写入生效。
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## [未发布] — 适配 DSH 0.1.7 配置接口（破坏性宿主版本）
+
+0.1.7 删掉了 `settings.register()` 与客户端的 `settingsScope`，本插件在旧接口上会**整机启动失败**（`TypeError: settings.register is not a function`），四个 `memory_*` 工具全部消失。本版迁到宿主新配置面，并把"配置层不得拖垮挂载"钉成测试。
+
+### Changed — 宿主半侧改用 volatile Config
+
+- 不再注册 `hippo-memory` settings 命名空间：改为导出 `Config = z.object({...})`，五个字段全部 `.volatile()`。命名空间由 profile 条目 id（`hippo-memory`）推导，插件自身不注册任何东西。
+- 生效配置从 Loader 交来的引用 `config.<field>.get()` 现读；**引用缺失或宿主给的是裸值时回落到 schema 自己的 `meta.default`**，不再抛错。默认值只写在 schema 一处，插件与配置面不可能各说一套。
+- 热更新改用 `ctx.on('loader/volatile-update')`，替换原 `sectionScope.watch()`。监听器在 `stores` / `lastSig` / `setEnabled` 等状态声明**之后**才注册：cordis 的 emit 是同步的，挂载期间到达的更新若早于状态初始化会踩 temporal dead zone 而中止整个插件。
+- 浏览器半侧改用 `ctx.configForms.get('hippo-memory')` + `ctx.configForms.whileServed(...)`，配置页槽位从 `settings.plugin.item` 换成插件页的 `plugins.row.config`（key `dsh-hippo-memory#hippo-memory`）。
+- 配置页现在是**进入即展开**：宿主按 `view: 'summary'` / `view: 'page'` 各渲染一次，一行摘要里不允许出现控件，故原来的手风琴卡片头/箭头删除，摘要只剩一句话。保存仍是一次带 revision 围栏的 `mutate(ops, expectedRevision)`；围栏取"本批第一处草稿落定时"的 revision（表单激活早于首次 describe，构造期读到的是 `undefined`）；被拒绝的写入保留草稿，不吞掉用户输入。
+- `engines.dsh` 从 `>=0.1.1-rc.1` 提到 `>=0.1.7-0`（`.volatile()` 在更早的 schemastery 上不存在；`-0` 让 0.1.7 的 prerelease 也算满足）。删除两个宿主已不再提供的 `require`（`@deepseek-ai/cordis`、`@deepseek-ai/dsh-client-store`）。
+- GUI 入口从「设置 → 插件 → 插件配置」移到「插件 → dsh-hippo-memory 包 → hippo-memory 行」。
+
+### Tests
+
+- 新增 `test/host-config.test.mjs`（8 项）与 `test/browser-card.test.mjs`（9 项），`test/fake-host.mjs` 提供 Loader 引用假件。本机读数：本包 52 项全绿（`npm test`），仓库 232 项全绿；`dsh --profile web` 启动无本插件报错、`dsh-hippo-memory/client.js` 进入浏览器 bundle 清单。**真实对话与配置页保存待人工验证。**
+
 ## [0.3.0] — 2026-09-20（需要引擎 `hippo-memory-core@^0.3.0`）
 
 ### Added — 前提作用域透传到工具面
