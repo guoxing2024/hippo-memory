@@ -1,7 +1,7 @@
 # 🧠 HippoMemory —— 给 DSH Agent 装上"海马体"
 
 > 一句话：**让 DeepSeek Runtime 的 agent 拥有跨会话、跨重启的长期记忆，长会话不再忘事、不再幻觉。**
-> 当前版本：引擎 `hippo-memory-core` 0.2.1 ｜ DSH 插件 `dsh-hippo-memory` 0.2.1 ｜ opencode 插件 `opencode-hippo-memory` 0.2.2（2026-09-18）
+> 当前版本：引擎 `hippo-memory-core` 0.3.0 ｜ DSH 插件 `dsh-hippo-memory` 0.3.1（**需宿主 DSH ≥ 0.1.7**）｜ opencode 插件 `opencode-hippo-memory` 0.3.0（2026-09-25）
 
 ## 为什么你需要它？
 
@@ -35,10 +35,10 @@ dsh web
 | 🔒 纯本地 | SQLite 存储（`~/.dsh/storages/hippo-memory/`），**零外部服务、零网络请求**，数据自己掌控 |
 | ♻️ 纠错链 | 用户纠正时旧记忆自动版本化存档，永不覆盖丢历史；也可用 `supersedes` 显式点名退役错误条目 |
 | 🔍 召回可解释 | 每个命中给三个分数（原始余弦 / 排序分 / 本次相对分）；**查不到时说明原因**并列出最接近的几条 |
-| 🧩 前提作用域（待发布） | 结论可带 `scope`（`population=… ; comparator=…`）声明"在什么条件下成立"；换口径的重测**各存各的不覆盖**，`memory_verify` 会答 `OUT_OF_SCOPE` 而不是把旧口径的答案盖到新问题上 |
+| 🧩 前提作用域 | 结论可带 `scope`（`population=… ; comparator=…`）声明"在什么条件下成立"；换口径的重测**各存各的不覆盖**，`memory_verify` 会答 `OUT_OF_SCOPE` 而不是把旧口径的答案盖到新问题上 |
 | ✅ 证据与前瞻 | 需要复跑的结论可带 `verify_cmd`（渲染标 `[VERIFIED]`）；"以后遇到 X 要先做 Y"可注册为 `[GUARD]` |
-| 🧹 重复与审计 | `duplicates` 只读列出重复重述（每组带 `mixedPremises`：两种前提下的同一句话不是重复）；`merge`（待发布）把确认过的一组**折叠**成一条，多余行仍在库里、`undemote` 可恢复，不必用会连历史一起删的 `delete`；`override-audit` 筛出可疑覆盖。先看再动，不会自动改你的数据 |
-| 🚪 空结果不再同形（待发布） | 召回全部低于门槛时端出最接近的那条并标明 `[low-confidence … not a memory]`；`status` 看得见同目录隔壁的库文件，"没记住"与"记在另一个文件"从此不是一句话 |
+| 🧹 重复与审计 | `duplicates` 只读列出重复重述（每组带 `mixedPremises`：两种前提下的同一句话不是重复）；`merge` 把确认过的一组**折叠**成一条，多余行仍在库里、`undemote` 可恢复，不必用会连历史一起删的 `delete`；`override-audit` 筛出可疑覆盖。先看再动，不会自动改你的数据 |
+| 🚪 空结果不再同形 | 召回全部低于门槛时端出最接近的那条并标明 `[low-confidence … not a memory]`；`status` 看得见同目录隔壁的库文件，"没记住"与"记在另一个文件"从此不是一句话 |
 | 🛡 防投毒 | 记忆里混入 ignore-all-previous-instructions 类劫持文本时，渲染出口统一清洗 + 数据框架隔离，可疑行点名待审 |
 | ⏳ 间隔重复 | 复述 / 召回按"距上次访问的间隔"对数加权强化（集中重复几乎无增益）；`importance` 可显式声明 |
 

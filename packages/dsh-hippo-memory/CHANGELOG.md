@@ -1,6 +1,6 @@
 # Changelog
 
-## [未发布] — 适配 DSH 0.1.7 配置接口（破坏性宿主版本）
+## [0.3.1] — 2026-09-25 — 适配 DSH 0.1.7 配置接口（破坏性宿主版本）
 
 0.1.7 删掉了 `settings.register()` 与客户端的 `settingsScope`，本插件在旧接口上会**整机启动失败**（`TypeError: settings.register is not a function`），四个 `memory_*` 工具全部消失。本版迁到宿主新配置面，并把"配置层不得拖垮挂载"钉成测试。
 
@@ -16,7 +16,9 @@
 
 ### Tests
 
-- 新增 `test/host-config.test.mjs`（8 项）与 `test/browser-card.test.mjs`（9 项），`test/fake-host.mjs` 提供 Loader 引用假件。本机读数：本包 52 项全绿（`npm test`），仓库 232 项全绿；`dsh --profile web` 启动无本插件报错、`dsh-hippo-memory/client.js` 进入浏览器 bundle 清单。**真实对话与配置页保存待人工验证。**
+- 新增 `test/host-config.test.mjs`（8 项）与 `test/browser-card.test.mjs`（10 项，含一条把 `cordis.patch.yml` 的行 id 钉在 `ENTRY_ID`/`SLOT_KEY` 上的耦合检查），`test/fake-host.mjs` 提供 Loader 引用假件。本机读数：本包 53 项全绿（35 + 10 + 8，`npm test`），仓库 233 项全绿（引擎 163 + 本包 53 + opencode 17）；`dsh --profile web` 启动无本插件报错、`dsh-hippo-memory/client.js` 进入浏览器 bundle 清单，被服务的那份 bundle 含 `configForms` / `plugins.row.config` 且 `settingsScope` 为零。**真实对话与配置页保存待人工验证。**
+
+> 本版只发 DSH 适配层：引擎 `hippo-memory-core` 与 `opencode-hippo-memory` 停在 0.3.0，依赖下限仍是 `hippo-memory-core@^0.3.0`（无引擎改动，故不连带跳号）。
 
 ## [0.3.0] — 2026-09-20（需要引擎 `hippo-memory-core@^0.3.0`）
 

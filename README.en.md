@@ -16,15 +16,15 @@ Local-first, zero external services: SQLite via Node's built-in `node:sqlite`, o
 
 | Package | What | Install |
 |---|---|---|
-| **dsh-hippo-memory** | DSH plugin — memory tools, automatic digest injection, usage guidance, GUI settings card | `dsh plugin --profile web add dsh-hippo-memory` |
+| **dsh-hippo-memory** | DSH plugin — memory tools, automatic digest injection, usage guidance, GUI settings page (host DSH ≥ 0.1.7) | `dsh plugin --profile web add dsh-hippo-memory` |
 | **opencode-hippo-memory** | opencode plugin — same 4 memory tools + per-turn digest, compression survives | `opencode plugin -g opencode-hippo-memory` |
 | **hippo-memory-core** | Framework-agnostic engine (use in any agent loop) | `npm install hippo-memory-core` |
 
-Adapters and engine are all at **0.3.0** (defined but not yet published to npm; 0.2.x on npm lacks the 0.3.0 interfaces). Engine **0.2.1** added **Bun support**: the SQLite driver is detected at load time (`node:sqlite` on Node, `bun:sqlite` on Bun), so `hippo-memory-core` imports and runs inside Bun hosts such as **opencode** (verified on opencode 1.18.31 / Bun 1.3.14: remember, recall, verify, digest and diagnostics all work — no bundling, no shims). `sqliteDriver` tells you which driver is active; `setSqliteDriver()` lets you plug your own. Upgrade: `dsh plugin --profile <profile> update dsh-hippo-memory`, then restart the profile. Stores need **no migration**.
+The engine and the opencode adapter are at **0.3.0**, the DSH adapter at **0.3.1** — all published to npm. `dsh-hippo-memory@0.3.1` requires **host DSH ≥ 0.1.7** (that release exists solely to follow 0.1.7's new configuration surface); stay on `0.3.0` for an older host. Engine **0.2.1** added **Bun support**: the SQLite driver is detected at load time (`node:sqlite` on Node, `bun:sqlite` on Bun), so `hippo-memory-core` imports and runs inside Bun hosts such as **opencode** (verified on opencode 1.18.31 / Bun 1.3.14: remember, recall, verify, digest and diagnostics all work — no bundling, no shims). `sqliteDriver` tells you which driver is active; `setSqliteDriver()` lets you plug your own. Upgrade: `dsh plugin --profile <profile> update dsh-hippo-memory`, then restart the profile. Stores need **no migration**.
 
 ⚠️ After installing an adapter, **restart the host and verify by side effect** (does a `.db` appear in the store directory after one turn?) rather than by config echo: `opencode debug info` only prints configuration, and a failed plugin load can leave zero log lines behind.
 
-## 🆕 0.3.0 (defined, not yet published to npm) — premise scope, duplicate merge, low-confidence fallback, sibling stores visible, fuzzy false-positive fix
+## 🆕 0.3.0 (published to npm, 2026-09-20) — premise scope, duplicate merge, low-confidence fallback, sibling stores visible, fuzzy false-positive fix
 
 Five changes from one piece of field feedback, all on one theme: **separating "looks like there is nothing" from "that is not what happened"**.
 
@@ -34,14 +34,14 @@ Five changes from one piece of field feedback, all on one theme: **separating "l
 - **④ `status` can see the other store** — DSH shards by agent id, opencode by project directory, which makes "was never stored" and "was stored in a different file" render identically. `diagnostics()` now returns `sibling_stores` (every `.db` in the directory: rows, demoted, last write, which one answered) plus `scope_rule` (the contract lives in the engine once); each adapter's `status` adds its own host `path_rule`, and `health` checks "empty here, full next door" first.
 - **⑤ Fuzzy archived-match false positive fixed + adapter pass-through** — `sourceMonitor`'s fuzzy archived-revision matcher used to admit rows on cosine alone, so an unrelated subject that merely shared wording with the claim and had flipped its own value would land in `superseded_matches` and wrongly set `contested` / `stale_support`. It now requires the archived row to share an entity with the support row (unless it *is* the support row); the exact-restatement tier is unaffected. Adapters also gained: `memory_recall` forwards `scope` and returns `scopeExcluded`; `memory_remember` echoes `verify_result` / `verified_at`.
 
-Engine + both adapters + docs are ready (**215 tests green**: 163 engine + 35 DSH + 17 opencode); version is **0.3.0**, but **not committed and not yet published to npm** (additive schema change). Details: [CHANGELOG.md](CHANGELOG.md).
+Engine + both adapters + docs shipped as **0.3.0** (**215 tests green** at that release: 163 engine + 35 DSH + 17 opencode; additive schema change). Details: [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start (DSH)
 
 ```bash
 dsh plugin --profile web add dsh-hippo-memory
 dsh web
-# Settings → Plugins → Plugin settings → HippoMemory (enabled by default)
+# Plugins → dsh-hippo-memory → the hippo-memory row (enabled by default; needs host DSH ≥ 0.1.7)
 ```
 
 Agents get 4 tools — `memory_remember`, `memory_recall`, `memory_verify`, `memory_maintain` — plus a per-turn `[hippo-memory digest]` that injects only the memories relevant to the current cue (~20–40 tok each; 0 when the store genuinely has nothing for this cue).
@@ -102,7 +102,7 @@ mem.diagnostics().coverage;         // { turns, misses, guesses, scope: 'process
 
 `v.substantiated ? 'safe to assert' : 'answer: not in my memory'`
 
-Runtime: Node ≥ 22.5 (`node:sqlite`) **or** Bun (`bun:sqlite`) — the driver is auto-detected at load time, so the same package also runs inside Bun hosts such as **opencode**. Tests: `npm test` (**163 engine + 35 DSH + 17 opencode = 215**, all green). Bench: `npm run bench`.
+Runtime: Node ≥ 22.5 (`node:sqlite`) **or** Bun (`bun:sqlite`) — the driver is auto-detected at load time, so the same package also runs inside Bun hosts such as **opencode**. Tests: `npm test` (**163 engine + 53 DSH + 17 opencode = 233**, all green). Bench: `npm run bench`.
 
 ## Roadmap & issues
 

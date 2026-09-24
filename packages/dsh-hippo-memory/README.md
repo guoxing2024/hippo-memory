@@ -11,7 +11,7 @@
 > ⚠️ 本包是 **DSH 专属**适配层，**不能在 opencode 等其它宿主里安装**。引擎 `hippo-memory-core` 自 0.2.1 起可在 Bun 上运行（opencode 用 Bun）；面向 opencode 的适配包 `opencode-hippo-memory` 已发布（同在本仓库 `packages/` 下）。
 > ⚠️ 配置面（GUI 那一页）要求宿主 **DSH ≥ 0.1.7**：0.1.7 起插件导出 volatile `Config`、浏览器半侧走 `ctx.configForms` 注册到插件页的 `plugins.row.config`，旧的 `settings.register()` / `settingsScope` / `settings.plugin.item` 已全部删除。四个记忆工具本身不依赖配置面。
 >
-> 当前版本：**0.3.0**（与引擎 `hippo-memory-core@0.3.0` 同步；适配 0.1.7 宿主的那批改动尚未发号）。详细使用说明见 [完整中文使用说明](https://github.com/guoxing2024/hippo-memory/blob/master/docs/USER-GUIDE.zh-CN.md)。
+> 当前版本：**0.3.1**（DSH 适配层单发；引擎 `hippo-memory-core` 与 `opencode-hippo-memory` 仍在 0.3.0，本包的依赖下限未变）。这一版全部内容是"跟上 DSH 0.1.7 的配置接口"——**宿主不到 0.1.7 请停在 0.3.0**（`dsh plugin --profile web add dsh-hippo-memory@0.3.0`）。详细使用说明见 [完整中文使用说明](https://github.com/guoxing2024/hippo-memory/blob/master/docs/USER-GUIDE.zh-CN.md)。
 
 ---
 

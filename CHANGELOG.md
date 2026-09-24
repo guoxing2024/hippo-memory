@@ -1,5 +1,7 @@
 # Changelog
 
+> 2026-09-25：`dsh-hippo-memory` 单独发到 **0.3.1**（跟上宿主 DSH 0.1.7 的配置接口）。本文件记的是引擎版本线，引擎 `hippo-memory-core` 与 `opencode-hippo-memory` 都**没有跳号**，仍在 0.3.0 —— 所以这里没有 `[0.3.1]` 一节，改动明细见 [packages/dsh-hippo-memory/CHANGELOG.md](packages/dsh-hippo-memory/CHANGELOG.md)。
+
 ## [0.3.0] — 2026-09-20
 
 ### Added — 第二轮专家审计落地（信任分级 / 三态裁决 / LLM 巩固钩子 / 遗忘保护 / scope 读取过滤）
