@@ -1,7 +1,7 @@
 # 🧠 HippoMemory —— 给 DSH Agent 装上"海马体"
 
 > 一句话：**让 DeepSeek Runtime 的 agent 拥有跨会话、跨重启的长期记忆，长会话不再忘事、不再幻觉。**
-> 当前版本：引擎 `hippo-memory-core` 0.3.2 ｜ DSH 插件 `dsh-hippo-memory` 0.3.2（**需宿主 DSH ≥ 0.1.7**）｜ opencode 插件 `opencode-hippo-memory` 0.3.2（2026-09-25，**本地全绿、npm 未发布**；上一发布线为 0.3.0 / DSH 0.3.1）
+> 当前版本：引擎 `hippo-memory-core` 0.3.2 ｜ DSH 插件 `dsh-hippo-memory` 0.3.2（**需宿主 DSH ≥ 0.1.7**）｜ opencode 插件 `opencode-hippo-memory` 0.3.2（批次 2026-09-25，**已于 2026-10-06 发布 npm**；上一发布线为 0.3.0 / DSH 0.3.1）
 
 ## 为什么你需要它？
 

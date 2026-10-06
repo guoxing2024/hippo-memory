@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.3.2] — 2026-09-25 — `memory_verify` 的返回值补上两种"不是 yes"（需要引擎 `hippo-memory-core@^0.3.2`）
+## [0.3.2] — 2026-09-25（批次日期）／ **2026-10-06 发布 npm** — `memory_verify` 的返回值补上两种"不是 yes"（需要引擎 `hippo-memory-core@^0.3.2`）
 
 与 DSH 适配层同构的一版：把引擎侧 `verify` 的契约订正透传给模型。**yes 现在需要锚**，`OUT_OF_SCOPE` 现在会点名否决它的那条前提；缺陷本体、根因与修都在引擎，见根 [CHANGELOG.md](../../CHANGELOG.md) 的 `[0.3.2]`。
 

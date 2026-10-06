@@ -1,7 +1,7 @@
 # 🧠 HippoMemory 使用说明（完整版）
 
 > 适用插件：**dsh-hippo-memory 0.3.2** ｜ 核心引擎：**hippo-memory-core 0.3.2** ｜ opencode 用户见 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md)（0.3.2） ｜ 更新：2026-09-25
-> 本文覆盖 **0.3.0** 的五组改动（前提作用域 `scope` + recall 硬过滤、重复合并 `merge`、门槛未过的兜底提示、库分裂可见、fuzzy 归档误报订正 + 适配层透传补齐），相关小节标有"0.3.0"；另覆盖 **0.3.2** 的 `memory_verify` 契约订正（**yes 与矛盾两条出口都要锚**、中文值冲突不再被盖章、前提冲突的行可跨支持位否决），相关小节标有"0.3.2"，见 [7.3](#73-memory_verify--断言前查证) 与 [9.13](#913-verify-的-yes-需要什么032)。**0.3.2 本批在本地全绿、npm 尚未发布**（上一发布线：引擎与 opencode 0.3.0、DSH 适配层 0.3.1）；对照 [CHANGELOG](../CHANGELOG.md)。
+> 本文覆盖 **0.3.0** 的五组改动（前提作用域 `scope` + recall 硬过滤、重复合并 `merge`、门槛未过的兜底提示、库分裂可见、fuzzy 归档误报订正 + 适配层透传补齐），相关小节标有"0.3.0"；另覆盖 **0.3.2** 的 `memory_verify` 契约订正（**yes 与矛盾两条出口都要锚**、中文值冲突不再被盖章、前提冲突的行可跨支持位否决），相关小节标有"0.3.2"，见 [7.3](#73-memory_verify--断言前查证) 与 [9.13](#913-verify-的-yes-需要什么032)。**0.3.2 三枚包已于 2026-10-06 发布 npm**（引擎 + DSH 适配层 + opencode 适配层，`latest` 同步；上一发布线：引擎与 opencode 0.3.0、DSH 适配层 0.3.1）；对照 [CHANGELOG](../CHANGELOG.md)。
 > 本文写给使用的人：不写代码也能照做。想了解设计原理请看 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 目录

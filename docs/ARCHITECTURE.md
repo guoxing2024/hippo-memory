@@ -1,7 +1,7 @@
 # HippoMemory 架构：受海马体启发的 Agent 长时记忆
 
 > 为什么线性上下文会让 Agent 的记忆混乱，以及本插件如何用人脑的分层方案根治它。
-> 版本：引擎 `hippo-memory-core` 0.3.2 / 适配层 `dsh-hippo-memory` 0.3.2、`opencode-hippo-memory` 0.3.2（0.3.2 本批本地全绿、npm 未发布；上一发布线 0.3.0 + DSH 0.3.1）
+> 版本：引擎 `hippo-memory-core` 0.3.2 / 适配层 `dsh-hippo-memory` 0.3.2、`opencode-hippo-memory` 0.3.2（三枚已于 **2026-10-06 发布 npm**，`latest` 同步；上一发布线 0.3.0 + DSH 0.3.1）
 
 ---
 

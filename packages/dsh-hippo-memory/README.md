@@ -11,7 +11,7 @@
 > ⚠️ 本包是 **DSH 专属**适配层，**不能在 opencode 等其它宿主里安装**。引擎 `hippo-memory-core` 自 0.2.1 起可在 Bun 上运行（opencode 用 Bun）；面向 opencode 的适配包 `opencode-hippo-memory` 已发布（同在本仓库 `packages/` 下）。
 > ⚠️ 配置面（GUI 那一页）要求宿主 **DSH ≥ 0.1.7**：0.1.7 起插件导出 volatile `Config`、浏览器半侧走 `ctx.configForms` 注册到插件页的 `plugins.row.config`，旧的 `settings.register()` / `settingsScope` / `settings.plugin.item` 已全部删除。四个记忆工具本身不依赖配置面。
 >
-> 当前版本：**0.3.2**（**本地全绿、npm 未发布**；需要引擎 `hippo-memory-core@^0.3.2`——本版转发了引擎对 `memory_verify` 的契约订正：**两条出口都要锚**，只有"有锚"的匹配才算支持、也只有"有锚"的反证才算矛盾（含中文的值冲突），前提冲突的行即使没抢到支持位也能否决。上一发布线：本包 0.3.1 / 引擎与 opencode 0.3.0）。**宿主不到 DSH 0.1.7 请停在 0.3.0**（`dsh plugin --profile web add dsh-hippo-memory@0.3.0`）。详细使用说明见 [完整中文使用说明](https://github.com/guoxing2024/hippo-memory/blob/master/docs/USER-GUIDE.zh-CN.md)。
+> 当前版本：**0.3.2**（**已发布 npm 2026-10-06**；需要引擎 `hippo-memory-core@^0.3.2`——本版转发了引擎对 `memory_verify` 的契约订正：**两条出口都要锚**，只有"有锚"的匹配才算支持、也只有"有锚"的反证才算矛盾（含中文的值冲突），前提冲突的行即使没抢到支持位也能否决。上一发布线：本包 0.3.1 / 引擎与 opencode 0.3.0）。**宿主不到 DSH 0.1.7 请停在 0.3.0**（`dsh plugin --profile web add dsh-hippo-memory@0.3.0`）。详细使用说明见 [完整中文使用说明](https://github.com/guoxing2024/hippo-memory/blob/master/docs/USER-GUIDE.zh-CN.md)。
 
 ---
 
