@@ -50,7 +50,7 @@ import {
   nowIso
 } from './schema.js';
 import { SCOPE_RULE, SqliteStore, surveyStores, vecFromBlob, vecToBlob, type MemoryRow, type StoreSurveyEntry } from './sqlite.js';
-import { cosine, embedHashing } from './vectors.js';
+import { cosine, embedHashing, tokenize } from './vectors.js';
 import { dataFrame, rangeCheck, sanitizeMemoryText } from './guard.js';
 
 function tagList(tagsJson: string): string[] {
@@ -118,8 +118,74 @@ function evidenceStanding(row: {
 const VALUE_FILLER = new Set(['and', 'or', 'with', 'the', 'an', 'of', 'to', 'in', 'on', 'for', 'at', 'by', 'as', 'per']);
 
 /** Terms of a claim value (latin/digit runs whole, CJK per run), fillers dropped. */
-function valueTokens(s: string): Set<string> {
+function rawTokens(s: string): Set<string> {
   return new Set((s.toLowerCase().match(/[a-z0-9][a-z0-9._+-]*|[一-鿿]+/g) ?? []).filter((t) => !VALUE_FILLER.has(t)));
+}
+
+/** Terms of a claim value, stemmed for comparison (R9). */
+function valueTokens(s: string): Set<string> {
+  return new Set([...rawTokens(s)].map(stemToken));
+}
+
+/**
+ * Inflectional stem for comparison only (field report round 8): `run`/`runs`
+ * and `lane`/`lanes` read as two values without it — one lands WEAK_MATCH via
+ * the belt, the other CONTRADICTED — although neither moved the value. Only
+ * pure-letter tokens longer than three characters are touched, so every
+ * three-letter value the R7b floor admitted (`aws`, `red`, `hot`) and every
+ * filler is byte-identical before and after. The strip is purely formal, so it
+ * also joins pairs that are two values, not two spellings of one
+ * (`https`/`http` and kin, field report round 9) — those are suppressed by
+ * pair key in `NO_MERGE_PAIRS` below, which restores the clash instead of
+ * merging. Deliberately inflectional, not derivational:
+ * `app`/`application` (abbreviation) and `deploys`/`deployed` (voice, whose
+ * `ed` side is left alone) stay out — the first is synonymy, the second its
+ * own open item, and reaching for either reopens the lexicon direction.
+ */
+function stemToken(t: string): string {
+  if (!/^[a-z]+$/.test(t) || t.length <= 3) return t;
+  if (/(sses|xes|zzes|ches|shes)$/.test(t)) return t.slice(0, -2);
+  if (/ies$/.test(t)) return t.slice(0, -3) + 'y';
+  if (t.endsWith('s') && !t.endsWith('ss')) return t.slice(0, -1);
+  return t;
+}
+
+/**
+ * Pairs the stemmer must not merge (field report round 9): each pair is two
+ * values, not two spellings of one — the trailing-`s` strip joins them, so
+ * the merge is suppressed for exactly these pairs. Keyed by pair (sorted,
+ * lowercased), consulted only to *restore* a clash the stem would hide: a hit
+ * can only ever downgrade (belt) or refute (the parsed-value route, i.e. prev
+ * behavior), never certify, and a miss is today's behavior. `ws`/`wss` is
+ * deliberately absent — the 3-letter floor owns it, not the stem (ROADMAP).
+ */
+const NO_MERGE_PAIRS = new Set(
+  (
+    [
+      ['https', 'http'],
+      ['ftps', 'ftp'],
+      ['smtps', 'smtp'],
+      ['imaps', 'imap'],
+      ['ldaps', 'ldap'],
+      ['amqps', 'amqp'],
+      ['news', 'new'],
+    ] as [string, string][]
+  ).map(([x, y]) => (x < y ? `${x} ${y}` : `${y} ${x}`)),
+);
+
+/** A listed collision pair split across the two sides restores the clash. */
+function unmergedPair(a: string, b: string): boolean {
+  const ra = rawTokens(a);
+  const rb = rawTokens(b);
+  if (ra.size === 0 || rb.size === 0) return false;
+  for (const x of ra) {
+    if (rb.has(x)) continue;
+    for (const y of rb) {
+      if (ra.has(y)) continue;
+      if (NO_MERGE_PAIRS.has(x < y ? `${x} ${y}` : `${y} ${x}`)) return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -136,6 +202,7 @@ function valueTokens(s: string): Set<string> {
  */
 function valueClash(a: string, b: string): boolean {
   if (a === b) return false;
+  if (unmergedPair(a, b)) return true;
   const sa = valueTokens(a);
   const sb = valueTokens(b);
   if (sa.size === 0 || sb.size === 0) return false; // nothing to compare
@@ -148,7 +215,361 @@ function valueClash(a: string, b: string): boolean {
   return union > 0 && inter / union < 0.5;
 }
 
+/** Characters two texts agree on before they diverge (both already normalized). */
+function sharedPrefix(a: string, b: string): string {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a[i] === b[i]) i++;
+  return a.slice(0, i);
+}
+
+/** How much real text a shared prefix carries — spaces prove nothing. */
+function contentChars(s: string): number {
+  return s.replace(/\s+/g, '').length;
+}
+
+/**
+ * The connective a one-sided tail inherits from the OTHER side's phrasing —
+ * `…副本数 是 99` / `…副本数 配置为 99` against a row written `…副本数 -> 3`.
+ * Leaving it in the tail made `是` part of the value, so a claim that dropped a
+ * clause ("300 秒" against "300 秒，最多 3 个分片") lost the containment test that
+ * marks a refinement and was read as a clash. The stub before the connective is
+ * bounded: the value must be what the sentence turns on, not the whole tail.
+ */
+const TAIL_COPULA_RE = /^\D{0,8}?(?:是|为|等于|系|->|=>|[:=：])\s*/;
+
+/**
+ * The value a text binds to an already-parsed subject, for the case where the
+ * parser read only ONE side. `claimParts` understands `主体 -> 值` and a table of
+ * English copulas; a Chinese claim ("…副本数是 99") against a stored arrow row
+ * ("…副本数 -> 3") parsed to null on the claim side, so the value comparison that
+ * protects the `主体 -> 值` contract was unreachable and the claim fell through to
+ * an anchor that similarity alone can satisfy (field report R1). Reading the
+ * subject out of the parse and taking whatever follows it in the other text
+ * keeps the comparison alive without teaching every prose path a Chinese
+ * copula table — a wrong split here can only ever downgrade a verdict.
+ */
+function tailForSubject(normalized: string, subject: string): string | null {
+  if (subject.length < 3) return null;
+  // Start of the text only: `which cluster was the deploy target before` names
+  // the subject too, and what follows it there is a question, not a value.
+  if (!normalized.startsWith(subject)) return null;
+  const tail = normalized.slice(subject.length).replace(TAIL_COPULA_RE, '').trim();
+  return tail ? tail : null;
+}
+
+/**
+ * A quantity stated on its own — `90 秒`, `-> 3`, `4GB` — with the number read as
+ * the value, not as a fragment of an identifier (`KAPPA-1`, `beta-2222`,
+ * `v1.2.0`). The stub before it stays short because the shape being looked for
+ * is "same wording, then the value": a number buried at the end of a long
+ * remainder is some other fact in a sentence that merely starts the same way.
+ *
+ * Sticky, not `^`-anchored: the number is looked for at the point where the two
+ * texts diverge, so the lookbehind still sees the character that precedes it
+ * there. Matching a slice instead cut `kappa-` off `KAPPA-1 record` and let the
+ * ticket number through as a value — the guard could no longer tell a divergence
+ * inside an identifier from one after a word (field report R3).
+ */
+const LEADING_QUANTITY_RE = /\D{0,12}?(?<![-\w.])(\d+(?:\.\d+)*)(?![\d.])/y;
+
+/** The quantity a text states at `at`, where two wordings stopped agreeing. */
+function quantityAt(text: string, at: number): string | undefined {
+  return quantitySpan(text, at)?.value;
+}
+
+/**
+ * The quantity a text states at `at`, plus where its digits begin. The veto's
+ * quantity exemption needs the span BETWEEN the swap and the number, not just
+ * the number — `m.index` is `at` (sticky), so the digits start after the stub.
+ */
+function quantitySpan(text: string, at: number): { value: string; start: number } | null {
+  LEADING_QUANTITY_RE.lastIndex = at;
+  const m = LEADING_QUANTITY_RE.exec(text);
+  if (!m?.[1]) return null;
+  return { value: m[1], start: m.index + m[0].length - m[1].length };
+}
+
+/**
+ * Words that join a separate constituent — `zone alpha and 30 slots` states
+ * a zone name AND a slot count, two parameters in one sentence. A number past
+ * one of these is another clause's value, not phrasing of the swapped word, so
+ * it must not trigger the quantity exemption (field reports R7a, #64).
+ * Checked on the whole span from the swap word to the digits: tokenizing
+ * splits on whitespace, so a boundary comma glues itself onto the swap token
+ * (`bravo,`), and only a span check sees it — checking past the token missed
+ * exactly that (`.hippo/r7-price-hash.txt`, comma row). A match strictly
+ * inside the swap word's own letters cannot fire: every entry needs a
+ * separator on both sides, and the single-character class names only clause
+ * punctuation. The set has two halves: coordinators (R7a) and thirteen
+ * prepositions (#64 census: 16/24 false yes → 1/24). `at` / `to` stay out —
+ * items 61/63 pin verb-rewordings through them — and so does the ambiguous
+ * `with`. The name is historical; the line is constituency, not word class.
+ */
+const COORDINATOR_RE = /(^|[\s,;])(and|or|for|in|on|by|from|near|per|under|over|of|upon|via|since)(?=[\s,;]|$)|[,;，、和与或]/;
+
+/** Whether the span from `from` to `to` crosses a clause boundary. A span that
+ * ends before it begins — the digits sit inside the swap word itself — crosses
+ * nothing and keeps the old reading. */
+function crossesCoordinator(text: string, from: number, to: number): boolean {
+  return to > from && COORDINATOR_RE.test(text.slice(from, to));
+}
+
+/**
+ * A value flip neither parser can see: two texts that agree word for word up to
+ * a number that differs — `probeC-gateway 超时设定为 30 秒` vs `…设定为 90 秒`. This
+ * needs no grammar and no language, only enough shared wording (4 content
+ * characters) to be about the same subject, and both sides stating a number.
+ */
+function numberFlip(claimNorm: string, storedNorm: string): { subject: string; stored: string; claimed: string } | null {
+  const prefix = sharedPrefix(claimNorm, storedNorm);
+  if (contentChars(prefix) < 4) return null;
+  const claimed = quantityAt(claimNorm, prefix.length);
+  const stored = quantityAt(storedNorm, prefix.length);
+  if (!claimed || !stored || claimed === stored) return null;
+  return { subject: prefix.trim(), stored, claimed };
+}
+
+const CJK_CHAR_RE = /[一-鿿]/;
+
+/**
+ * What can stand in front of a swap without being anything the sentence is about:
+ * the connectives, plus the article `a` that `VALUE_FILLER` deliberately leaves out.
+ * That set compares VALUES, and dropping `a` from it is what lets a single-letter
+ * enumerator value (`cluster a` vs `cluster b`) clash at all; a lone article in
+ * FRONT of a divergence cannot be the subject, so the slot test needs it.
+ */
+const NO_SUBJECT_HEAD = new Set([...VALUE_FILLER, 'a']);
+
+/** A run that can carry a value on its own, as opposed to a connective between words. */
+function isValueWord(t: string): boolean {
+  if (!t || VALUE_FILLER.has(t)) return false;
+  // Two CJK characters say as much as three Latin ones. The Latin floor used to
+  // be four, which made every three-letter value (`aws`, `red`, `hot`) invisible
+  // to the belt while the similarities certifying them kept climbing (field
+  // report R7b: `aws`→`gcp` certified in both spaces). At three, every one- and
+  // two-letter word is still out along with every filler; what the newly admitted
+  // three-letter verbs cost in over-blocking is measured on the short-word panel
+  // (.hippo/probe-r7-price.mjs, 24 rows: R7a/R7b wants plus price watches), not assumed.
+  return CJK_CHAR_RE.test(t) ? t.length >= 2 : t.length >= 3;
+}
+
+/**
+ * The reading `numberFlip` makes, for values that are not numbers: two texts built
+ * identically — same number of whitespace-separated runs, agreeing word for word
+ * except at ONE position — where what differs is a value, not a connective.
+ * Position is the entire test, which is what lets it see `staging` / `production`
+ * (field report V1) that the eight-word copula table in `claimParts` cannot: no
+ * verb list survives contact with real prose, and no wordlist of environment names
+ * would either, because the same shape with a nonsense word in the slot was
+ * certified just the same (.hippo/probe-position.mjs).
+ *
+ * Deliberately NOT wired into `valueFlip`, which hands out CONTRADICTED. A
+ * predicate can hold of several values at once — `commit A fixes the leak` does not
+ * refute `commit B fixes the leak` — so all this can honestly say is "not
+ * evidence", which is the verdict the anchor gate's belt produces.
+ *
+ * The first cut of this required 4 content characters before the swap, and field
+ * report V2a found the hole in it: `the primary handles writes` against `the
+ * standby handles writes` was sailed through by a 3-character prefix. That bar
+ * measured how far the divergence sat from the start of the sentence, which is not
+ * a property of the divergence at all — dropping it low enough to catch that shape
+ * would also newly over-block the `gto 内存上限设定为 4GB` rewrites, which today
+ * escape only because their prefix happens to be three characters long. What
+ * decides whether the trace still speaks to the claim is WHICH SLOT moved. Stripped
+ * of connectives, the words before the swap are a subject, and `nginx proxies every
+ * inbound request` against `haproxy proxies every inbound request` is two sentences
+ * about different things rather than one thing carrying a new value. Both readings
+ * veto the anchor; `subjectSwap` exists only so the note can say honestly what
+ * moved instead of asserting a shared subject that isn't there.
+ *
+ * `tokenize` keeps a CJK run whole, so a reworded Chinese predicate arrives as one
+ * differing token against an otherwise identical rest — which is exactly the shape
+ * of a value swap (field report V2b). The exemption is not a language rule: when
+ * both sides then state the SAME quantity at the divergence, the quantity is the
+ * shared content and the words around it are phrasing. A differing quantity belongs
+ * to `numberFlip`, not here. The boundary is `LEADING_QUANTITY_RE`'s forward budget of
+ * 12 non-digits, counted FROM THE SWAP WORD ITSELF and required on both sides, so a
+ * long value word spends the budget it is being read with: `capped near 30` (12) is
+ * exempt, `capped since 30` (13) and `configured at 30` (14) keep their veto.
+ *
+ * The number must also sit in the swap's own clause: a coordinator (`and`, `or`,
+ * a comma) between the swap word and the digits means the digits head another
+ * conjunct — `zone alpha and 30 slots` is a zone name AND a slot count — so the
+ * exemption does not fire however equal the numbers are (field report R7a).
+ */
+function wordFlip(
+  claim: string,
+  stored: string
+): { stored: string; claimed: string; subjectSwap: boolean } | null {
+  const claimNorm = normalizeText(stripAbstractPrefix(claim));
+  const storedNorm = normalizeText(stripAbstractPrefix(stored));
+  const a = claimNorm.split(' ');
+  const b = storedNorm.split(' ');
+  if (a.length !== b.length || a.length < 2) return null;
+  const at = a.findIndex((t, i) => t !== b[i]);
+  if (at < 0 || a.some((t, i) => i !== at && t !== b[i])) return null;
+  const claimed = a[at]!;
+  const storedWord = b[at]!;
+  if (!isValueWord(claimed) || !isValueWord(storedWord)) return null;
+  if (!valueClash(claimed, storedWord)) return null;
+  // `normalizeText` collapsed every run to a single space, so the offset of the
+  // swap is just the tokens before it, plus one space each.
+  const claimFrom = offsetOfToken(a, at);
+  const storedFrom = offsetOfToken(b, at);
+  const statedClaim = quantitySpan(claimNorm, claimFrom);
+  const statedStored = quantitySpan(storedNorm, storedFrom);
+  // Same number, same clause: the quantity is the shared content and the swap is
+  // phrasing. Past a coordinator the number belongs to another parameter, and in
+  // doubt the veto stands — the belt can only ever downgrade.
+  if (
+    statedClaim && statedStored && statedClaim.value === statedStored.value &&
+    !crossesCoordinator(claimNorm, claimFrom, statedClaim.start) &&
+    !crossesCoordinator(storedNorm, storedFrom, statedStored.start)
+  ) return null;
+  // An empty prefix and an article-only one say the same thing: nothing that a
+  // sentence could be ABOUT stands before the swap, so the slot that moved is the
+  // subject. `a` counts as an article here even though it is not a VALUE filler.
+  return { stored: storedWord, claimed, subjectSwap: b.slice(0, at).every((t) => NO_SUBJECT_HEAD.has(t)) };
+}
+
+/**
+ * The swap `wordFlip` cannot see (field report #65): both sides parse to the
+ * same subject with different value strings, but the values share no comparable
+ * terms — one side is a connective filler (`flag is on`: `on` is in
+ * `VALUE_FILLER`, so its token set is empty and `valueClash` stays silent).
+ * That silence is correct on the refutation path, but the anchor gate must not
+ * certify the pair on similarity either: the wording matches up to that one
+ * word, so what it shares is the shape of the sentence, not the value.
+ *
+ * The round-12 widening: the shipped belt only covered the gap where comparison
+ * is impossible (one side with nothing to compare). But a combination value
+ * (`currently on` vs `currently off`, `on duty` vs `off duty`,
+ * `with telemetry` vs `without telemetry`) keeps a comparable term on both
+ * sides, so the belt bailed and `valueClash` read containment as refinement —
+ * while the single differing slot is filler-vs-value, which is the swap, not
+ * agreement. The belt therefore reads the full token sequence, not the
+ * filtered set: one differing position where a connective stands against a
+ * value word (or a lone filler against a lone filler) is the same slot the
+ * shipped belt covered, with context around it.
+ *
+ * Two boundaries keep this from over-blocking. A refinement is not a swap: one
+ * side saying more about the same state in the same words in a row (`on` vs
+ * `on duty`, `a postgres` vs `postgres`) leaves by the subsequence exit — and
+ * that exit is token-ordered on purpose, so `with` vs `without` is a swap, not
+ * a prefix: raw-string containment is not token-safe. And when the swap joins
+ * two connectives inside a longer value (`red and blue` vs `red or blue`) no
+ * value moved, so the comparison routes keep it. Like every belt it can only
+ * ever downgrade, never certify or refute.
+ */
+function fillerSwap(
+  claim: string,
+  stored: string
+): { stored: string; claimed: string; positional: boolean } | null {
+  const a = claimParts(normalizeText(stripAbstractPrefix(claim)));
+  const b = claimParts(normalizeText(stripAbstractPrefix(stored)));
+  if (!a || !b || a.subject !== b.subject || a.value === b.value) return null;
+  const ta = seqTokens(a.value);
+  const tb = seqTokens(b.value);
+  if (ta.length === 0 || tb.length === 0) return null;
+  if (isStrictSubseq(ta, tb) || isStrictSubseq(tb, ta)) return null;
+  const at = ta.length === tb.length ? ta.findIndex((t, i) => t !== tb[i]) : -1;
+  if (at >= 0 && ta.every((t, i) => i === at || t === tb[i])) {
+    const xv = isValueWord(ta[at]!);
+    const yv = isValueWord(tb[at]!);
+    if (xv && yv) return null;
+    if (!xv && !yv && ta.length > 1) return null;
+    return { stored: b.value, claimed: a.value, positional: true };
+  }
+  // Different lengths or several swaps: comparison decides when it can (both
+  // sides have comparable terms); the belt covers only the gap where one side
+  // — or both — has nothing to compare.
+  if (valueTokens(a.value).size > 0 && valueTokens(b.value).size > 0) return null;
+  return { stored: b.value, claimed: a.value, positional: false };
+}
+
+/** Word runs of a value in order, fillers kept (cf. `rawTokens`, which drops them). */
+function seqTokens(s: string): string[] {
+  return s.toLowerCase().match(/[a-z0-9][a-z0-9._+-]*|[一-鿿]+/g) ?? [];
+}
+
+/**
+ * Is `sub` a strict contiguous run inside `full`? A refinement says more about
+ * the same state by adding words, never by swapping them — and contiguity is
+ * load-bearing: without it a dropped middle word would read as agreement.
+ */
+function isStrictSubseq(sub: string[], full: string[]): boolean {
+  if (sub.length === 0 || sub.length >= full.length) return false;
+  outer: for (let i = 0; i + sub.length <= full.length; i++) {
+    for (let j = 0; j < sub.length; j++) if (full[i + j] !== sub[j]) continue outer;
+    return true;
+  }
+  return false;
+}
+
+/** Where token `at` begins in a text whose tokens came from splitting on single spaces. */
+function offsetOfToken(tokens: string[], at: number): number {
+  let n = 0;
+  for (let i = 0; i < at; i++) n += tokens[i]!.length + 1;
+  return n;
+}
+
+/**
+ * Which value the claim and the closest trace disagree on, or null when they
+ * agree, refine each other, or cannot be lined up at all. Three routes, in
+ * descending confidence: both sides parse, one side parses and its subject is
+ * found in the other, and neither parses but the wording matches up to a number.
+ */
+function valueFlip(
+  claim: string,
+  stored: string
+): { subject: string; stored: string; claimed: string } | null {
+  const claimNorm = normalizeText(stripAbstractPrefix(claim));
+  const storedNorm = normalizeText(stripAbstractPrefix(stored));
+  const a = claimParts(claim);
+  const b = claimParts(stored);
+  if (a && b) {
+    if (a.subject === b.subject && valueClash(a.value, b.value)) return { subject: a.subject, stored: b.value, claimed: a.value };
+    return null;
+  }
+  if (!a && b) {
+    const tail = tailForSubject(claimNorm, b.subject);
+    if (tail && valueClash(tail, b.value)) return { subject: b.subject, stored: b.value, claimed: tail };
+    return null;
+  }
+  if (a && !b) {
+    const tail = tailForSubject(storedNorm, a.subject);
+    if (tail && valueClash(a.value, tail)) return { subject: a.subject, stored: tail, claimed: a.value };
+    return null;
+  }
+  return numberFlip(claimNorm, storedNorm);
+}
+
+/**
+ * Do these two texts talk about the same thing? Polarity is a statement ABOUT a
+ * subject, so a contradiction verdict needs one (field report R2): the negation
+ * branch used to compare polarities alone, and `NEGATION_RE`'s CJK arm matches
+ * a single character, so any stored row containing 不 refuted every unrelated
+ * negated claim that cleared the recall floor — `python is not a compiled
+ * language` came back CONTRADICTED against a row about service restarts.
+ * Structural evidence only, never prose similarity: an identifier, the same
+ * wording up to the flip, a parsed subject named by the other side, or the
+ * trace's own entity tag appearing in the claim.
+ */
+function polarityAnchored(claim: string, stored: string, entities: string[]): boolean {
+  if (literalOverlap(claim, stored) > 0) return true;
+  const claimNorm = normalizeText(stripAbstractPrefix(claim));
+  const storedNorm = normalizeText(stripAbstractPrefix(stored));
+  if (contentChars(sharedPrefix(claimNorm, storedNorm)) >= 4) return true;
+  const a = claimParts(claim);
+  const b = claimParts(stored);
+  if (a && storedNorm.includes(a.subject)) return true;
+  if (b && claimNorm.includes(b.subject)) return true;
+  return entities.some((e) => typeof e === 'string' && e.length >= 3 && claimNorm.includes(e.toLowerCase()));
+}
+
 function rowToMemory(row: MemoryRow, withEmbedding: boolean): StoredMemory {
+  const tags = JSON.parse(row.tags_json) as string[];
   return {
     id: row.id,
     version: row.version,
@@ -165,7 +586,10 @@ function rowToMemory(row: MemoryRow, withEmbedding: boolean): StoredMemory {
         : undefined,
     semantic: row.rule ? { rule: row.rule } : undefined,
     entities: JSON.parse(row.entities_json) as string[],
-    tags: JSON.parse(row.tags_json) as string[],
+    tags,
+    // F4: one meaning for `consolidated` — the tag consolidate() wrote, read
+    // back at the source so get/recall/list/digest/stats cannot disagree.
+    consolidated: tags.includes('consolidated'),
     occurredAt: row.occurred_at ?? undefined,
     source: row.source ?? undefined,
     verify: row.verify_json ? (JSON.parse(row.verify_json) as { cmd?: string; expect?: string; artifact?: string }) : undefined,
@@ -478,9 +902,9 @@ export class HippoMemory {
     // reported back, never overwritten (see the scope guard at branch 0).
     const scopeOnlyMatches: { id: string; summary: string; similarity: number; reason: string }[] = [];
     // Premise clash (scope field): rows this write must NOT fold into, because
-    // they state a different condition under a key both sides name. Collecting
-    // them keeps the skip visible instead of silent (same rule as the entity
-    // gate above).
+    // they state a different condition — a shared key holding another value, or
+    // an unkeyed premise naming another condition. Keeps the skip visible
+    // instead of silent (same rule as the entity gate above).
     const premiseClash = (rowScope: string | null | undefined): string[] => scopeDifferences(scope, rowScope);
     const premiseSkipped: { id: string; summary: string; keys: string[] }[] = [];
     const notePremiseSkip = (r: MemoryRow, keys: string[]): void => {
@@ -491,10 +915,37 @@ export class HippoMemory {
       if (seen) seen.keys = Array.from(new Set([...seen.keys, ...keys]));
       else premiseSkipped.push({ id: r.id, summary: sanitizeMemoryText(r.summary).slice(0, 60), keys });
     };
-    // A re-tell that supplies the premise the incumbent never stated fills it
-    // in; one that states nothing leaves the recorded premise alone (a
-    // premise-free echo must not erase what a row holds "under").
-    const premiseFill = (r: MemoryRow): { scope?: string } => (!r.scope && scope ? { scope } : {});
+    // G4 (round 28): a re-tell that SUPPLIES the premise the incumbent never stated is
+    // not a missing field to complete — it is a narrowing. `scope` decides whom a row
+    // speaks for: a premise-free row answers every caller (premiseFill used to be read as
+    // "补注条件", a kindness to the row), a keyed row answers one. Writing the caller's
+    // premise onto a premise-free row therefore takes a general statement out of the
+    // store, and it did so inside three rehearsal branches while returning `none` (twice)
+    // or `merge` — a state change reported as nothing happening. Measured on the installed
+    // bytes: 4 of 7 shapes narrowed this way and all 4 lost read coverage
+    // (`.hippo/probe-g4b-round28.txt`: verify under an unrelated premise went
+    // substantiated → OUT_OF_SCOPE across the write). The only thing that separated the
+    // destroyed row from a surviving pair was whether the caller re-typed the sentence
+    // verbatim, which is a wording accident, not a semantic rule.
+    //
+    // So the criterion is refused rather than filled, at ALL FOUR sites, by one
+    // predicate: G3's lesson is that a rule wired to one of its sites leaks at the others.
+    // The fourth is the similarity-driven override arm (`brink`, path-3): G4 wired the
+    // three rehearsal branches, R1 (round 30) hoisted the refusal above the same-value
+    // check in path-0, and re-running the reporter's OWN reproduction on that build
+    // (`.hippo/repro-r1r2r3-round30b-postfix.txt`) showed the write sliding past the keyed
+    // arm into path-3 and retiring the same premise-free row there (content-sim 0.90 +
+    // claim-sim 0.95). Three of four doors is the same leak G3 named, one door later.
+    // An intentional narrowing stays available — `supersedes:[id]`, or `update(id, {scope})`,
+    // which increments the version and archives the premise it replaced.
+    const narrowsPremiseFree = (rowScope: string | null | undefined): boolean => !rowScope && !!scope;
+    const premiseNarrowed: { id: string; summary: string }[] = [];
+    const notePremiseNarrow = (r: MemoryRow): void => {
+      if (!premiseNarrowed.some((p) => p.id === r.id)) {
+        premiseNarrowed.push({ id: r.id, summary: sanitizeMemoryText(r.summary).slice(0, 60) });
+      }
+    };
+
     const neighbours: WriteNeighbour[] = candidates
       .slice()
       .sort((a, b) => b.sim - a.sim)
@@ -515,7 +966,7 @@ export class HippoMemory {
         // benign re-tell of a fact that shares an entity.
         const rClaim = claimParts(r.summary);
         const isRehearsal =
-          normalizeText(stripAbstractPrefix(r.summary)) === normalizeText(stripAbstractPrefix(summary)) ||
+          isVerbatimRestatement(r.summary, summary) ||
           !!(newClaim && rClaim && rClaim.subject === newClaim.subject && rClaim.value === newClaim.value);
         const sameSubject = !!(newClaim && rClaim && rClaim.subject === newClaim.subject && rClaim.value !== newClaim.value);
         const sharedEntity = entities.length > 0 && this.entitiesOverlap(entities, JSON.parse(r.entities_json || '[]') as string[]);
@@ -638,6 +1089,27 @@ export class HippoMemory {
           });
           continue;
         }
+        // G4 (round 28) refused the narrowing of a premise-free incumbent, and R1
+        // (round 30) found the site it was missing: the refusal sat INSIDE the
+        // same-value branch below, so a keyed write whose value DIFFERS reached the
+        // `override` return without ever asking the question that protects the data.
+        // The question is "does the row already on file declare a premise?" — not "are
+        // the two writes verbatim identical". Measured on the installed bytes
+        // (`.hippo/repro-r1r2r3-round30b.txt`, R1a, identical in both embedding spaces):
+        // a premise-free "rate limit -> 1000 req/min" was retired by a `tenant=acme`
+        // write of "rate limit -> 100 req/min" with no `premise-narrowing:` note, one
+        // active row carrying a premise it never stated, and the general sentence
+        // unreachable to every caller afterwards (OUT_OF_SCOPE under another tenant,
+        // WEAK_MATCH under none). A value flip is the case that MOST needs both
+        // readings kept: the general one and the conditioned one.
+        //
+        // An incumbent that DOES state a premise is not narrowed by anything, so the
+        // version chain and the evidence shield below stay reachable for it — that is
+        // the guard test "a premise-free row is the only incumbent a narrowing refuses".
+        if (narrowsPremiseFree(r.scope)) {
+          notePremiseNarrow(r);
+          continue;
+        }
         let trigger: string | null = 'path-0 identical structured subject with shared entities';
         if (oldClaim.value === newClaim.value) {
           // Same value, but a DIFFERENT verbatim detail is new information,
@@ -663,7 +1135,7 @@ export class HippoMemory {
                     payload.verifyAttested !== undefined ? (payload.verifyAttested ? 1 : 0) : (r.verify_attested ?? 0)
                 }
               : {};
-          this.db.update({ ...r, ...premiseFill(r), ...carryVerify, importance: imp, updated_at: now });
+          this.db.update({ ...r, ...carryVerify, importance: imp, updated_at: now });
           return {
             outcome: 'none',
             memory: rowToMemory(this.db.getById(r.id)!, false),
@@ -740,38 +1212,46 @@ export class HippoMemory {
     //    collapsing it to `none` silently discards the new detail.
     const isRetell =
       closest !== undefined &&
-      normalizeText(stripAbstractPrefix(closest.r.summary)) === normalizeText(stripAbstractPrefix(summary)) &&
+      isVerbatimRestatement(closest.r.summary, summary) &&
       (payload.detail ?? '').trim() === (closest.r.detail ?? '').trim();
     const closestClash = premiseClash(closest?.r.scope);
     if (closest && isRetell && closestClash.length > 0) {
       notePremiseSkip(closest.r, closestClash);
     }
     if (closest && isRetell && closestClash.length === 0) {
-      const imp = Math.min(1, closest.r.importance + rehearsalBoost(closest.r.last_access_at, Date.parse(now)));
-      // A re-tell may carry fresh evidence the incumbent lacked ("this fact I
-      // logged earlier — I just ran the check and it passes"). Rehearsal keeps
-      // the row, but the evidence must land, or a later verify reads the row as
-      // unverified. Only upgrade: never let a bare re-tell erase a passing
-      // result already on the row.
-      const carryVerify =
-        payload.verifyResult !== undefined
-          ? {
-              verify_result: payload.verifyResult,
-              verified_at: payload.verifiedAt ?? (payload.verifyResult === 'pass' ? now : closest.r.verified_at),
-              verify_json: payload.verify !== undefined ? JSON.stringify(payload.verify) : closest.r.verify_json,
-              verify_attested:
-                payload.verifyAttested !== undefined ? (payload.verifyAttested ? 1 : 0) : (closest.r.verify_attested ?? 0)
-            }
-          : {};
-      this.db.update({ ...closest.r, ...premiseFill(closest.r), ...carryVerify, importance: imp, updated_at: now });
-      return {
-        outcome: 'none',
-        memory: rowToMemory(this.db.getById(closest.r.id)!, false),
-        neighbours,
-        scope_only_matches: scopeOnlyMatches,
-        ...(withNotes() ? { warning: withNotes() as string } : {}),
-        ...(suspectedConflict ? { suspected_conflict: true } : {})
-      };
+      // G4: the verbatim case is where the silent narrowing was cheapest — the incumbent
+      // matched character for character, so `none` looked obviously right, while the scope
+      // the row answers UNDER had just changed. Refuse it here and let the write land as
+      // its own trace; a premise-free re-tell (`scope` absent) still rehearses normally.
+      if (narrowsPremiseFree(closest.r.scope)) {
+        notePremiseNarrow(closest.r);
+      } else {
+        const imp = Math.min(1, closest.r.importance + rehearsalBoost(closest.r.last_access_at, Date.parse(now)));
+        // A re-tell may carry fresh evidence the incumbent lacked ("this fact I
+        // logged earlier — I just ran the check and it passes"). Rehearsal keeps
+        // the row, but the evidence must land, or a later verify reads the row as
+        // unverified. Only upgrade: never let a bare re-tell erase a passing
+        // result already on the row.
+        const carryVerify =
+          payload.verifyResult !== undefined
+            ? {
+                verify_result: payload.verifyResult,
+                verified_at: payload.verifiedAt ?? (payload.verifyResult === 'pass' ? now : closest.r.verified_at),
+                verify_json: payload.verify !== undefined ? JSON.stringify(payload.verify) : closest.r.verify_json,
+                verify_attested:
+                  payload.verifyAttested !== undefined ? (payload.verifyAttested ? 1 : 0) : (closest.r.verify_attested ?? 0)
+              }
+            : {};
+        this.db.update({ ...closest.r, ...carryVerify, importance: imp, updated_at: now });
+        return {
+          outcome: 'none',
+          memory: rowToMemory(this.db.getById(closest.r.id)!, false),
+          neighbours,
+          scope_only_matches: scopeOnlyMatches,
+          ...(withNotes() ? { warning: withNotes() as string } : {}),
+          ...(suspectedConflict ? { suspected_conflict: true } : {})
+        };
+      }
     }
 
     // 2. cross-kind merge: an episodic re-tell of an existing semantic rule.
@@ -790,20 +1270,24 @@ export class HippoMemory {
     //
     //    Retractions never merge (markers stay addressable on their own).
     if (kind === 'episode' && !isRetraction) {
-      const newBody = normalizeText(stripAbstractPrefix(summary));
       const newDetail = (payload.detail ?? '').trim();
       const newEnts = new Set(entities.map((e) => e.toLowerCase()));
       const nearSemantic = candidates.find((x) => {
         if (x.r.kind !== 'semantic') return false;
         if (premiseClash(x.r.scope).length > 0) return false;
-        if (normalizeText(stripAbstractPrefix(x.r.summary)) !== newBody) return false;
+        if (!isVerbatimRestatement(x.r.summary, summary)) return false;
         if (((x.r.detail ?? '') as string).trim() !== newDetail) return false;
         const rowEnts = JSON.parse(x.r.entities_json || '[]') as string[];
         return rowEnts.length === entities.length && rowEnts.every((e) => newEnts.has(e.toLowerCase()));
       });
-      if (nearSemantic) {
+      if (nearSemantic && narrowsPremiseFree(nearSemantic.r.scope)) {
+        // G4: the third door. This branch returns `merge` rather than `none`, so an
+        // assertion about the no-op label alone would leave it open — the rule is about
+        // the premise changing, not about which outcome word was attached to it.
+        notePremiseNarrow(nearSemantic.r);
+      } else if (nearSemantic) {
         const imp = Math.min(1, nearSemantic.r.importance + 0.01 + rehearsalBoost(nearSemantic.r.last_access_at, Date.parse(now)));
-        this.db.update({ ...nearSemantic.r, ...premiseFill(nearSemantic.r), importance: imp, updated_at: now });
+        this.db.update({ ...nearSemantic.r, importance: imp, updated_at: now });
         return {
           outcome: 'merge',
           memory: rowToMemory(this.db.getById(nearSemantic.r.id)!, false),
@@ -836,6 +1320,26 @@ export class HippoMemory {
     const closestClaim = closest ? claimParts(closest.r.summary) : null;
     const sameSubject = !!(newClaim && closestClaim && closestClaim.subject === newClaim.subject);
     const oppositePolarity = closest ? this.polarityOf(closest.r.summary) !== newNegated : false;
+    // R1 (round 30) — the SECOND retirement site, found by re-running the reporter's own
+    // reproduction against the build that fixed path-0 (`.hippo/repro-r1r2r3-round30b-postfix.txt`):
+    // the write no longer overrode through the keyed loop, fell through to here, and retired
+    // the same premise-free row on similarity alone (content-sim 0.90 + claim-sim 0.95, same
+    // structured subject, shared entities). `narrowsPremiseFree` asks the question that
+    // protects the data — "does the incumbent state no premise?" — and this arm never asked
+    // it. G3's lesson, restated: a rule wired to three of its four doors is not a rule.
+    //
+    // The evidence shield below is deliberately NOT given a turn to speak for this row. That
+    // is a placement decision, not a measurement: in the reproduction above the incumbent
+    // carries no standing evidence, so `shielded` is false and the shield never speaks. When
+    // a premise-free row DOES hold attested evidence, the two gates would both apply, and the
+    // shield's copy would explain the right outcome by the wrong reason ("not retired: its
+    // VERIFIED evidence stands") while pointing the caller at `supersedes` / a re-run — the
+    // wrong lever for a premise. Refusing first makes the premise note the one that speaks.
+    let narrowsIncumbent = false;
+    if (closest && narrowsPremiseFree(closest.r.scope)) {
+      narrowsIncumbent = true;
+      notePremiseNarrow(closest.r);
+    }
     // Path-3 side of the evidence shield (same rule as path-0, audit #5):
     // only ATTESTED fresh evidence blocks; a self-reported pass warns.
     const closestStanding = closest
@@ -843,6 +1347,7 @@ export class HippoMemory {
       : ('none' as const);
     if (
       closest &&
+      !narrowsIncumbent &&
       !isRetell &&
       !isRetraction &&
       !isRetractionRow(closest.r) &&
@@ -877,6 +1382,7 @@ export class HippoMemory {
     // clear the bar, or the write is kept as its own trace with a note.
     const brink =
       closest &&
+      !narrowsIncumbent &&
       !isRetell &&
       !isRetraction &&
       !isRetractionRow(closest.r) &&
@@ -984,7 +1490,19 @@ export class HippoMemory {
           `(${premiseSkipped.map((p) => `${p.id.slice(0, 8)} "${p.summary}"`).join('; ')}). ` +
           `The same sentence under a different condition is not a re-tell; pass the same scope to rehearse, or supersedes:[id] to retire it.`
         : undefined;
-    const notesWarning = withNotes(shielded, blockedWarning, withheldContradiction, premiseWarning);
+    // G4: the caller supplied a condition a premise-free row never carried. Refusing it
+    // means two rows where the old build kept one, so the pair has to explain itself —
+    // otherwise it reads as a failed update, which is exactly what `different-scope`
+    // above exists to prevent for the keyed case.
+    const narrowWarning =
+      premiseNarrowed.length > 0
+        ? `premise-narrowing: kept as its own trace — ${premiseNarrowed.length} row(s) state NO premise, and the scope of this write ` +
+          `(${JSON.stringify(scope)}) would replace that general statement rather than add to it ` +
+          `(${premiseNarrowed.map((p) => `${p.id.slice(0, 8)} "${p.summary}"`).join('; ')}). ` +
+          `The general row keeps answering callers outside that premise; to narrow one on purpose pass supersedes:[id], or update its ` +
+          `scope — both raise the version and archive what the row held before.`
+        : undefined;
+    const notesWarning = withNotes(shielded, blockedWarning, withheldContradiction, premiseWarning, narrowWarning);
     return {
       outcome: 'new',
       memory: rowToMemory(row, false),
@@ -1137,7 +1655,19 @@ export class HippoMemory {
         .sort((a, b) => (b.updated_at ?? '').localeCompare(a.updated_at ?? ''))
         .slice(0, Math.min(limit, 5));
       return {
-        hits: recent.map((r) => ({ ...rowToMemory(r, false), score: 0.5, similarity: 0.5, relativeScore: 1, consolidated: false })),
+        hits: recent.map((r) => {
+          const mem = rowToMemory(r, false);
+          return {
+            ...mem,
+            score: 0.5,
+            similarity: 0.5,
+            relativeScore: 1,
+            // No cue to anchor on: recency is the stated basis, not relevance.
+            anchors: ['recency'],
+            anchored: true,
+            consolidated: mem.consolidated === true
+          };
+        }),
         warnings: ['empty cue: showing recently updated memories'],
         scanned: 0,
         eligible: recent.length,
@@ -1215,13 +1745,20 @@ export class HippoMemory {
         continue;
       }
       const retr = retractions.get(mem.id);
+      const anchors = recallAnchors(q, mem);
       hits.push({
         ...mem,
         score: sim,
         similarity: sim,
         relativeScore: 0,
         literalMatch: literal || undefined,
-        consolidated: mem.kind === 'semantic',
+        // F4b: cosine says "nearby", never "this is the answer". Say which
+        // evidence ties the row to the cue, and say so when there is none.
+        anchors,
+        anchored: anchors.length > 0,
+        // The engine's marker, not a kind alias (F4): `hits` may not claim every
+        // semantic row is a consolidation product.
+        consolidated: mem.consolidated === true,
         ...(retr ? { retracted: retr } : {})
       });
     }
@@ -1405,7 +1942,7 @@ export class HippoMemory {
     return {
       hits: ranked,
       warnings: ranked.length === 0 && reason === 'below-threshold'
-        ? [...warnings, `no hit cleared the similarity floor ${minSim}; closest was ${bestSim.toFixed(3)} — see nearMisses`]
+        ? [...warnings, `no hit cleared the similarity floor ${minSim}; closest was ${belowFloor(bestSim, minSim)} — see nearMisses`]
         : warnings,
       scanned,
       eligible,
@@ -1727,25 +2264,47 @@ export class HippoMemory {
    * Report near-duplicate traces (read-only; never deletes).
    *
    * Duplicates accumulate from restatements that slip past the write-path
-   * merge: most commonly an episode and the semantic rule abstracted from it,
-   * where the rule carries a "FACT: " wrapper. Comparison strips that wrapper
-   * and ignores case/punctuation, so a cross-kind restatement is recognised.
-   * The write path now folds these automatically; this reports what is already
-   * stored so a caller can review before merging (`mergeDuplicates`) or
-   * deleting anything. Grouping is by TEXT, so a group can also hold two
-   * traces that state incompatible premises: `mixedPremises` marks the group
-   * when *any pair* in it disagrees, because those two rows are different facts
-   * rather than duplicates (the other rows in the same group may still be).
+   * merge, and they arrive through two channels, so the report has two:
+   *
+   *  - `by: 'text'` — an episode and the semantic rule abstracted from it,
+   *    where the rule carries a "FACT: " wrapper. Comparison strips that
+   *    wrapper and ignores case and whitespace, so a cross-kind restatement is
+   *    recognised. The write path now folds these automatically; this reports
+   *    what is already stored.
+   *  - `by: 'vector'` (F3, black-box report #1) — DIFFERENT wording of one
+   *    statement, at or above `nearDuplicateThreshold`. That bar is the
+   *    engine's own definition of "same statement" (recall surfaces such pairs
+   *    as `nearDuplicates`, `consolidate` refuses to re-fold them) and until
+   *    now the cleanup entry point was the one place that never consulted it:
+   *    measured on the report's shape, three paraphrases of one fact gave
+   *    `scanned=3 groupCount=0`, and `mergeDuplicates` then refused the ids.
+   *    Rows already inside a text group are excluded, so the two channels never
+   *    report the same pair twice; a paraphrase of a sentence that is itself
+   *    duplicated surfaces after that text group is merged.
+   *
+   * Cost: the vector channel compares the rows that carry a unique text,
+   * pairwise, once per call — O(k²) cosines on k singletons in a store of
+   * active, non-demoted rows (measured store in the field report: 58 rows).
+   *
+   * Grouping by text means a group can also hold two traces that state
+   * incompatible premises: `mixedPremises` marks the group when *any pair* in
+   * it disagrees, because those two rows are different facts rather than
+   * duplicates (the other rows in the same group may still be). `similarity` is
+   * the weakest measured link inside a vector group, and `null` for a text
+   * group, which asserts no measured score.
    */
   duplicates(): {
     groups: {
       key: string;
+      by: 'text' | 'vector';
+      similarity: number | null;
       mixedPremises: boolean;
       memories: { id: string; kind: MemoryKind; version: number; summary: string; scope: string | null }[];
     }[];
     scanned: number;
   } {
     const byKey = new Map<string, StoredMemory[]>();
+    const vectors = new Map<string, number[] | null>();
     for (const row of this.db.allActive()) {
       if (row.demoted === 1) continue; // folded detail is accounted for, not a stray duplicate
       const mem = rowToMemory(row, false);
@@ -1754,32 +2313,102 @@ export class HippoMemory {
       const list = byKey.get(key);
       if (list) list.push(mem);
       else byKey.set(key, [mem]);
+      vectors.set(mem.id, vecFromBlob(row.vec));
     }
-    const groups = [...byKey.entries()]
+    const view = (m: StoredMemory) => ({
+      id: m.id,
+      kind: m.kind,
+      version: m.version,
+      summary: m.summary,
+      scope: m.scope ?? null
+    });
+    // Any pair in the group stating a different premise makes it mixed — the
+    // same rule for both channels, since a near-duplicate pair under two
+    // conditions is two facts just as much as a verbatim pair is.
+    //
+    // G2 (round 28) adds the second reading of "different": one side states a condition
+    // and the other states none. `scopeDifferences` calls that pair undifferentiated, so
+    // the group used to be reported as tidy and a cleanup sweep would walk straight into
+    // the fold the merge gate now refuses. Report and refusal consult the same
+    // `premiseAgrees`, so they cannot disagree about whether the pair is one statement.
+    const anyPremiseClash = (sorted: StoredMemory[]): boolean => {
+      for (let i = 0; i < sorted.length; i++) {
+        for (let j = i + 1; j < sorted.length; j++) {
+          const a = sorted[i]?.scope ?? null;
+          const b = sorted[j]?.scope ?? null;
+          if (!premiseAgrees(a, b) || scopeDifferences(a, b).length > 0) return true;
+        }
+      }
+      return false;
+    };
+    const byCreated = (a: StoredMemory, b: StoredMemory) => a.createdAt.localeCompare(b.createdAt);
+    const groups: {
+      key: string;
+      by: 'text' | 'vector';
+      similarity: number | null;
+      mixedPremises: boolean;
+      memories: { id: string; kind: MemoryKind; version: number; summary: string; scope: string | null }[];
+    }[] = [...byKey.entries()]
       .filter(([, list]) => list.length > 1)
       .map(([key, list]) => {
-        const sorted = list.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-        let mixedPremises = false;
-        outer: for (let i = 0; i < sorted.length; i++) {
-          for (let j = i + 1; j < sorted.length; j++) {
-            if (scopeDifferences(sorted[i]?.scope ?? null, sorted[j]?.scope ?? null).length > 0) {
-              mixedPremises = true;
-              break outer;
-            }
-          }
-        }
+        const sorted = list.sort(byCreated);
         return {
           key: key.slice(0, 120),
-          mixedPremises,
-          memories: sorted.map((m) => ({
-            id: m.id,
-            kind: m.kind,
-            version: m.version,
-            summary: m.summary,
-            scope: m.scope ?? null
-          }))
+          by: 'text' as const,
+          similarity: null,
+          mixedPremises: anyPremiseClash(sorted),
+          memories: sorted.map(view)
         };
       });
+
+    // ---- vector channel ----
+    const grouped = new Set(groups.flatMap((g) => g.memories.map((m) => m.id)));
+    const singles = [...byKey.values()].flat().filter((m) => !grouped.has(m.id)).sort(byCreated);
+    const threshold = this.options.nearDuplicateThreshold;
+    const parent = singles.map((_, i) => i);
+    const root = (i: number): number => {
+      while (parent[i] !== i) {
+        parent[i] = parent[parent[i]!]!;
+        i = parent[i]!;
+      }
+      return i;
+    };
+    const weakest = new Map<number, number>();
+    for (let i = 0; i < singles.length; i++) {
+      for (let j = i + 1; j < singles.length; j++) {
+        const a = vectors.get(singles[i]!.id);
+        const b = vectors.get(singles[j]!.id);
+        // Incomparable vectors (missing, or a different embedding space after a
+        // provider swap) are not a match — and not an error either; the row just
+        // cannot be judged by this channel.
+        if (!a || !b || a.length !== b.length) continue;
+        const sim = cosine(a, b);
+        if (sim < threshold) continue;
+        const ra = root(i);
+        const rb = root(j);
+        if (ra !== rb) parent[ra] = rb;
+        for (const r of [ra, rb]) {
+          const seen = weakest.get(r);
+          weakest.set(r, seen === undefined ? sim : Math.min(seen, sim));
+        }
+      }
+    }
+    const clusters = new Map<number, number[]>();
+    singles.forEach((m, i) => {
+      const r = root(i);
+      (clusters.get(r) ?? clusters.set(r, []).get(r)!).push(i);
+    });
+    for (const [rootIndex, members] of clusters) {
+      if (members.length < 2) continue;
+      const sorted = members.map((i) => singles[i]!).sort(byCreated);
+      groups.push({
+        key: `vector:${sorted[0]!.id.slice(0, 8)}`,
+        by: 'vector',
+        similarity: Number((weakest.get(rootIndex) ?? threshold).toFixed(4)),
+        mixedPremises: anyPremiseClash(sorted),
+        memories: sorted.map(view)
+      });
+    }
     return { groups, scanned: this.db.countActive() };
   }
 
@@ -1812,13 +2441,43 @@ export class HippoMemory {
       }
       rows.push(row);
     }
-    // Same text is what makes them duplicates. Without this check a caller who
-    // hands over two unrelated ids would erase one of them behind a "cleanup".
+    // What makes these rows one statement? Two channels (F3), the same ones
+    // `duplicates()` reports: identical text under the wrapper-insensitive
+    // normalisation, or vectors at or above `nearDuplicateThreshold` forming ONE
+    // connected cluster. The guard's purpose is unchanged — a caller who hands
+    // over two unrelated ids would otherwise erase one of them behind a
+    // "cleanup" — it just no longer claims text identity is the only way a fact
+    // gets restated. Rows with incomparable vectors cannot clear the second
+    // channel, so they still need identical text.
     const keys = new Set(rows.map((r) => normalizeText(stripAbstractPrefix(r.summary))));
     if (keys.size > 1) {
-      throw new Error(
-        `merge: these ${rows.length} ids are not restatements of one claim (${[...keys].map((k) => `"${k.slice(0, 40)}"`).join(' vs ')}) — pass a single group from duplicates()`
-      );
+      const threshold = this.options.nearDuplicateThreshold;
+      const sim = (a: MemoryRow, b: MemoryRow): number => {
+        const va = vecFromBlob(a.vec);
+        const vb = vecFromBlob(b.vec);
+        if (!va || !vb || va.length !== vb.length) return -1;
+        return cosine(va, vb);
+      };
+      // Reachability from the first id over "same statement" edges.
+      const reached = new Set([0]);
+      const queue = [0];
+      while (queue.length) {
+        const i = queue.shift()!;
+        for (let j = 0; j < rows.length; j++) {
+          if (reached.has(j)) continue;
+          if (sim(rows[i]!, rows[j]!) >= threshold) {
+            reached.add(j);
+            queue.push(j);
+          }
+        }
+      }
+      if (reached.size < rows.length) {
+        const orphans = rows.filter((_, i) => !reached.has(i)).map((r) => r.id.slice(0, 8));
+        throw new Error(
+          `merge: these ${rows.length} ids are not restatements of one claim — ${orphans.join(', ')} share neither text nor a vector within ` +
+          `${threshold.toFixed(2)} of the rest (${[...keys].map((k) => `"${k.slice(0, 40)}"`).join(' vs ')}). Pass a single group from duplicates()`
+        );
+      }
     }
     // Pick the row that is worth keeping: re-checkable evidence outranks a bare
     // restatement (merging must never retire the only row an agent can re-run),
@@ -1835,17 +2494,29 @@ export class HippoMemory {
     if (!survivor) throw new Error(`merge: ${plan.into} is not one of the ids`);
     const toView = (r: MemoryRow) => ({ id: r.id, kind: r.kind, summary: r.summary });
 
-    // Premise gate: `duplicates()` groups by TEXT, and the same sentence under
-    // another condition is deliberately its own trace (that is what `scope` is
-    // for), so those rows are not restatements of each other and stay apart.
+    // Premise gate: `duplicates()` groups by text AND by vector, and the same
+    // statement under another condition is deliberately its own trace (that is
+    // what `scope` is for), so those rows are not restatements of each other and
+    // stay apart — whichever channel put them in the same group.
     const clashOf = (r: MemoryRow) => scopeDifferences(survivor.scope, r.scope);
+    // G2 (round 28): the other half of "different premises". A premise-free row and a
+    // conditioned one produce an EMPTY `clashOf` — there is no shared key to differ on —
+    // and read as restatements right up to the fold, where one of the two statements is
+    // retired: the general row loses the coverage that motivated keeping the pair apart,
+    // or the conditioned row loses the premise someone stated. `premiseAgrees` is the same
+    // predicate the write path refuses the narrowing under, so the two doors cannot disagree.
+    const premiseOnly = (r: MemoryRow) => !survivor.scope !== !r.scope;
     const others = byValue.filter((r) => r.id !== survivor.id);
-    const retired = others.filter((r) => clashOf(r).length === 0);
+    const retired = others.filter((r) => clashOf(r).length === 0 && !premiseOnly(r));
     const blocked = others
-      .filter((r) => clashOf(r).length > 0)
+      .filter((r) => clashOf(r).length > 0 || premiseOnly(r))
       .map((r) => ({
         id: r.id,
-        reason: `states different premises (${clashOf(r).join(', ')}) — the same sentence under another condition stays its own trace`
+        reason: premiseOnly(r)
+          ? `states ${r.scope ? 'a premise where the survivor states none' : 'no premise, while the survivor states one'} (${
+              survivor.scope ? `"${survivor.scope}"` : 'none'
+            } vs ${r.scope ? `"${r.scope}"` : 'none'}) — a general statement and a conditioned one are not restatements of each other, so neither may be folded into the other`
+          : `states different premises (${clashOf(r).join(', ')}) — the same sentence under another condition stays its own trace`
       }));
     if (retired.length === 0) {
       return {
@@ -1854,7 +2525,8 @@ export class HippoMemory {
         carried: [],
         blocked,
         dryRun: !!plan.dryRun,
-        note: 'merge: nothing retired — every other row in the group states premises that disagree with the one it would be merged into'
+        note:
+          'merge: nothing retired — every other row in the group states premises that disagree with, or are absent beside, the one it would be merged into'
       };
     }
 
@@ -2039,6 +2711,33 @@ export class HippoMemory {
     };
   }
 
+  /**
+   * Does this row state the SAME THING the claim states — as opposed to merely
+   * living near it? Two of the four `recallAnchors` tiers qualify: an
+   * identifier both sides carry (a ticket, a version, an address), or the
+   * subject of a structured claim the claim repeats. `entity` and `vocabulary`
+   * do not.
+   *
+   * The census that drew this line (`.hippo/panel-g1-scope-round23k.mjs`, 24
+   * premise shapes run against both the previous build and this one, in both
+   * embedding spaces): the panel case "strong scope-less support, weak
+   * anchored conflict" — a verbatim restatement at 0.93 hashing / 0.98 bge with
+   * no premise, and a row about `api latency budget` under `region=us-east` at
+   * 0.40 / 0.70 — vetoed the exact match when the route accepted the entity
+   * tier. `api` is a TOPIC: a store that has ever recorded two facts about one
+   * service shares that token across all of them, so an entity is not evidence
+   * that the two texts state one claim under two conditions, which is the only
+   * thing this veto is for. Anchors are read on the RAW stored text for the
+   * same reason D1 reads them raw: sanitizing can hollow a summary out and
+   * erase the subject being asked about.
+   */
+  private sameThingAnchor(claim: string, r: MemoryRow): boolean {
+    return recallAnchors(claim, {
+      summary: r.summary,
+      entities: JSON.parse(r.entities_json || '[]') as string[]
+    }).some((a) => a === 'identifier' || a === 'subject');
+  }
+
   /** True when two entity sets share at least one name (case-insensitive). */
   private entitiesOverlap(a: string[], b: string[]): boolean {
     if (a.length === 0 || b.length === 0) return false;
@@ -2057,18 +2756,35 @@ export class HippoMemory {
    *   - out_of_scope: the support holds under premises the claim does not
    *     share (see MemoryPayload.scope) — pass `opts.scope` to have the
    *     engine compare them and prefer the trace stated under your premises.
+   *     A conflicting-scope row that matches the claim as well as the support
+   *     vetoes even when it did not win the support slot.
+   *   - weak_match: something nearby cleared the recall floor but carries no
+   *     anchor for THIS claim, so the verdict is not a yes (see `substantiated`).
    */
   async sourceMonitor(claim: string, opts: { scope?: string } = {}): Promise<{
     substantiated: boolean;
     contradicted: boolean;
     /** True when the closest trace is stated under premises that disagree with `opts.scope`. */
     out_of_scope: boolean;
+    /**
+     * True when a trace cleared the RECALL floor and nothing anchors the claim
+     * to it. Not a yes and not an empty store: the closest trace is attached as
+     * `support`, labelled, for inspection only (field report D1).
+     */
+    weak_match: boolean;
+    /**
+     * Same-subject rows that state a premise conflicting with `opts.scope` and
+     * match the claim at least as well as the chosen support. Non-empty is what
+     * makes the verdict OUT_OF_SCOPE: these are the traces that would have been
+     * the answer had the caller asked under their premises.
+     */
+    scope_conflicts: RelatedTrace[];
     support?: { id: string; summary: string; detail?: string; verifyResult?: 'pass' | 'fail'; verifiedAt?: string; source?: string; confidence: string; version: number; score: number; scope?: string } | null;
     contradiction?: { id: string; summary: string; detail?: string; verifyResult?: 'pass' | 'fail'; verifiedAt?: string; source?: string; confidence: string; version: number; score: number; scope?: string } | null;
     closest?: { id: string; summary: string; detail?: string; verifyResult?: 'pass' | 'fail'; verifiedAt?: string; source?: string; confidence: string; version: number; score: number; scope?: string } | null;
-    /** Same-scope rows asserting the opposite polarity of the claim. */
+    /** Rows whose premise agrees with the checked scope (or that state none) and assert the opposite polarity of the claim. */
     contradicting: RelatedTrace[];
-    /** Newer rows sharing the claim's scope (the support may be stale). */
+    /** Newer premise-agreeing rows sharing the claim's subject (the support may be stale). */
     newer_related: RelatedTrace[];
     /** Retired rows whose superseded_by points at a matched row. */
     superseded_matches: RelatedTrace[];
@@ -2079,15 +2795,19 @@ export class HippoMemory {
      * substantiating argmax row is NOT the newest word on its scope, or when
      * a related row asserts the opposite. The boolean verdict stays (an
      * affirming exact match is still support), but a contested yes must be
-     * re-checked against contradicting[] / newer_related[] before asserting.
+     * re-checked against whichever of contradicting[] / newer_related[] /
+     * superseded_matches[] actually has rows in it. The note names exactly that set
+     * and nothing else (R3, round 30: it used to say "Review newer_related" on a
+     * store whose only newer disagreement lived in the archived chain, sending the
+     * reader to an empty array — the third time this batch met a note asserting a
+     * relation the verdict had not computed).
      */
     contested: boolean;
     note: string;
   }> {
     const cueVec = await this.embedOne(claim);
     const claimNegated = this.polarityOf(claim);
-    const queryScope = typeof opts.scope === 'string' && opts.scope.trim() ? opts.scope.trim() : undefined;
-    // Score every comparable row ONCE: the argmax pass and the related-row scan
+    const queryScope = typeof opts.scope === 'string' && opts.scope.trim() ? opts.scope.trim() : undefined;    // Score every comparable row ONCE: the argmax pass and the related-row scan
     // below need the same cosine against the same cue vector. Keeping the pairs
     // around avoids decoding and re-computing the whole store a second time.
     const scored: { r: MemoryRow; sim: number }[] = [];
@@ -2110,11 +2830,50 @@ export class HippoMemory {
     // the claim, a trace stated under THOSE conditions outranks a closer match
     // stated under others (measured failure: an old-scope conclusion at higher
     // similarity answered a new-scope claim, `substantiated: true`). A row that
-    // names no premise ranks between the two — it cannot be wrong for this
-    // scope, but it is not the caller's scope either, so it stays below a row
-    // that states it. Without a caller scope the ordering is untouched.
+    // names no premise ranks below it and above everything else — it cannot be
+    // wrong for this scope, because it makes a claim about every scope.
+    //
+    // Round 23 (arm A) put a row keyed on an axis the caller never named in that
+    // same band, reasoning that it "cannot be wrong for this scope" either. Round
+    // 24 falsified the half that mattered: a premise-free row IS a general
+    // statement and a `tenant=acme` row is not, and giving them one rank let a
+    // 0.859 keyed restatement take the support seat away from the general trace
+    // that should have answered (test #G3-121), which is how the affirm gate came
+    // to be reached by a row about nobody's conditions. A row that disagrees with
+    // the caller still ranks above a row that never addresses it, because the
+    // disagreeing row is evidence about THIS question (#G3-122). Without a caller
+    // scope the ordering is untouched.
     if (queryScope) {
-      const rank = (r: MemoryRow): number => (!r.scope ? 1 : scopeDifferences(r.scope, queryScope).length === 0 ? 2 : 0);
+      const rank = (r: MemoryRow): number => {
+        // R2 (round 30): "states no premise, so it cannot be wrong for this scope" is
+        // true, and it is NOT "therefore it is the best answer to this claim". The band
+        // used to be unconditional, so a premise-free row about a different subject took
+        // the support seat from a row that IS the caller's claim character for character
+        // — measured on the installed bytes (`.hippo/repro-r1r2r3-round30b.txt`, bge R2
+        // arms): "database vacuum runs nightly at 03:00" at 0.622 beat a verbatim
+        // `api timeout -> 30 seconds` under `service=billing` at 0.862 for a caller
+        // asking under `cluster=blue`, and because the hijacker's premise is vacuously
+        // admissible the veto scan never ran (`supportMeetsScope` reads true for a row
+        // that names nothing), so the trace the caller needed appeared in NONE of
+        // support / contradicting / newer_related / scope_conflicts. Deleting the two
+        // vacuum rows made it reappear at 0.862 as OUT_OF_SCOPE — seat, not score.
+        //
+        // The fix keeps the reasoning that put #G3-121 and #G3-122 on opposite sides of
+        // this list: the seat goes to evidence about THIS question. A premise-free row is
+        // that evidence when it states the claim (same subject/value, a shared
+        // identifier, or the sentence itself) — then it keeps its band and answers a
+        // caller the keyed twin contradicts. A premise-free row about something else is
+        // not evidence at all, and ranks with the other rows that do not address the
+        // caller, where similarity decides. Measured predicates for every fixture this
+        // touches: `.hippo/probe-r2-anchor-round30.txt`.
+        if (!r.scope) return this.sameThingAnchor(claim, r) || isVerbatimRestatement(claim, r.summary) ? 1 : -1;
+        if (scopeStatesCallerPremise(r.scope, queryScope)) return 2;
+        // G3 (round 24): `no difference` and `nothing to compare` are still two
+        // different facts, but they are not the same RANK — an off-axis trace is
+        // not evidence about the caller's premise at all, so it sits below the
+        // row that at least speaks the caller's language and disagrees.
+        return scopesComparable(r.scope, queryScope) ? 0 : -1;
+      };
       const chosen = scored
         .filter(({ r, sim }) => sim >= this.options.similarityThreshold)
         .sort((a, b) => rank(b.r) - rank(a.r) || b.sim - a.sim)[0];
@@ -2130,52 +2889,180 @@ export class HippoMemory {
         substantiated: false,
         contradicted: false,
         out_of_scope: false,
+        weak_match: false,
+        scope_conflicts: [],
         closest: best ?? null,
         contradicting: [],
         newer_related: [],
         superseded_matches: [],
         stale_support: false,
         contested: false,
-        note: `UNSUBSTANTIATED: no stored trace matches this claim (best similarity ${bestSim.toFixed(2)} < ${this.options.similarityThreshold}). Do NOT assert it from memory; answer "I don't know / not in my memory".`
+        note: `UNSUBSTANTIATED: no stored trace matches this claim (best similarity ${belowFloor(bestSim, this.options.similarityThreshold)} < ${this.options.similarityThreshold}). Do NOT assert it from memory; answer "I don't know / not in my memory".`
       };
     }
+
+    const supportRow = this.db.getById(best.id);
+    const supportEntities = supportRow ? (JSON.parse(supportRow.entities_json || "[]") as string[]) : [];
 
     // Premise mismatch comes before the negation heuristic: judging the claim
     // TRUE or FALSE against a trace stated under other conditions is exactly
     // the silent contamination this field exists to stop.
-    if (queryScope && best.scope) {
-      const differing = scopeDifferences(best.scope, queryScope);
-      if (differing.length > 0) {
-        return {
-          substantiated: false,
-          contradicted: false,
-          out_of_scope: true,
-          support: best,
-          contradicting: [],
-          newer_related: [],
-          superseded_matches: [],
-          stale_support: false,
-          contested: false,
-          note:
-            `OUT_OF_SCOPE: the closest trace ${best.id} (v${best.version}) is stated under "${sanitizeMemoryText(best.scope)}" ` +
-            `and the claim was checked under "${sanitizeMemoryText(queryScope)}" — the key(s) ${differing.join(', ')} hold different values, ` +
-            `so memory neither supports nor refutes the claim here. Re-verify under the trace's own premises, ` +
-            `or remember the new-scope conclusion with its own scope so both stand side by side.`
-        };
+    //
+    // The comparison must cover every row that cleared the floor, not just the
+    // one that won support: the premise-aware ranking above deliberately places
+    // a scope-less row ABOVE a row whose scope conflicts, so reading only
+    // `best.scope` let a conclusion stored under `env=prod` answer a question
+    // asked about `env=dev` as `substantiated: true` — with the conflicting row
+    // named nowhere in the answer (field report D2). A conflicting row that
+    // matches the claim at least as well as the chosen support vetoes the
+    // verdict and is named in `scope_conflicts`; a weaker one used to be
+    // dropped entirely, which arm B (round 23) showed is not the same as it
+    // not being the caller's answer — a 0.486 row that restates the claim's
+    // OWN SUBJECT under a premise the caller contradicts is more relevant to
+    // this verdict than a 0.689 row that names no premise at all.
+    // Similarity WAS the whole relevance anchor here on purpose — entities are
+    // optional, and requiring them made the veto inert for every store that
+    // writes entity-less rows (opencode's own adapter test caught it) — so the
+    // anchor route is added ALONGSIDE the score route, never in place of it:
+    // anything that vetoes today still vetoes, and entity-less stores keep
+    // vetoing by score plus the subject/identifier tiers. The scan
+    // is skipped when the support already STATES the caller's premises — which
+    // is not what an empty `scopeDifferences` means for a row on another axis
+    // (arm A) — because a row stated under OTHER conditions must not veto an
+    // answer that was found under the caller's own.
+    const scopeConflicts: RelatedTrace[] = [];
+    const supportMeetsScope = scopeStatesCallerPremise(best.scope, queryScope);
+    if (queryScope && !supportMeetsScope) {
+      for (const { r, sim } of scored) {
+        if (r.id === best.id || !r.scope || sim < this.options.similarityThreshold) continue;
+        // An empty difference set covers both "the caller's own premise" and
+        // "nothing comparable to disagree with" (a premise on another axis),
+        // and neither is a conflict — `scopesComparable` is what separates them
+        // in the ranking above, where the two read differently.
+        if (scopeDifferences(r.scope, queryScope).length === 0) continue;
+        // The score route (D2) OR the same-thing route (arm B): matching the
+        // support's score is no longer the only way to be heard, but a row has
+        // to state the claim's own subject or carry an identifier with it to be
+        // heard that way — `sameThingAnchor` says why an entity is not enough.
+        //
+        // Round 28 (G4) adds the strongest form of "the same thing": the row IS the claim,
+        // character for character after normalization. It is measured rather than assumed —
+        // `.hippo/probe-g4d-round28.mjs` arm A, the shape the coexistence ruling now
+        // produces on purpose: a premise-free row answering at 0.7746 beside a twin that
+        // restates the same sentence under `db=primary` at 0.5906, both anchored only by
+        // `vocabulary`. Neither old route reaches it, so the answer printed
+        // `substantiated` with `scope_conflicts: []` next to a store holding a direct
+        // contradiction of the caller's premise — the exemption's own pair invisible to the
+        // exit that exists to name it. Same lesson as the F batch, one door later: a
+        // promise reachable at only one exit reads as a broken promise.
+        //
+        // Alongside, never in place of: anything that vetoed before still vetoes.
+        if (sim >= bestSim || this.sameThingAnchor(claim, r) || isVerbatimRestatement(claim, r.summary)) scopeConflicts.push(this.toRelated(r, sim));
       }
     }
+    const supportDiffers = queryScope && best.scope ? scopeDifferences(best.scope, queryScope) : [];
+    // G3 (round 24), the affirm half of the same misreading. A support whose
+    // premise shares NO condition with the caller's is not a conflict —
+    // `scopeDifferences` is empty for it, and `scopeConflicts` correctly never
+    // collects it — and until now "not a conflict, not a restatement" fell
+    // through to `substantiated: true`. That is the field report's shape (a): one
+    // trace under `tenant=acme`, a claim checked under `cluster=blue`, a yes at
+    // 0.846 hashing / 0.909 bge naming no mismatch anywhere in the answer. The
+    // shape (b) companion (a third-premise sibling bought `contradicting`,
+    // `newer_related` and `stale_support: true` off the same affirm) needs no
+    // separate gate: this return happens before the related scan runs.
+    //
+    // A ranking consequence to keep in view: an off-premise row can only win the
+    // seat when nothing comparable OR premise-free cleared the floor, because
+    // rank -1 sits below both. When it does, `scopeConflicts` is necessarily
+    // empty (it collects rows that disagree on a shared key, i.e. rank 0), so
+    // this branch never hides a conflict that was in reach.
+    const supportOffPremise = !!queryScope && !!best.scope && !scopeCanSupport(best.scope, queryScope);
+    // G4 read-side companion, and the boundary of the coexistence ruling.
+    //
+    // Refusing the narrowing on the write path CREATES this shape: a premise-free row
+    // that is the claim word for word, standing beside a twin that holds one premise.
+    // Without an exemption here the twin vetoes the general row — D2's rule applied to
+    // the pair the store just produced on purpose — so the ruling would buy a second
+    // row and lose the coverage the first one had, and the veto's own wording ("which
+    // states no premise answers this no better") would contradict `scopeCanSupport`'s
+    // premise-free branch: a trace that names no condition is a GENERAL statement, and
+    // a general statement covers the caller's.
+    //
+    // The exemption is identity, not proximity, and it is the same predicate the write
+    // path refuses under. D2's fixture — a scope-less row that merely shares an entity,
+    // a DIFFERENT sentence — fails this test and stays vetoed, which is what makes the
+    // carve-out a boundary rather than a widening.
+    const generalRestatement = !!queryScope && !best.scope && isVerbatimRestatement(claim, best.summary);
+    const blocker = supportDiffers.length > 0 || supportOffPremise ? best : generalRestatement ? undefined : scopeConflicts[0];
+    const blockerKeys = blocker && queryScope ? scopeDifferences(blocker.scope ?? '', queryScope) : [];
+    const blockerOffPremise = !!blocker && blocker === best && supportOffPremise;
+    if (blocker && queryScope) {
+      const foreign = blocker.id === best.id
+        ? ''
+        : ` The row matched instead (${best.id}, ${best.scope ? `under "${sanitizeMemoryText(best.scope)}"` : 'which states no premise'}) answers this no better.`;
+      // Say WHAT disagrees in the shape the reader can act on. A keyed pair
+      // names a field both sides share; an unkeyed premise has no field to
+      // name, and "the key(s) unkeyed-premise hold different values" would be
+      // a sentence about an internal bucket rather than about the caller's data.
+      const namedKeys = blockerKeys.filter((k) => k !== UNKEYED_SCOPE_LABEL);
+      const bareKeys = blockerKeys.length !== namedKeys.length;
+      const axes = (s?: string | null): string => {
+        const { keys, bare } = scopeAxes(s);
+        const parts: string[] = [];
+        if (keys.length > 0) parts.push(keys.join(', '));
+        if (bare) parts.push('an unkeyed condition');
+        return parts.length > 0 ? parts.join(' plus ') : 'no key at all';
+      };
+      const why = blockerOffPremise
+        ? `the trace keys only ${axes(blocker.scope)} and the caller states only ${axes(queryScope)}, with no condition named by both`
+        : namedKeys.length === 0
+          ? 'neither side keys its premise and the two stated conditions name different things'
+          : `the key(s) ${namedKeys.join(', ')} hold different values${bareKeys ? ', and the unkeyed premises differ too' : ''}`;
+      return {
+        substantiated: false,
+        contradicted: false,
+        out_of_scope: true,
+        weak_match: false,
+        scope_conflicts: scopeConflicts,
+        support: best,
+        contradicting: [],
+        newer_related: [],
+        superseded_matches: [],
+        stale_support: false,
+        contested: false,
+        note:
+          `OUT_OF_SCOPE: ${blocker.id} (v${blocker.version}) is stated under "${sanitizeMemoryText(blocker.scope ?? '')}" ` +
+          `and the claim was checked under "${sanitizeMemoryText(queryScope)}" — ${why}, ` +
+          `so memory neither supports nor refutes the claim here.${foreign} Re-verify under the trace's own premises, ` +
+          `or remember the new-scope conclusion with its own scope so both stand side by side.`
+      };
+    }
 
-    // Negation heuristic on the global argmax (unchanged behaviour).
+    // Negation heuristic on the global argmax.
     // NOTE: negation is tested on the SANITIZED text, so a payload cannot
-    // escape contradiction detection by hiding inside a hijack phrase.
+    // escape contradiction detection by hiding inside a hijack phrase. The
+    // ANCHOR below is read on the RAW row for the same reason D1 reads its
+    // anchors raw — sanitizing can hollow the summary out to
+    // "[sanitized-conceal]friday" and erase the subject being asked about.
     const storedNegated = this.polarityOf(best.summary);
     const infectedNote = best.summary.includes('[sanitized-') ? ' [injection: stored text contained instruction-shaped content — sanitized]' : '';
-    if (claimNegated !== storedNegated && bestSim >= this.options.similarityThreshold) {
+    const polarityMismatch = claimNegated !== storedNegated;
+    const negAnchored = polarityMismatch && polarityAnchored(claim, supportRow?.summary ?? best.summary, supportEntities);
+    // R2: an unanchored mismatch is not a verdict, but it is not nothing either.
+    // The opposite-polarity trace stays visible as a lead, and the belt on the
+    // anchor gate below keeps it from being read as support instead.
+    const oppositePolarityNote = polarityMismatch && !negAnchored
+      ? ` NOTE: a nearby trace asserts the OPPOSITE polarity (${best.summary.slice(0, 60)} [v${best.version}]) while nothing anchors the two texts to one subject — a coincidence of negation, not a proven conflict.`
+      : '';
+    if (polarityMismatch && negAnchored) {
       const bestRow = this.db.getById(best.id);
       return {
         substantiated: false,
         contradicted: true,
         out_of_scope: false,
+        weak_match: false,
+        scope_conflicts: scopeConflicts,
         contradiction: best,
         contradicting: bestRow ? [this.toRelated(bestRow, bestSim)] : [],
         newer_related: [],
@@ -2192,14 +3079,14 @@ export class HippoMemory {
     // it is the opposite, and this is the one row the related-scan below skips
     // (it excludes best.id). One value containing the other is a refinement,
     // not a clash (`postgres` vs `postgres 15`), so those still substantiate.
+    // Field report R1: this used to demand `claimParts()` on BOTH sides, and
+    // that parser only knows `主体 -> 值` plus English copulas, so a Chinese claim
+    // silently skipped the check and the wrong value got stamped SUBSTANTIATED.
+    // `valueFlip` now keeps the comparison alive when one side or both are
+    // unreadable prose.
     const claimClaim = claimParts(claim);
-    const bestClaim = claimParts(best.summary);
-    if (
-      claimClaim &&
-      bestClaim &&
-      claimClaim.subject === bestClaim.subject &&
-      valueClash(claimClaim.value, bestClaim.value)
-    ) {
+    const flip = valueFlip(claim, best.summary);
+    if (flip) {
       const bestRow = this.db.getById(best.id);
       // The claim restates the OLD value of a row that has since moved on:
       // the live row contradicts it, but the archived revision that said
@@ -2235,25 +3122,55 @@ export class HippoMemory {
         substantiated: false,
         contradicted: true,
         out_of_scope: false,
+        weak_match: false,
+        scope_conflicts: scopeConflicts,
         contradiction: best,
         contradicting: bestRow ? [this.toRelated(bestRow, bestSim)] : [],
         newer_related: [],
         superseded_matches: archMatches,
         stale_support: false,
         contested: true,
-        note: `CONTRADICTED: memory binds "${bestClaim.subject}" to "${sanitizeMemoryText(bestClaim.value)}" (v${best.version}), not "${sanitizeMemoryText(claimClaim.value)}". The closest trace states a different value — do not assert the claim.${infectedNote}${archNote}`
+        note: `CONTRADICTED: memory binds "${flip.subject}" to "${sanitizeMemoryText(flip.stored)}" (v${best.version}), not "${sanitizeMemoryText(flip.claimed)}". The closest trace states a different value — do not assert the claim.${infectedNote}${archNote}`
       };
     }
 
     // ---- P0-1: the scan the old version never did ----
     // Related active rows: entity-overlapping OR clearing the similarity floor.
-    // Reuses the scores computed above — no second decode/cosine pass.
-    const supportRow = this.db.getById(best.id);
-    const supportEntities = supportRow ? (JSON.parse(supportRow.entities_json || "[]") as string[]) : [];
+    // Reuses the scores computed above — no second decode/cosine pass, and the
+    // support row/entities were already resolved for the premise scan above.
+    //
+    // Premise filter (F2, black-box report #3): a related row is evidence about
+    // the scope being asked about, so a row stating a premise that DISAGREES
+    // with it is not evidence at all. The anchor is the caller's scope, or the
+    // support's own premise when the caller stated none — reaching this point
+    // means the two already agree (a disagreeing support was vetoed above).
+    // A row that states no premise is never excluded for disagreement: a
+    // premise-free correction is still a correction (guard test F2 guard: a
+    // newer premise-free row still ages the support). Without the filter an
+    // eu-west trace made a us-east verdict "stale", and the note claimed a
+    // newer trace existed "on this scope" while naming a row that proved the
+    // opposite condition.
+    //
+    // G3 (round 24) deliberately does NOT extend this keep-test to
+    // `scopeCanSupport`, even though it reads the same empty difference set the
+    // affirm path did. The two sites ask opposite questions. The affirm gate
+    // promotes a row to CERTIFICATION, so a row that shares no condition with the
+    // caller must be refused — that is the dangerous side. This filter feeds
+    // `contradicting` / `newer_related` / the archive tiers, which are
+    // downgrade-only: dropping an off-axis row here would delete a warning that
+    // might be real (a premise-free support restated under one axis while a
+    // newer row on another says otherwise is the case the reporter's own D-shape
+    // census calls a correction), and the batch's standing lesson is that
+    // narrowing one exit without a belt converts a false verdict into a false
+    // verdict on the dangerous side. Test #G3-125 pins that residual open. The
+    // reported false staleness needs no help from here: an off-axis SUPPORT now
+    // returns before this scan runs (#G3-119, #G3-120).
+    const premiseAnchor = queryScope ?? supportRow?.scope ?? undefined;
     const related = supportRow
       ? scored
           .filter(({ r }) => r.id !== best.id)
           .filter(({ r, sim }) => sim >= this.options.similarityThreshold || this.entitiesOverlap(supportEntities, JSON.parse(r.entities_json || '[]') as string[]))
+          .filter(({ r }) => !premiseAnchor || !r.scope || scopeDifferences(r.scope, premiseAnchor).length === 0)
           .sort((a, b) => b.sim - a.sim)
           .slice(0, 8)
       : [];
@@ -2388,9 +3305,27 @@ export class HippoMemory {
     }
 
     const staleSupport = newerRelated.length > 0 || supersededMatches.length > 0;
-    const staleNote = staleSupport
-      ? ' WARNING: a NEWER trace exists on this scope — the support above may be outdated. Review newer_related before asserting.'
-      : '';
+    // R3 (round 30) — the third round the same SHAPE was reported on this gate (G3 fixed a
+    // false conflict, F2 a false "assert the OPPOSITE"; this is a REAL flag wearing the
+    // wrong label). `staleSupport` has two causes and the note named one of them
+    // unconditionally, so an archived revision of the support — the ordinary consequence of
+    // an `override`, where nothing is newer than the live row — printed "Review
+    // newer_related" over `newer_related: []` while the evidence sat in
+    // `superseded_matches`. Measured on the installed bytes in both embedding spaces
+    // (`.hippo/repro-r1r2r3-round30b.txt`, R3 arm): `stale=true contested=true
+    // newer_related=[] superseded_matches=… 0.684`, note "Review newer_related".
+    // A pointer to an empty array is worse than no pointer: the caller checks the array,
+    // finds nothing, and concludes the flag was raised in error. Each cause gets its own
+    // wording, and only the `newer_related` cause points at `newer_related` — the archived
+    // cause is already named twice over below (`archiveNote`/`fuzzyNote` say
+    // "see superseded_matches", and `contestedNote` now lists only populated arrays), so
+    // repeating the pointer here would be noise rather than information. Both wordings are
+    // pinned in `test/scope.test.mjs` so neither cause can be dropped to make a test pass.
+    const staleNote = !staleSupport
+      ? ''
+      : newerRelated.length > 0
+        ? ' WARNING: a NEWER trace exists — the support above may be outdated. Review newer_related before asserting.'
+        : ' WARNING: an ARCHIVED revision of the support stands behind it — the row above may be outdated.';
     const contradictNote = contradicting.length > 0
       ? ` WARNING: ${contradicting.length} related trace(s) assert the OPPOSITE of this claim — review contradicting[] before asserting.`
       : '';
@@ -2423,26 +3358,178 @@ export class HippoMemory {
         ? ` NOTE: the support states no scope — its premise could not be checked against "${sanitizeMemoryText(queryScope)}".`
         : '';
 
+    // G4, seen from the affirm side. The general row answers the caller, and the twin that
+    // holds a premise the caller contradicts is still named here: an empty `scope_conflicts`
+    // next to a yes would read as "nothing in the store disagrees", which is not what the
+    // pair holds. The twin is not a refutation either — it says the same sentence, only
+    // under a condition the caller did not state.
+    const twinPremiseNote =
+      generalRestatement && scopeConflicts.length > 0
+        ? ` NOTE: ${scopeConflicts.length} sibling trace(s) restate this SAME sentence under a premise the caller contradicts (${scopeConflicts
+            .slice(0, 3)
+            .map((c) => `"${sanitizeMemoryText(c.scope ?? '')}"`)
+            .join(', ')}) — they hold only under their own condition, and the general row is the one that covers the caller's.`
+        : '';
+
     // Audit #3: the argmax contract stays (an affirming match substantiates),
     // but the verdict is no longer a bare boolean — when the support is not
     // the newest word on its scope, or a related row disagrees, the caller
     // must treat the yes as contested and read the neighbourhood evidence.
     const contested = staleSupport || contradicting.length > 0;
+    // R3, same attribution rule as `staleNote`: name the arrays that are populated, never a
+    // pair of empty ones. `contested` is the field a caller reads to decide whether to
+    // re-check, so a pointer to `contradicting[] / newer_related[]` on a store where both
+    // are empty and the archived revision holds the evidence teaches the caller to ignore
+    // the flag.
+    const contestedFields = [
+      contradicting.length > 0 ? 'contradicting[]' : null,
+      newerRelated.length > 0 ? 'newer_related[]' : null,
+      supersededMatches.length > 0 ? 'superseded_matches[]' : null
+    ].filter(Boolean);
     const contestedNote = contested
-      ? ' CONTESTED: this yes is disputed (stale support or a disagreeing sibling) — weigh contradicting[] / newer_related[] before asserting.'
+      ? ` CONTESTED: this yes is disputed — weigh ${contestedFields.join(' and ')} before asserting.`
       : '';
+
+    // Field report D1: a bare `substantiated: true` at sim 0.47 certified
+    // "Python 是用来煮咖啡的" against a row about which language the backend uses.
+    // The verdict asked "did anything clear the RECALL floor?" while the tool
+    // promises a claim-level answer, and `claimThreshold` — published by this
+    // same store's `diagnostics().thresholds` — was consulted only on the write
+    // path. Raising the floor is not the fix: measured claim-to-summary cosine
+    // in the hashing space is 0.444 for that hallucination and 0.444 for a
+    // legitimate paraphrase of the same fact, so the number cannot tell them
+    // apart. An ANCHOR can, so the yes now requires one:
+    //   - both sides parse to the same subject with a compatible value,
+    //   - an identifier (ticket id, sha, version) appears in both,
+    //   - the trace carries the claim verbatim, or nearly all of its distinctive
+    //     wording,
+    //   - claim-to-summary cosine clears `claimThreshold`.
+    // The anchors read the RAW stored text on purpose: sanitizing is a rendering
+    // concern, and it can hollow a summary out to "[sanitized-conceal]friday" —
+    // erasing the very wording the caller is asking about. Contradiction
+    // detection keeps the sanitized text, where a payload must not get to hide.
+    // Without an anchor the trace is still shown — as a lead, never as evidence.
+    const rawSummary = supportRow?.summary ?? best.summary;
+    const rawContent = supportRow
+      ? [supportRow.summary, supportRow.detail ?? ''].filter(Boolean).join(' ')
+      : best.summary;
+    const rawClaim = claimParts(rawSummary);
+    const structurallyAgrees =
+      !!claimClaim && !!rawClaim && claimClaim.subject === rawClaim.subject && !valueClash(claimClaim.value, rawClaim.value);
+    const sharesIdentifier = literalOverlap(claim, rawSummary) > 0 || literalOverlap(claim, supportRow?.detail ?? '') > 0;
+    const normRawClaim = normalizeText(stripAbstractPrefix(claim));
+    const restatesVerbatim =
+      normRawClaim.length >= 12 &&
+      (normalizeText(stripAbstractPrefix(rawSummary)) === normRawClaim ||
+        normalizeText(stripAbstractPrefix(rawContent)).includes(normRawClaim));
+    const distinctive = tokenize(claim).filter((t) => t.length >= 6);
+    const traceTokens = new Set(tokenize(rawContent));
+    const carriesTheWording =
+      distinctive.length > 0 &&
+      distinctive.filter((t) => traceTokens.has(t)).length / distinctive.length >= this.options.claimThreshold;
+    // Each side naming a label the other does not means the two texts are about
+    // different things, no matter how much wording they share — `2024-05-01` vs
+    // `2024-05-02` differ in one character and are two releases. Requiring it on
+    // BOTH sides is what keeps a trace's extra detail from vetoing a partial
+    // restatement, which R1 ruled support. This is the belt that keeps the R3 fix
+    // from trading a false CONTRADICTED for a false SUBSTANTIATED: `KAPPA-2
+    // record` against a `KAPPA-1 record` row covers the claim's only distinctive
+    // token (`record`) and would anchor a yes at sim 0.48.
+    const claimIds = identifierTokens(claim);
+    const traceIds = identifierTokens(rawContent);
+    const claimOnly = [...claimIds].filter((t) => !traceIds.has(t));
+    const traceOnly = [...traceIds].filter((t) => !claimIds.has(t));
+    const identifierMismatch = claimOnly.length > 0 && traceOnly.length > 0;
+    // V1 belt: the value slot itself differs and neither parser could read it, so
+    // every anchor below is certifying a value it never looked at. Attribution was
+    // measured, not assumed (.hippo/probe-anchor-name.mjs against an instrumented
+    // copy of dist): six of the eight census shapes ride claim-to-summary
+    // similarity, three ride the trace carrying the claim's wording — that one is
+    // reachable because `carriesTheWording` counts only tokens of >= 6 characters,
+    // so a value like `9999` or `eu-west` (split past the hyphen) is invisible to
+    // it while the context words around it are not.
+    const valueSwap = wordFlip(claim, rawSummary);
+    const hollowSwap = fillerSwap(claim, rawSummary);
+    let claimToSummarySim: number | null = null;
+    if (!structurallyAgrees && !sharesIdentifier && !restatesVerbatim && !carriesTheWording) {
+      const sv = await this.embedOne(rawSummary);
+      claimToSummarySim = sv.length === cueVec.length ? cosine(sv, cueVec) : null;
+    }
+    const anchoredBy = structurallyAgrees
+      ? 'the same subject and value'
+      : sharesIdentifier
+        ? 'a shared identifier'
+        : restatesVerbatim
+          ? 'a verbatim restatement of the trace'
+          : carriesTheWording
+            ? 'the trace carrying the claim wording'
+            : claimToSummarySim !== null && claimToSummarySim >= this.options.claimThreshold
+              ? `claim-to-summary similarity ${claimToSummarySim.toFixed(2)} ≥ ${this.options.claimThreshold}`
+              : null;
+    // R2 belt: the anchor gate is the last chance to catch a polarity the
+    // negation branch gave up on, and a yes is the one verdict that must never
+    // be handed out against the trace the caller is pointing at.
+    // R3 adds the other way an anchor can be real and still irrelevant.
+    const anchored = anchoredBy !== null && !polarityMismatch && !identifierMismatch && !valueSwap && !hollowSwap;
+    const overriddenBy: string[] = [];
+    if (polarityMismatch)
+      overriddenBy.push('they assert OPPOSITE polarities, so this trace refutes the claim rather than supporting it');
+    if (identifierMismatch)
+      overriddenBy.push(
+        `the trace names ${traceOnly.slice(0, 3).join(', ')} while this claim names ${claimOnly
+          .slice(0, 3)
+          .join(', ')} — different identifiers, so the shared wording is about another thing`
+      );
+    if (valueSwap)
+      overriddenBy.push(
+        valueSwap.subjectSwap
+          ? `what this claim puts first — "${valueSwap.claimed}" — the trace puts first "${valueSwap.stored}", and nothing but connectives stands before that slot: the wording matches up to that one word because it is the same sentence shape about a different thing, not because it agrees on a value`
+          : `the trace binds this subject to "${valueSwap.stored}" where this claim binds it to "${valueSwap.claimed}" — the wording matches up to that one word, so what it shares is the shape of the sentence, not the value`
+      );
+    if (hollowSwap)
+      overriddenBy.push(
+        hollowSwap.positional
+          ? `the trace states this subject as "${hollowSwap.stored}" where this claim states it as "${hollowSwap.claimed}" — the two values match word for word except at one connective slot, so what agrees is the shape of the sentence, not the value`
+          : `the trace states this subject as "${hollowSwap.stored}" where this claim states it as "${hollowSwap.claimed}", and the two values share no comparable terms — what matches is the shape of the sentence, not the value`
+      );
+    if (!anchored) {
+      return {
+        substantiated: false,
+        contradicted: false,
+        out_of_scope: false,
+        weak_match: true,
+        scope_conflicts: scopeConflicts,
+        support: best,
+        contradicting,
+        newer_related: newerRelated,
+        superseded_matches: supersededMatches,
+        stale_support: staleSupport,
+        contested,
+        note:
+          `WEAK_MATCH: ${best.id} (v${best.version}) clears the recall floor (sim ${bestSim.toFixed(2)} ≥ ${this.options.similarityThreshold}) ` +
+          (anchoredBy === null
+            ? `but nothing anchors it to this claim — no agreeing subject/value, no shared identifier, the trace does not carry the ` +
+              `claim's wording, and claim-to-summary similarity ` +
+              `${claimToSummarySim === null ? 'not measured' : belowFloor(claimToSummarySim, this.options.claimThreshold)} is below the claim bar ${this.options.claimThreshold}. `
+            : `and ${anchoredBy} ties the two texts together, but ${overriddenBy.join('; ')}. `) +
+          `NOT substantiated: memory is merely on the same topic. Read support as a lead to re-check, never as evidence for the claim.` +
+          `${oppositePolarityNote}${infectedNote}${staleNote}${contradictNote}${archiveNote}${fuzzyNote}${premiseNote}${twinPremiseNote}${contestedNote}`
+      };
+    }
 
     return {
       substantiated: true,
       contradicted: false,
       out_of_scope: false,
+      weak_match: false,
+      scope_conflicts: scopeConflicts,
       support: best,
       contradicting,
       newer_related: newerRelated,
       superseded_matches: supersededMatches,
       stale_support: staleSupport,
       contested,
-      note: `SUBSTANTIATED: matches ${best.id} (v${best.version}, sim ${bestSim.toFixed(2)}).${infectedNote}${staleNote}${contradictNote}${archiveNote}${fuzzyNote}${staleEvidenceNote}${premiseNote}${contestedNote}`
+      note: `SUBSTANTIATED: matches ${best.id} (v${best.version}, sim ${bestSim.toFixed(2)}).${infectedNote}${staleNote}${contradictNote}${archiveNote}${fuzzyNote}${staleEvidenceNote}${premiseNote}${twinPremiseNote}${contestedNote}`
     };
   }
   /* ============================ context gating ============================ */
@@ -2459,17 +3546,43 @@ export class HippoMemory {
   ): Promise<{ context: string; items: RetrievedMemory[]; warnings: string[] }> {
     const limit = opts.limit ?? 6;
     const rec = await this.recall({ query: goal }, limit);
-    const items = [...rec.hits];
+    const hits = [...rec.hits];
     const warnings = [...rec.warnings];
     const tagNow = Date.now();
     this.digestCoverage.turns += 1;
-    if (items.length === 0) this.digestCoverage.misses += 1;
+    if (hits.length === 0) this.digestCoverage.misses += 1;
+    // F4b (black-box report #4): a row that shares no identifier, entity, claim
+    // subject or word with the cue is close in vector space and nothing more —
+    // it must not crowd out the rows that answer the question. The withheld set
+    // stays in `recall` (flagged, not deleted) and is named here, so the drop is
+    // visible. When NOTHING is anchored the block still renders: an unanchored
+    // lead beats silence, which is how this gate has always failed visibly.
+    const quiet = hits.filter((h) => !h.anchored);
+    const items = hits.length - quiet.length > 0 ? hits.filter((h) => h.anchored) : hits;
+    const brief = (h: RetrievedMemory) =>
+      `${h.id.slice(0, 8)} "${sanitizeMemoryText(h.summary).slice(0, 60)}" sim ${h.similarity.toFixed(2)}`;
+    if (quiet.length > 0 && items.length !== hits.length) {
+      warnings.push(
+        `unanchored: withheld ${quiet.length} hit(s) that share no identifier, entity, claim subject or word with the cue — vector neighbours, not answers: ${quiet
+          .map(brief)
+          .join('; ')}`
+      );
+    } else if (quiet.length > 0) {
+      warnings.push(
+        `unanchored: all ${quiet.length} injected hit(s) rest on vector proximity alone (no shared identifier, entity, claim subject or word) — leads to verify, not memory: ${quiet
+          .map(brief)
+          .join('; ')}`
+      );
+    }
 
     /** One rendered line per memory; the only place the digest format lives. */
     const renderLine = (m: RetrievedMemory, i: number): string => {
       const prov = m.source ? ` [source: ${sanitizeMemoryText(m.source)}]` : '';
       const conf = m.confidence === 'high' ? '' : ` [conf:${m.confidence}]`;
-      const kind = `[${m.kind}${m.consolidated ? '/semantic' : ''}]`;
+      // F4: the suffix reported the KIND ("semantic") whenever the row was
+      // semantic, which read as "this is a consolidation product". It marks the
+      // engine's own provenance tag now, and says so in the reader's words.
+      const kind = `[${m.kind}${m.consolidated ? '+consolidated' : ''}]`;
       const occ = m.occurredAt ? ` (at ${m.occurredAt})` : '';
       // A guess carries no standing: it never cleared the floor, so it may not
       // borrow VERIFIED/ASSERTED from the row it happens to be. Audit #5: the
@@ -2477,7 +3590,7 @@ export class HippoMemory {
       // by its trust tier — attested runs get the bare badge, self-reported
       // passes are marked as such (the write-path shield degrades the same way).
       const standing = m.lowConfidence
-        ? ` [low-confidence sim ${m.similarity.toFixed(2)} < floor ${rec.threshold.toFixed(2)}: the closest trace, not a memory — verify before asserting]`
+        ? ` [low-confidence sim ${belowFloor(m.similarity, rec.threshold)} < floor ${rec.threshold}: the closest trace, not a memory — verify before asserting]`
         : evidenceFresh(m.verifyResult, m.verifiedAt, tagNow, this.options.evidenceTtlSec)
           ? m.verifyAttested
             ? ' [VERIFIED]'
@@ -2486,10 +3599,13 @@ export class HippoMemory {
             ? ' [ASSERTED]'
             : '';
       const guardTag = m.tags.includes('guard') ? ' [GUARD]' : '';
+      // F4b: a row that cleared the floor on cosine alone is rendered with the
+      // reason it cannot be trusted, so the reader weighs it as a lead.
+      const anchorTag = m.anchored || m.recent || m.lowConfidence ? '' : ' [unanchored: vector proximity only]';
       const scopeTag = m.scope ? ` [scope: ${sanitizeMemoryText(m.scope)}]` : '';
       const recentTag = m.recent ? ' [recent]' : '';
       const retrTag = m.retracted ? ` [retracted: ${sanitizeMemoryText(m.retracted.criterion)}]` : '';
-      return `${i + 1}. ${kind}${prov}${conf}${occ}${standing}${guardTag}${scopeTag}${recentTag}${retrTag} v${m.version} ${sanitizeMemoryText(m.summary)}`;
+      return `${i + 1}. ${kind}${prov}${conf}${occ}${standing}${guardTag}${anchorTag}${scopeTag}${recentTag}${retrTag} v${m.version} ${sanitizeMemoryText(m.summary)}`;
     };
 
     // Nothing cleared the floor: still show the single closest trace, marked.
@@ -2501,13 +3617,17 @@ export class HippoMemory {
         ? rec.nearMisses[0]
         : undefined;
     const guessRow = near && near.similarity > 0 ? this.db.getById(near.id) : undefined;
-    const guess: RetrievedMemory | null = guessRow && near
+    const guessMem = guessRow ? rowToMemory(guessRow, false) : null;
+    const guessAnchors = guessMem && near ? recallAnchors(goal, guessMem) : [];
+    const guess: RetrievedMemory | null = guessMem && near
       ? {
-          ...rowToMemory(guessRow, false),
+          ...guessMem,
           score: near.similarity,
           similarity: near.similarity,
           relativeScore: 0,
-          consolidated: false,
+          anchors: guessAnchors,
+          anchored: guessAnchors.length > 0,
+          consolidated: guessMem.consolidated === true,
           lowConfidence: true
         }
       : null;
@@ -2548,7 +3668,16 @@ export class HippoMemory {
         // Flagged at push time (S7 fix): the old index-arithmetic tag
         // (items.slice(limit) vs slice(0,limit)) addressed disjoint ranges,
         // so [recent] could never render.
-        items.push({ ...mem, score: 0.5, similarity: 0.5, relativeScore: 0, consolidated: false, recent: true });
+        items.push({
+          ...mem,
+          score: 0.5,
+          similarity: 0.5,
+          relativeScore: 0,
+          anchors: ['recency'],
+          anchored: true,
+          consolidated: mem.consolidated === true,
+          recent: true
+        });
       }
       warnings.push('includeRecent: appended recent traces not directly goal-relevant');
     }
@@ -2565,7 +3694,7 @@ export class HippoMemory {
 
   /* ============================ introspection ============================ */
 
-  stats(): { active: number; episodes: number; semantics: number; procedures: number; historyRows: number; demoted: number } {
+  stats(): { active: number; episodes: number; semantics: number; procedures: number; consolidated: number; historyRows: number; demoted: number } {
     const rows = this.db.allActive();
     const count = (k: string) => rows.filter((r) => r.kind === k).length;
     return {
@@ -2573,6 +3702,9 @@ export class HippoMemory {
       episodes: count('episode'),
       semantics: count('semantic'),
       procedures: count('procedure'),
+      // F4: the marker is not derivable from `kind`, so the count that says how
+      // many rows systems consolidation actually produced lives here.
+      consolidated: rows.filter((r) => (JSON.parse(r.tags_json || '[]') as string[]).includes('consolidated')).length,
       historyRows: rows.reduce((s, r) => s + r.version - 1, 0),
       demoted: rows.filter((r) => r.demoted === 1).length
     };
@@ -2728,6 +3860,31 @@ function clamp01(x: number): number {
 }
 
 /**
+ * A score rendered for a "this is below X" sentence. `toFixed` can round the
+ * printed value UP onto the bar the real score failed to clear, so the notes
+ * that compare a similarity to a threshold end up asserting `0.54 < 0.54` — a
+ * self-contradiction the reader cannot tell apart from a broken engine.
+ * Truncating to the bar's own decimal count makes the sentence true by
+ * construction (`floor(sim) <= sim < threshold`), and a float wobble can only
+ * push the truncation further down, never up onto the bar.
+ *
+ * The input is not always the raw score: the digest renders recall's near-miss
+ * field, which is rounded to three decimals where it is built, so that number
+ * can arrive already equal to the floor. Stepping one decimal further down is
+ * then the only thing left, and it terminates because every step strictly
+ * lowers the printed value.
+ */
+function belowFloor(sim: number, threshold: number): string {
+  let dp = Math.max(2, (String(threshold).split('.')[1] ?? '').length);
+  for (;;) {
+    const scale = 10 ** dp;
+    const out = (Math.floor(sim * scale) / scale).toFixed(dp);
+    if (Number(out) < threshold || dp === 0) return out;
+    dp--;
+  }
+}
+
+/**
  * Spaced-repetition rehearsal boost (Bjork's desirable-difficulty finding:
  * retrievals spread over time strengthen a trace far more than massed
  * repetition). The gain grows logarithmically with the gap since the last
@@ -2805,16 +3962,38 @@ function scopeTokens(s: string): string[] {
   return (s.toLowerCase().match(/[a-z0-9][a-z0-9._+-]*|[一-鿿]/g) ?? []).filter((t) => !SCOPE_STOP.has(t));
 }
 
-/** `key=value; key=value` (or `key:value`, comma/newline separated) → key → terms. */
+/**
+ * Two premises stated without a key are compared against each other; the
+ * label is what a note prints when such a pair is what blocked an answer.
+ */
+const UNKEYED_SCOPE = '@premise';
+const UNKEYED_SCOPE_LABEL = 'unkeyed-premise';
+
+/**
+ * `key=value; key=value` (or `key:value`, comma/newline separated) → key → terms.
+ *
+ * A segment that states a condition WITHOUT naming a key is not "no premise".
+ * It folds into one synthetic `@premise` bucket, so two different bare premises
+ * can disagree (black-box report #2: a row stored under `us-east` and a query
+ * under `ap-south` used to share no key, `scopeDifferences` returned nothing,
+ * and the ranking read the foreign row as "the caller's own premise" — a false
+ * SUBSTANTIATED). The bucket keeps the wording of the premise instead of
+ * inventing a key for it: `us-east` names the condition, not a "region" field.
+ */
 function scopePairs(s: string): Map<string, string[]> {
   const out = new Map<string, string[]>();
   for (const seg of s.split(/[;,\n]/)) {
     const t = seg.trim();
     if (!t) continue;
     const eq = t.match(/^([^=:]+)[=:](.*)$/);
-    const key = normalizeText(eq ? eq[1] ?? '' : t);
+    if (!eq) {
+      const terms = scopeTokens(t);
+      if (terms.length) out.set(UNKEYED_SCOPE, [...(out.get(UNKEYED_SCOPE) ?? []), ...terms]);
+      continue;
+    }
+    const key = normalizeText(eq[1] ?? '');
     if (!key) continue;
-    const terms = scopeTokens(eq ? eq[2] ?? '' : t);
+    const terms = scopeTokens(eq[2] ?? '');
     out.set(key, out.has(key) ? [...out.get(key)!, ...terms] : terms);
   }
   return out;
@@ -2842,6 +4021,14 @@ function scopeValuesCompatible(a: string[], b: string[]): boolean {
  * Keys both premises name while holding different values — the disagreement
  * evidence. Empty when either side states no premise: an unstated condition
  * is not a contradiction (it is reported as an unchecked premise instead).
+ *
+ * Keyed premises disagree only under a key BOTH sides name (naming another
+ * axis is not disagreeing). An unkeyed premise is checked against the other
+ * side's stated condition — its own unkeyed bucket when it has one, otherwise
+ * the union of everything its keyed values say. That is what makes the two
+ * forms cross-checkable: a bare `us-east` restates `region=us-east` (compatible)
+ * and contradicts `region=eu-west` (a disagreement), instead of sliding past
+ * the whole premise machinery as it did before.
  */
 function scopeDifferences(a?: string | null, b?: string | null): string[] {
   if (!a || !b) return [];
@@ -2849,11 +4036,183 @@ function scopeDifferences(a?: string | null, b?: string | null): string[] {
   const pb = scopePairs(b);
   const differing: string[] = [];
   for (const [key, terms] of pa) {
+    if (key === UNKEYED_SCOPE) continue;
     const other = pb.get(key);
     if (!other) continue;
     if (!scopeValuesCompatible(terms, other)) differing.push(key);
   }
+  const bareA = pa.get(UNKEYED_SCOPE);
+  const bareB = pb.get(UNKEYED_SCOPE);
+  if (bareA && bareB) {
+    if (!scopeValuesCompatible(bareA, bareB)) differing.push(UNKEYED_SCOPE_LABEL);
+  } else {
+    const bare = bareA ?? bareB;
+    if (bare) {
+      const stated: string[] = [];
+      for (const [key, terms] of (bareA ? pb : pa)) if (key !== UNKEYED_SCOPE) stated.push(...terms);
+      if (stated.length > 0 && !scopeValuesCompatible(bare, stated)) differing.push(UNKEYED_SCOPE_LABEL);
+    }
+  }
   return differing;
+}
+
+/**
+ * Do these two premises state anything about the SAME condition?
+ *
+ * `scopeDifferences` answers "where do the two disagree", and by design it
+ * returns nothing when the sides share no key — naming another axis is not
+ * disagreeing. Every caller that reads that empty set as AGREEMENT therefore
+ * inherits a premise nobody stated: the two were comparable. Round 23 (arm A)
+ * is what happens when they are not — a trace stored under `release=v2` was
+ * read as "the caller's own premise" against a claim checked under
+ * `env=staging; region=ap-south`, won the support ranking, and short-circuited
+ * the whole scope-veto scan. The black-box report's `out_of_scope` was never
+ * unreachable for lack of wiring; it was unreachable because the gate in front
+ * of it accepted a non-argument as a proof.
+ *
+ * Comparability is exactly the three shapes `scopeDifferences` can harvest a
+ * difference from: a key both sides name, two unkeyed premises, or one unkeyed
+ * premise against the terms the other side does state. Anything else has no
+ * shared condition to agree OR disagree about.
+ */
+function scopesComparable(a?: string | null, b?: string | null): boolean {
+  if (!a || !b) return false;
+  const pa = scopePairs(a);
+  const pb = scopePairs(b);
+  const bareA = pa.get(UNKEYED_SCOPE);
+  const bareB = pb.get(UNKEYED_SCOPE);
+  if (bareA && bareB) return true;
+  if (bareA || bareB) {
+    const other = bareA ? pb : pa;
+    for (const [key, terms] of other) if (key !== UNKEYED_SCOPE && terms.length > 0) return true;
+    return false;
+  }
+  for (const key of pa.keys()) if (key !== UNKEYED_SCOPE && pb.has(key)) return true;
+  return false;
+}
+
+/**
+ * Does the stored premise RESTATE the caller's, rather than merely failing to
+ * contradict it? No for a row that states no premise (there is nothing
+ * stated), and no for a row on an axis the caller never named (there is
+ * nothing to compare) — `scopeDifferences(...) === 0` alone claims both.
+ */
+function scopeStatesCallerPremise(rowScope?: string | null, queryScope?: string | null): boolean {
+  if (!rowScope || !queryScope) return false;
+  if (!scopesComparable(rowScope, queryScope)) return false;
+  return scopeDifferences(rowScope, queryScope).length === 0;
+}
+
+/**
+ * May this row stand as SUPPORT for a claim stated under the caller's premise?
+ *
+ * The third question in the family, and the one round 24 found unasked. Naming
+ * another axis is not disagreeing (`scopeDifferences` says nothing), and it is
+ * not restating the caller's condition either (`scopeStatesCallerPremise` says
+ * no) — the pair leaves a third state, and both earlier answers read it as the
+ * first. A trace keyed on `tenant` says nothing about a claim checked under
+ * `cluster`, so it cannot certify it; the field report's shape (a) is exactly
+ * that affirm, at 0.846 hashing / 0.909 bge, with nothing in the answer naming
+ * the mismatch.
+ *
+ * Premise-free rows stay admissible on purpose: a trace that states no condition
+ * is a GENERAL statement, and a general statement does cover the caller's. The
+ * asymmetry is what `scopeStatesCallerPremise` already encodes — "no premise"
+ * means "nothing stated", never "nothing to check" — and it is the difference
+ * between this gate vetoing a foreign axis and vetoing every conditioned query.
+ */
+function scopeCanSupport(rowScope?: string | null, queryScope?: string | null): boolean {
+  if (!rowScope || !queryScope) return true;
+  return scopesComparable(rowScope, queryScope);
+}
+
+/**
+ * Do these two texts say the SAME SENTENCE?
+ *
+ * One predicate on purpose, shared by the write path and the read path. The write path
+ * refuses to narrow a premise-free row under it (G4: `narrowsPremiseFree` fires only
+ * inside a branch that already matched on this test), and the read path exempts such a
+ * row from a foreign-premise veto under it too. If the two grew separate grammars, the
+ * pair the write path keeps apart and the exemption that lets the general half answer
+ * would no longer be about the same sentence, and the store could produce a shape its
+ * own verify refuses to read.
+ *
+ * Wrapper stripped, whitespace collapsed, case folded: a consolidation echo of `X`
+ * recorded as "FACT: X" is the same sentence as `X`.
+ */
+function isVerbatimRestatement(a: string, b: string): boolean {
+  return normalizeText(stripAbstractPrefix(a)) === normalizeText(stripAbstractPrefix(b));
+}
+
+/**
+ * Do these two traces state their condition the SAME way?
+ *
+ * `scopeDifferences` answers a narrower question — where the two sides share a key, do
+ * the values disagree — and a premise-free row shares no key with anything, so it answers
+ * "no difference" for the pair `null` / `env=staging`. That reading is right for a veto
+ * (nothing stated cannot contradict) and wrong for a fold: retiring either row either
+ * drops the general statement's coverage or discards the condition someone stated, and
+ * there is no third row that knows both.
+ *
+ * So the merge side asks the wider question first, and it is the same one the write path
+ * refuses under (`narrowsPremiseFree` is this predicate with the caller's scope on one
+ * side): a row that states nothing and a row that states something are two statements.
+ */
+function premiseAgrees(a?: string | null, b?: string | null): boolean {
+  if (!a && !b) return true;
+  return !!a && !!b && scopeDifferences(a, b).length === 0;
+}
+
+/** The axes a premise names, for a note that has to say WHY two share nothing. */
+function scopeAxes(scope?: string | null): { keys: string[]; bare: boolean } {
+  const pairs = scope ? scopePairs(scope) : new Map<string, string[]>();
+  return { keys: [...pairs.keys()].filter((k) => k !== UNKEYED_SCOPE), bare: pairs.has(UNKEYED_SCOPE) };
+}
+
+/**
+ * The labels — ticket ids, dates, versions, zone codes, addresses, counts — a
+ * text names. One rule rather than a grammar per dialect, because a veto read off
+ * these has to be monotone. R4 closed `2024z` by adding a branch, and a family
+ * sweep then found six shapes still answered SUBSTANTIATED in BOTH the pre-R4 and
+ * the R4 build (`.hippo/probe-numeric-family.mjs`). Two of the three reasons were
+ * a branch existing but harvesting the wrong extent: an IP pair shared the token
+ * `10.20.30` that the dotted branch stopped at, leaving the divergent octet
+ * outside anything that was compared, while `probe-k8 2024z` was vetoed only
+ * because NO branch named `probe-k8` — under the disjointness test that used to
+ * read these sets, harvesting the shared prefix would have UNDONE the fix.
+ * Growing the alternation could not close the family; the comparison had to move.
+ *
+ * So: any run of alphanumerics joined by `- _ . : /`, whole, that contains at
+ * least one digit. Taking the run to its full extent is what makes the divergent
+ * character land inside the token, and the digit requirement is load-bearing — it
+ * keeps ordinary hyphenated words out of the set, since the rule below treats a
+ * one-sided label as evidence that two sentences are different facts.
+ *
+ * One exception, restored after it was measured as a transfer of exactly the R4
+ * kind: a run of seven or more hex letters with NO digit is a commit sha
+ * (`HEXISH_RUN_RE`), and the retired `[0-9a-f]{7,40}` branch used to name it.
+ * `commit deadbeef …` asked back as `commit cafebabe …` was WEAK_MATCH on both
+ * pre-R4b builds and SUBSTANTIATED on the first R4b cut (`.hippo/probe-digitless.mjs`).
+ * Restoring it is safe in a way the branch table never was: under a both-private
+ * comparison, harvesting MORE can only enlarge a side's private set, so a wider
+ * harvest can add downgrades and never remove one. The price it does not pay is
+ * the word case — `long-tailed` vs `short-tailed` still substantiates, by design.
+ *
+ * Still deliberately WIDER than the `literalOverlap` grammar above, and used only
+ * in the opposite direction: `literalOverlap` may hand out a yes, so it stays
+ * strict, while these sets are compared to DECIDE THAT A MATCH IS NOT ABOUT THE
+ * SAME THING, which can only ever downgrade a verdict. `KAPPA-1` is the case the
+ * strict grammar misses — `[A-Z]{1,3}-\d` caps the prefix at three letters.
+ */
+const LABEL_RUN_RE = /[0-9a-z]+(?:[-_.:/][0-9a-z]+)*/gi;
+const HEXISH_RUN_RE = /^[0-9a-f]{7,}$/i;
+
+function identifierTokens(s: string): Set<string> {
+  return new Set(
+    (s.match(LABEL_RUN_RE) ?? [])
+      .filter((t) => /\d/.test(t) || HEXISH_RUN_RE.test(t))
+      .map((t) => t.toLowerCase())
+  );
 }
 
 /**
@@ -2876,4 +4235,62 @@ function literalOverlap(cue: string, summary: string): number {
   let shared = 0;
   for (const t of a) if (b.has(t)) shared++;
   return shared;
+}
+
+/** Distinct CJK ideographs in a string (the per-character idiom `scopeTokens` uses). */
+function cjkChars(s: string): Set<string> {
+  return new Set(s.match(/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g) ?? []);
+}
+
+/** Topic-bearing words: ≥4 characters, connectives excluded (reuses `SCOPE_STOP`, no new lexicon). */
+function anchorWords(s: string): Set<string> {
+  return new Set((s.toLowerCase().match(/[a-z0-9_][a-z0-9_.+-]{3,}/g) ?? []).filter((w) => !SCOPE_STOP.has(w)));
+}
+
+/**
+ * Anchors: the nameable evidence that a recall hit is about what the cue asked
+ * (F4b, black-box report #4).
+ *
+ * Cosine cannot tell "this row answers the question" from "this row happens to
+ * sit nearby", and a real embedding model makes the two indistinguishable — while
+ * `relativeScore` (sim ÷ best sim of THIS set) then reads as a confidence the
+ * match never earned, and the digest injects the neighbour as if it were memory.
+ * An anchor is something a caller can point at: an identifier both sides carry,
+ * an entity the cue names, the subject of a structured claim the cue repeats, or
+ * at minimum one shared content word.
+ *
+ * The weakest tier is deliberately generous — one shared word of ≥4 characters
+ * (or ≥2 shared CJK ideographs) counts. Under-flagging leaves a real paraphrase
+ * in the digest; over-flagging would withhold answers, and a belt that starves
+ * the context is worse than the noise it removes. Only rows with NO lexical or
+ * structural overlap at all are called unanchored: pure vector drift.
+ */
+function recallAnchors(cue: string, mem: Pick<StoredMemory, 'summary' | 'entities'>): string[] {
+  const q = cue.toLowerCase();
+  const qWords = anchorWords(q);
+  const out: string[] = [];
+  if (literalOverlap(q, mem.summary) > 0) out.push('identifier');
+  if (mem.entities.some((e) => e.length > 1 && q.includes(e.toLowerCase()))) out.push('entity');
+  // The cue repeating the claim's SUBJECT — as the whole phrase, or as any word
+  // of it (a cue is usually shorter than a stored subject, so containment alone
+  // would under-report and leave the row looking merely word-adjacent).
+  const claim = claimParts(mem.summary);
+  if (
+    claim &&
+    claim.subject.length >= 4 &&
+    (q.includes(claim.subject) || [...anchorWords(claim.subject)].some((w) => qWords.has(w)))
+  ) {
+    out.push('subject');
+  }
+  if (out.length === 0) {
+    // Weakest tier, and deliberately generous: one shared topic word (or two
+    // shared CJK ideographs) anywhere in the row counts, even when it is only in
+    // the predicate rather than the thing being asked about.
+    const shared = [...anchorWords(mem.summary)].some((w) => qWords.has(w));
+    const cueHan = cjkChars(q);
+    let han = 0;
+    for (const ch of cjkChars(mem.summary)) if (cueHan.has(ch)) han++;
+    if (shared || han >= 2) out.push('vocabulary');
+  }
+  return out;
 }

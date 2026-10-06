@@ -88,10 +88,10 @@ const GUIDANCE = `## Long-term memory (hippocampus-inspired)
 
 You have an explicit long-term memory store. Follow this discipline instead of relying on the raw transcript for old facts:
 
-1. WRITE — after learning a durable fact or finishing a meaningful event, call memory_remember (kind: semantic = rules, episode = events, procedure = skills). Prefer a structured summary "<subject> -> <value>" so later corrections version cleanly instead of conflicting. When a fact holds only under conditions (population, comparator, release, environment, version), pass scope as "key=value; key=value" — the same sentence under a different scope is kept as its own trace instead of overwriting that one. Reach for scope whenever the same claim could be true in one setup and false in another: "latency -> 40ms" with scope "region=us-east; load=peak", "auth flow -> oauth" with scope "env=prod". Only state conditions you actually know — never invent a scope key to look precise; a fact with no real premise takes no scope.
-2. RECALL — before answering anything that depends on facts from earlier in this session (or a past session), call memory_recall with the question as the query. If your question is itself premise-bound (a specific environment, region, release, dataset), pass that same scope so a fact stored under a different premise is filtered out instead of misread as the answer.
-3. VERIFY — before asserting a remembered fact as current, call memory_verify with the claim and the scope you mean. Pass scope whenever the claim's truth depends on a premise you can name (env, region, version, population) — it makes the check answer OUT_OF_SCOPE instead of blessing a value stored under different conditions. Do not fabricate a scope you are not actually asking about. If it returns substantiated=false, answer "not in my memory / I don't know" — never confabulate. If contradicted, flag the conflict and use the newest revision. If out_of_scope, the stored answer is about different premises: do not carry it over.
-4. MAINTAIN — in long sessions call memory_maintain so the store stays readable: status (one-line health, plus which store file actually answered), duplicates (read-only report of restatements; inside a group marked mixedPremises the rows stated under different premises are not restatements of each other), then merge on a group you confirmed — merge folds the extras into the survivor, they stay in the store and undemote restores them, while delete also destroys the version history. consolidate / forget as usual.
+1. WRITE — after learning a durable fact or finishing a meaningful event, call memory_remember (kind: semantic = rules, episode = events, procedure = skills). Prefer a structured summary "<subject> -> <value>" so later corrections version cleanly instead of conflicting. When a fact holds only under conditions (population, comparator, release, environment, version), pass scope as "key=value; key=value" — the same sentence under a different scope is kept as its own trace instead of overwriting that one. Reach for scope whenever the same claim could be true in one setup and false in another: "latency -> 40ms" with scope "region=us-east; load=peak", "auth flow -> oauth" with scope "env=prod". Only state conditions you actually know — never invent a scope key to look precise; a fact with no real premise takes no scope. A plain condition phrase is a premise too and is compared the same way ("scope": "the production cluster"), so write the condition in whichever form you actually have; do not drop it because it does not look like key=value.
+2. RECALL — before answering anything that depends on facts from earlier in this session (or a past session), call memory_recall with the question as the query. If your question is itself premise-bound (a specific environment, region, release, dataset), pass that same scope so a fact stored under a different premise is filtered out instead of misread as the answer. Every hit carries anchored plus anchors naming which tier matched it (identifier / entity / subject / vocabulary, or recency when there was no cue to match against): relativeScore 1.000 only means "closest in this result set", and anchored:false means the row cleared the recall floor on cosine alone with nothing in common with your question — a lead to go re-check in the real source, never evidence to assert from.
+3. VERIFY — before asserting a remembered fact as current, call memory_verify with the claim and the scope you mean. Pass scope whenever the claim's truth depends on a premise you can name (env, region, version, population) — it makes the check answer OUT_OF_SCOPE instead of blessing a value stored under different conditions. Do not fabricate a scope you are not actually asking about. If it returns substantiated=false, answer "not in my memory / I don't know" — never confabulate. weak_match:true means exactly that: a trace is on the same topic and nothing ties it to your claim, so it is a lead to go re-check, not evidence — do not upgrade it to a yes by reading its support line. If contradicted, flag the conflict and use the newest revision. If out_of_scope, the stored answer is about different premises: do not carry it over.
+4. MAINTAIN — in long sessions call memory_maintain so the store stays readable: status (one-line health, plus which store file actually answered), duplicates (read-only report on two channels — by "text" for the same sentence restated, by "vector" for one statement worded differently; inside a group marked mixedPremises the rows stated under different premises are not restatements of each other), then merge on a group you confirmed — merge folds the extras into the survivor, they stay in the store and undemote restores them, while delete also destroys the version history. consolidate / forget as usual.
 5. The [hippo-memory digest] runtime-context block (when present) lists memories retrieved automatically for the current task with provenance — treat them as retrieved evidence, never as license to invent more. A line tagged [low-confidence …] is the closest trace *below* the recall floor: a guess about what you may have meant, not a memory — verify before asserting it and never repeat it as stored fact. They may lag one step behind a memory_remember write; trust memory_verify for authoritative checks.`;
 
 /* ------------------------------------------------------------------ */
@@ -136,17 +136,34 @@ function textOf(v, depth = 0) {
  */
 const INJECTED_PLUGIN_MARKS = ['system-prompt'];
 
-/** True when the node provably comes from prompt plumbing, not the human. */
+/**
+ * Source fields, measured 2026-10-05 against the installed host by
+ * .hippo/probe-session-api.mjs and .hippo/probe-session-source.mjs (the whole
+ * session registry: 366 log files, 1,046,504 events, 9,580 `user/message` nodes,
+ * of which 284 sessions replay through the host's own foldSurface()). Every
+ * user-role node carries `source.kind`; the human turns are the ones with kind
+ * 'user' (3,387 of them) and everything else is plumbing — tool results project
+ * to role 'user' as well (14,469), as do skill catalogs (601), time-context
+ * snapshots (411) and our own digest (3,152 nodes carry its marker: 2,345 under
+ * kind 'plugin', 798 under 'runtime-context', 5 quoted inside human turns).
+ * Nodes from before that attribution (no kind at all) stay eligible, which is
+ * what the legacy fixtures and older hosts produce.
+ */
 function isInjectedNode(node) {
-  const p = node?.source?.plugin ?? node?.plugin;
-  return typeof p === 'string' && INJECTED_PLUGIN_MARKS.some((m) => p.includes(m));
+  const src = node?.source ?? node?.data?.source;
+  const kind = src?.kind ?? node?.kind;
+  if (typeof kind === 'string') return kind !== 'user';
+  const p = src?.plugin ?? node?.plugin;
+  return typeof p === 'string' && (INJECTED_PLUGIN_MARKS.some((m) => p.includes(m)) || p !== 'user');
 }
 
 /**
  * Strip our own digest block out of a cue (suggestion 2). Accumulator nodes
  * quote prior turns including [hippo-memory digest] … [/memory data]; feeding
  * that back into recall is a self-loop (field: 72.5% hit, 24.3% closed loop).
- * Belt-and-braces next to the node whitelist: any accumulator can smuggle one.
+ * Belt-and-braces next to the node whitelist: any accumulator can smuggle one,
+ * and they do — of the 3,152 registry nodes carrying the marker, 5 sit on a
+ * `source.kind:'user'` node, where the whitelist alone would let them through.
  */
 function stripDigest(text) {
   return String(text ?? '')
@@ -169,13 +186,33 @@ function stripDigest(text) {
  */
 function latestUserCue(session) {
   try {
-    const nodes = session?.surface?.nodes;
+    // The host's own message projection, when it offers one. This is not a
+    // preference: `session.surface.nodes` is `readonly SessionSeq[]`
+    // (dsh-session/lib/types/surface.d.ts:120, pushed as `plan.seq` at
+    // dsh-session/lib/types/surface.js:439), so iterating it for message fields finds
+    // nothing — measured by .hippo/probe-session-api.mjs as an empty cue in 284 of 284
+    // real sessions replayed through the host's own foldSurface(), and the fix picks
+    // the newest human-attributed turn in 282 of them (the other 2 sessions contain
+    // no human turn). deriveMessages() (dsh-session/lib/index.js:1514) returns the
+    // Messages those seqs stand for.
+    let nodes = null;
+    if (session && typeof session.deriveMessages === 'function') {
+      try {
+        const projected = session.deriveMessages();
+        if (Array.isArray(projected)) nodes = projected;
+      } catch {
+        nodes = null; // degraded host: fall through to whatever the surface holds
+      }
+    }
+    if (!nodes) nodes = session?.surface?.nodes;
     if (nodes && Array.isArray(nodes)) {
       // Collect user-type nodes newest-first with stripped text.
       const cands = [];
       for (let i = nodes.length - 1; i >= 0; i--) {
         const node = nodes[i];
-        if (node && typeof node === 'object' && node.type && node.type !== 'user/message') continue;
+        if (!node || typeof node !== 'object') continue;
+        if (node.type && node.type !== 'user/message') continue; // event-shaped node
+        if (node.role && node.role !== 'user') continue;         // projected Message
         const text = stripDigest(textOf(node)).trim();
         if (text) cands.push({ node, text });
       }
@@ -189,13 +226,16 @@ function latestUserCue(session) {
       }
       for (let pass = 1; pass <= 3; pass++) {
         for (const c of cands) {
-          const plugin = c.node?.source?.plugin ?? c.node?.plugin;
+          const src = c.node.source ?? c.node.data?.source;
+          const plugin = src?.plugin ?? c.node?.plugin;
+          const kind = src?.kind ?? c.node?.kind;
           if (isInjectedNode(c.node)) continue; // prompt plumbing: never a cue
           if (pass === 1) {
             // Whitelist: explicit human origin, or no origin info at all
             // (pre-source shape) — and not boilerplate.
             if (c.boiler) continue;
             if (plugin != null && plugin !== 'user') continue;
+            if (kind != null && kind !== 'user') continue;
           } else if (pass === 2) {
             if (c.boiler) continue;
           }
@@ -240,6 +280,47 @@ function cleanJson(value) {
     return out;
   }
   return value;
+}
+
+/**
+ * Register a tool whose argument list is closed at the boundary (F5, black-box
+ * report #6).
+ *
+ * The host builds the parameter-object schema WITHOUT `additionalProperties`
+ * — `@deepseek-ai/dsh-tools` calls this an "implicit open parameter object" —
+ * and would only report an extra key if the tool declared
+ * `additionalProperties: false`. So an invented argument (a typo of `detail`,
+ * a hallucinated `not_a_field`) reaches `execute`, is dropped where the engine
+ * reads only the names it knows, and then reappears on the tool card from the
+ * `rawInput` echo — which reads to the model as "that argument landed".
+ *
+ * The tool is the only component that knows what it declared, so it says so
+ * here: refuse, name the unknown keys, and list the declared ones so the next
+ * call can be written correctly. Nothing is read or written on a refusal.
+ */
+function defineClosedTool(def) {
+  // The adapter declares parameters as a flat `name -> schema` map; accept the
+  // nested JSON-Schema form too so the guard does not silently no-op if that
+  // ever changes shape.
+  const params = def?.parameters;
+  const declared = Object.keys(params?.properties ?? params ?? {});
+  const inner = def?.execute;
+  if (!declared.length || typeof inner !== 'function') return defineTool(def);
+  return defineTool({
+    ...def,
+    async execute(args, exec) {
+      const unknown = Object.keys(args ?? {}).filter((k) => !declared.includes(k));
+      if (unknown.length) {
+        return cleanJson({
+          ok: false,
+          error:
+            `${def.name}: unknown argument(s) ${unknown.join(', ')} — not declared, so nothing was read or written. ` +
+            `Declared: ${declared.join(', ')}.`
+        });
+      }
+      return inner(args, exec);
+    }
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -488,7 +569,7 @@ function apply(ctx, config = {}) {
       const d = t.register(tool);
       if (typeof d === 'function') disposers.push(d);
     };
-    reg(defineTool({
+    reg(defineClosedTool({
       name: 'memory_remember',
       description: 'Write a durable fact / event / skill into long-term memory. Re-stating the same fact strengthens it; a changed value for the same subject becomes a versioned override (old revision archived, never silently lost). The response echoes the nearest existing neighbours so you can see what the store already believed; pass supersedes to explicitly retire wrong ids. scope_only_matches lists same-subject-key rows withheld from overwrite for lack of a shared entity (empty means nothing to report, not a skipped check). outcome merge fires only when an episode restates a semantic rule with nothing new. Numeric assertion-shaped semantic claims (arrow/copula) without passing verify_* evidence are stored as episodes; a freshly VERIFIED incumbent is retired only by passing evidence (else both rows are kept with a shielded: warning). Tag a retraction with tags ["retraction"] plus retracts:<id>; tag prospective trigger/action pairs with tags ["guard"] plus guard_trigger/guard_action.',
       parameters: {
@@ -510,7 +591,7 @@ function apply(ctx, config = {}) {
         guard_trigger: { type: 'string', description: 'Future situation this guards (use with tags ["guard"]).' },
         guard_action: { type: 'string', description: 'What to do when guard_trigger matches.' },
         supersedes: { type: 'array', items: { type: 'string' }, description: 'Ids of existing memories this write corrects/retires. Use when you verified a stored claim is wrong and are writing the replacement: the listed rows get superseded (kept for audit, excluded from recall), and verify/recall surface the newer conclusion instead.' },
-        scope: { type: 'string', description: 'The conditions this statement holds under, as `key=value` segments separated by "; " — e.g. "population=all records; comparator=instruction start". Use it whenever the same sentence could be true under one setup and false under another: a write whose scope disagrees with an existing row becomes its own trace instead of merging into it, and memory_verify compares scopes and answers OUT_OF_SCOPE rather than blessing the wrong one.' }
+        scope: { type: 'string', description: 'The conditions this statement holds under: `key=value` segments separated by "; " ("population=all records; comparator=instruction start"), or a plain condition phrase you actually have ("the production cluster", "us-east") — both are compared as premises, and a bare phrase is checked against another bare phrase *and* against the conditions other rows name by key. Use it whenever the same sentence could be true under one setup and false under another: a write whose scope disagrees with an existing row becomes its own trace instead of merging into it, and memory_verify compares scopes and answers OUT_OF_SCOPE rather than blessing the wrong one.' }
       },
       output: outputOf(),
       async execute(args, exec) {
@@ -584,16 +665,16 @@ function apply(ctx, config = {}) {
       },presentCall: (args) => present('Remember', 'write', args.summary)
     }));
 
-    reg(defineTool({
+    reg(defineClosedTool({
       name: 'memory_recall',
-      description: 'Retrieve memories matching a question (cue-driven recall). Use before answering anything that depends on facts from earlier in the session or past sessions. Every hit carries provenance (source/confidence/version/time) and conflict warnings flag newer revisions of the same subject.',
+      description: 'Retrieve memories matching a question (cue-driven recall). Use before answering anything that depends on facts from earlier in the session or past sessions. Every hit carries provenance (source/confidence/version/time) and conflict warnings flag newer revisions of the same subject. Every hit also carries `anchored` and `anchors`: whether an identifier, entity, claim subject or shared word ties it to your cue (or `recency` when no cue was given). `similarity` is the raw cosine and `relativeScore` only ranks this result set — a hit can be 1.000 relative and `anchored: false`, which means it is the closest thing stored, not evidence for your question.',
       parameters: {
         query: { type: 'string', required: true, description: 'The question / retrieval cue, natural language.' },
         entities: { type: 'array', items: { type: 'string' }, description: 'Restrict to memories about these entities.' },
         kind: { type: 'string', enum: ['episode', 'semantic', 'procedure'], description: 'Restrict to one kind.' },
         limit: { type: 'number', description: 'Max hits (default 8, max 20).' },
         include_demoted: { type: 'boolean', description: 'Also surface compress-folded rows (default false: their invariant covers them).' },
-        scope: { type: 'string', description: 'The premise your question is bound to, as `key=value; key=value`. Rows whose stated scope disagrees are excluded entirely, so a fact stored under a different premise (another env/region/release) is filtered out instead of misread as the answer.' }
+        scope: { type: 'string', description: 'The premise your question is bound to — `key=value; key=value`, or the plain condition phrase you actually have ("us-east", "the staging cluster"). Rows whose stated scope disagrees are excluded entirely, so a fact stored under a different premise (another env/region/release) is filtered out instead of misread as the answer.' }
       },
       output: outputOf(),
       async execute(args, exec) {
@@ -628,6 +709,11 @@ function apply(ctx, config = {}) {
             similarity: Number(h.similarity.toFixed(3)),
             relativeScore: h.relativeScore,
             literalMatch: h.literalMatch,
+            // F4b: relativeScore is relative to THIS set, not a confidence scale.
+            // `anchored: false` means the row cleared the floor on cosine alone,
+            // with no identifier, entity, claim subject or word shared with the cue.
+            anchored: h.anchored,
+            anchors: h.anchors ?? [],
             consolidated: h.consolidated
           })),
           warnings: res.warnings,
@@ -650,12 +736,12 @@ function apply(ctx, config = {}) {
       presentCall: (args) => present('Recall', 'read', args.query)
     }));
 
-    reg(defineTool({
+    reg(defineClosedTool({
       name: 'memory_verify',
-      description: 'Source-monitoring check for a factual claim: SUBSTANTIATED (memory supports it), CONTRADICTED (memory holds the opposite / a newer revision), OUT_OF_SCOPE (the closest trace holds under premises your `scope` argument disagrees with), or UNSUBSTANTIATED (no memory). Call BEFORE asserting remembered facts. Never assert an unsubstantiated claim as fact — answer "not in my memory" instead.',
+      description: 'Source-monitoring check for a factual claim: SUBSTANTIATED (memory supports it at claim level), CONTRADICTED (memory holds the opposite / a newer revision), OUT_OF_SCOPE (a trace about the same subject holds under premises your `scope` argument disagrees with — see scope_conflicts), WEAK_MATCH (weak_match:true: a trace is topically nearby but nothing anchors it to your claim — a lead to re-check, NOT evidence), or UNSUBSTANTIATED (no memory). Call BEFORE asserting remembered facts. Only substantiated:true may be stated as remembered fact — a weak or missing match means "not in my memory / I have not verified it".',
       parameters: {
         claim: { type: 'string', required: true, description: 'The claim you intend to assert.' },
-        scope: { type: 'string', description: 'The conditions you are asking about, in the same `key=value; key=value` form memory_remember takes. Memory stated under a disagreeing scope is reported OUT_OF_SCOPE instead of substantiated, and the trace stated under YOUR premises is chosen as the support even when another row matches the wording more closely.' }
+        scope: { type: 'string', description: 'The conditions you are asking about, in the same form memory_remember takes — `key=value; key=value` or a plain condition phrase ("us-east", "the staging cluster"). Memory stated under a disagreeing scope is reported OUT_OF_SCOPE instead of substantiated, and the trace stated under YOUR premises is chosen as the support even when another row matches the wording more closely.' }
       },
       output: outputOf(),
       async execute(args, exec) {
@@ -666,6 +752,8 @@ function apply(ctx, config = {}) {
           substantiated: v.substantiated,
           contradicted: v.contradicted,
           out_of_scope: v.out_of_scope === true,
+          weak_match: v.weak_match === true,
+          scope_conflicts: v.scope_conflicts ?? [],
           support: v.support ?? null,
           contradiction: v.contradiction ?? null,
           closest: v.closest ?? null,
@@ -680,11 +768,11 @@ function apply(ctx, config = {}) {
       presentCall: (args) => present('Verify claim', 'check', args.claim)
     }));
 
-    reg(defineTool({
+    reg(defineClosedTool({
       name: 'memory_maintain',
       description: 'Long-term memory housekeeping. consolidate: abstract well-established episodes into durable semantic rules. compress: fold N same-scope traces into 1 caller-authored invariant + K representatives (dry_run previews groups; apply with plan_json; undemote restores). merge: collapse the near-duplicate restatements a "duplicates" group reports into one live trace (dry_run previews which row survives; the rest stay live but hidden, undemote restores). forget: decay / soft-delete weak traces (preview with dry_run). stats: store summary. list: newest-first inventory of active memories. history: show revision history of one memory id. delete: permanently remove a memory by id. prune: delete store files that hold no memories. status: embedder/plugin state.',
       parameters: {
-        action: { type: 'string', required: true, enum: ['consolidate', 'compress', 'undemote', 'forget', 'stats', 'list', 'history', 'delete', 'prune', 'duplicates', 'merge', 'override-audit', 'status'], description: 'Which maintenance action to run. "duplicates" reports near-duplicate restatements (read-only); a group is tagged mixedPremises:true when any two rows in it state incompatible premises. "merge" acts on ONE duplicates group: ids:[group ids] with dry_run (default) previews, dry_run:false retires the extras into the survivor. "override-audit" screens overridden rows whose archived text shares little with the live text — the signature of an unrelated memory retired by an override (read-only). "compress" with dry_run (default) proposes foldable groups; with dry_run:false plus plan_json it folds.' },
+        action: { type: 'string', required: true, enum: ['consolidate', 'compress', 'undemote', 'forget', 'stats', 'list', 'history', 'delete', 'prune', 'duplicates', 'merge', 'override-audit', 'status'], description: 'Which maintenance action to run. "duplicates" reports duplicates (read-only) on two channels, and each group says which one found it: by "text" is the same sentence restated (a `FACT:` wrapper, case, whitespace), by "vector" is one statement worded differently — at or above the engine near-duplicate bar (default 0.92), with the group similarity reporting its weakest link. A group is tagged mixedPremises:true when any two rows in it state incompatible premises. "merge" acts on ONE duplicates group: ids:[group ids] with dry_run (default) previews, dry_run:false retires the extras into the survivor. "override-audit" screens overridden rows whose archived text shares little with the live text — the signature of an unrelated memory retired by an override (read-only). "compress" with dry_run (default) proposes foldable groups; with dry_run:false plus plan_json it folds.' },
         id: { type: 'string', description: 'Memory id (history/delete action).' },
         ids: { type: 'array', items: { type: 'string' }, description: 'Memory ids (undemote action; merge: the ids of ONE duplicates group).' },
         into: { type: 'string', description: 'merge: id to keep instead of the one the engine would pick (must be one of ids).' },

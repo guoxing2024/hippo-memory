@@ -88,6 +88,20 @@ test('verify reports support, contradiction and superseded matches', async () =>
   assert.ok(verdict.note);
 });
 
+test('verify passes the WEAK_MATCH verdict and vetoing premises through to the model', async () => {
+  const { hooks, ctx } = await pluginFor();
+  await hooks.tool.memory_remember.execute({ kind: 'semantic', summary: 'ZZOCCUR the backend language is python' }, ctx);
+  const weak = JSON.parse(await hooks.tool.memory_verify.execute({ claim: 'ZZOCCUR python brews the best espresso' }, ctx));
+  assert.equal(weak.substantiated, false, `topical proximity is not a yes: ${weak.note}`);
+  assert.equal(weak.weak_match, true, 'the adapter must hand over the verdict, not swallow it');
+
+  await hooks.tool.memory_remember.execute({ kind: 'semantic', summary: 'ZZVETO quota -> 40', scope: 'env=prod' }, ctx);
+  await hooks.tool.memory_remember.execute({ kind: 'semantic', summary: 'ZZVETO quota numbers are watched closely' }, ctx);
+  const veto = JSON.parse(await hooks.tool.memory_verify.execute({ claim: 'ZZVETO quota -> 40', scope: 'env=dev' }, ctx));
+  assert.equal(veto.out_of_scope, true, `a scope-less fallback must not bless foreign premises: ${veto.note}`);
+  assert.ok(Array.isArray(veto.scope_conflicts) && veto.scope_conflicts.length > 0, 'the vetoing row is named');
+});
+
 test('remember carries scope and verify answers OUT_OF_SCOPE for foreign premises', async () => {
   const { hooks, ctx } = await pluginFor();
   const written = JSON.parse(
@@ -317,4 +331,97 @@ test('cue helpers flatten opencode message shapes', () => {
 test('discipline names merge and explains the digest guess line', () => {
   assert.match(DISCIPLINE, /\bmerge\b/, 'a duplicates report the agent cannot act on is a dead end');
   assert.match(DISCIPLINE, /low-confidence/, 'the digest can carry one line that is a guess');
+});
+
+// ---------------------------------------------------------------------------
+// F5 (black-box report #6): the host accepts arguments a tool never declared.
+//
+// `@deepseek-ai/dsh-tools` builds the parameter object schema without
+// `additionalProperties` ("implicit open parameter object"), and opencode passes
+// the model's JSON through as-is, so an invented key — a typo of `detail`, a
+// hallucinated `not_a_field` — was accepted, silently dropped by the engine, and
+// then echoed back on the tool card from `rawInput` as if it had landed. The
+// boundary is the only place that knows what it declared, so the boundary says so.
+// ---------------------------------------------------------------------------
+
+test('F5: an undeclared argument is refused, naming the declared ones', async () => {
+  const { hooks, ctx } = await pluginFor();
+  const res = JSON.parse(
+    await hooks.tool.memory_remember.execute(
+      { kind: 'semantic', summary: 'ZZF5 the deploy gate runs the smoke suite first', detail2: 'typo', not_a_field: true },
+      ctx,
+    ),
+  );
+  assert.equal(res.ok, false, `the call must fail: ${JSON.stringify(res)}`);
+  assert.match(res.error, /unknown argument/i);
+  assert.match(res.error, /detail2/);
+  assert.match(res.error, /not_a_field/);
+  assert.match(res.error, /summary/, 'the caller must see what it could have written');
+
+  const rec = JSON.parse(await hooks.tool.memory_recall.execute({ query: 'ZZF5 the deploy gate runs the smoke suite first' }, ctx));
+  assert.equal(rec.hits.length, 0, 'a refused write stores nothing');
+});
+
+test('F5 guard: declared arguments still pass the boundary', async () => {
+  const { hooks, ctx } = await pluginFor();
+  const written = JSON.parse(
+    await hooks.tool.memory_remember.execute(
+      { kind: 'semantic', summary: 'ZZF5b the deploy gate runs the smoke suite first', detail: 'after the build', scope: 'env=staging' },
+      ctx,
+    ),
+  );
+  assert.equal(written.outcome, 'new', JSON.stringify(written));
+});
+
+// F4b: same plumbing guarantee on the opencode side — `hitView` lists fields
+// explicitly, so an unlisted engine field never reaches the model.
+
+test('F4b: memory_recall carries the anchor fields on every hit', async () => {
+  const { hooks, ctx } = await pluginFor();
+  await hooks.tool.memory_remember.execute(
+    { kind: 'semantic', summary: 'ZZF4b the canary window is one hour before the rollback gate' },
+    ctx
+  );
+  const rec = JSON.parse(await hooks.tool.memory_recall.execute({ query: 'ZZF4b canary window' }, ctx));
+  assert.equal(rec.hits.length, 1, 'the fixture row is a hit');
+  assert.equal(typeof rec.hits[0].anchored, 'boolean', `anchored must arrive: ${JSON.stringify(rec.hits[0])}`);
+  assert.equal(rec.hits[0].anchored, true, 'a cue naming the claim subject is anchored');
+  assert.ok(rec.hits[0].anchors.includes('subject'), `tiers: ${JSON.stringify(rec.hits[0].anchors)}`);
+});
+
+// The instruction surface for the F batch: the engine changed what a hit means,
+// so the text the model reads has to change with it. Report #2's root cause was
+// an instruction that taught one ritual (`key=value`) agents do not write, and
+// report #4's was a ranking number that reads like a confidence score.
+
+test('instruction surface: memory_recall describes the fields it actually sends', async () => {
+  const { hooks } = await pluginFor();
+  const d = hooks.tool.memory_recall.description;
+  assert.match(d, /anchored/i, `the hit field must be named where the model reads how to use it: ${d}`);
+  assert.match(d, /anchors/, 'the tier list is the readable part');
+  assert.match(d, /relativeScore/, 'the ranking value must be told apart from evidence');
+  // hitView sends similarity/relativeScore, never a bare `score`.
+  assert.doesNotMatch(d, /\bscore\b/, `the description must not promise a field the view drops: ${d}`);
+});
+
+test('instruction surface: duplicates is described as two channels', async () => {
+  const { hooks } = await pluginFor();
+  const d = `${hooks.tool.memory_maintain.description} ${hooks.tool.memory_maintain.args.action.description}`;
+  assert.match(d, /\btext\b/, 'the verbatim-restatement channel');
+  assert.match(d, /vector/i, 'a paraphrase of one statement is a duplicate too (report #1)');
+});
+
+test('instruction surface: every scope argument documents the plain form', async () => {
+  const { hooks } = await pluginFor();
+  for (const name of ['memory_remember', 'memory_recall', 'memory_verify']) {
+    const sc = hooks.tool[name].args.scope;
+    assert.ok(sc, `${name} takes scope`);
+    assert.match(sc.description ?? '', /plain condition/i, `${name}: scope must not teach only key=value`);
+  }
+});
+
+test('instruction surface: DISCIPLINE names anchors, both channels, plain premises', async () => {
+  assert.match(DISCIPLINE, /anchored/, 'RECALL must say what anchored:false means');
+  assert.match(DISCIPLINE, /vector/i, 'MAINTAIN must say the report also catches paraphrases');
+  assert.match(DISCIPLINE, /plain condition/i, 'WRITE must not teach a ritual agents do not write');
 });

@@ -121,6 +121,12 @@ export interface StoredMemory {
   semantic?: SemanticContent;
   entities: string[];
   tags: string[];
+  /**
+   * True when systems consolidation produced this row — read back from the
+   * `consolidated` tag `consolidate()` writes (F4: one meaning, not a kind
+   * alias). A plain `semantic` row the caller wrote directly is NOT consolidated.
+   */
+  consolidated?: boolean;
   occurredAt?: string;
   source?: string;
   confidence: SourceConfidence;
@@ -190,7 +196,22 @@ export interface RetrievedMemory extends StoredMemory {
   relativeScore: number;
   /** Number of shared literal identifier tokens (0x…, D-123, sha, version). */
   literalMatch?: number;
-  /** True when the hit came from the consolidated semantic store. */
+  /**
+   * Nameable evidence tying this hit to the cue: `identifier` (a literal id both
+   * sides carry), `entity` (an entity of the row that the cue names), `subject`
+   * (the subject of a structured claim the cue repeats), `vocabulary` (weakest
+   * tier — one shared content word, reported only when nothing stronger matched),
+   * or `recency` (a recency-buffer row, which claims no relevance to the cue at
+   * all). Empty when the row is close to the cue in vector space and nothing else.
+   */
+  anchors: string[];
+  /**
+   * `anchors.length > 0`. False means the hit is cosine proximity alone, so
+   * `relativeScore` (which is relative to THIS result set, not to a confidence
+   * scale) must not be read as "this answers the question".
+   */
+  anchored: boolean;
+  /** True when systems consolidation produced this row (the `consolidated` tag), not merely when it is semantic. */
   consolidated: boolean;
   /** True when this hit came from the recency buffer, not goal-relevance. */
   recent?: boolean;

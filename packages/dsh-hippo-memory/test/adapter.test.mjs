@@ -294,6 +294,25 @@ test('remember carries scope and verify answers OUT_OF_SCOPE for foreign premise
   assert.equal(r.hits[0].scope, 'population=all records; comparator=instruction start');
 });
 
+test('verify hands the model the WEAK_MATCH verdict and the vetoing premises', async () => {
+  const agent = { agent: { id: 'weakmatch-agent' } };
+  await toolExec('memory_remember', { kind: 'semantic', summary: 'ZZWEAK the backend language is python', entities: ['python'] }, agent);
+  const weak = await toolExec('memory_verify', { claim: 'ZZWEAK python brews the best espresso' }, agent);
+  assert.ok(weak.support ?? weak.closest, `the nearby trace must still be shown: ${weak.note}`);
+  assert.equal(weak.substantiated, false, `topical proximity is not a yes: ${weak.note}`);
+  assert.equal(weak.weak_match, true, 'the verdict has to be named, not inferred from a note');
+
+  const scoped = { agent: { id: 'scopeveto-agent' } };
+  await toolExec('memory_remember', { kind: 'semantic', summary: 'ZZVETO quota -> 40', scope: 'env=prod', entities: ['quota'] }, scoped);
+  await toolExec('memory_remember', { kind: 'semantic', summary: 'ZZVETO quota numbers are watched closely', entities: ['quota'] }, scoped);
+  const veto = await toolExec('memory_verify', { claim: 'ZZVETO quota -> 40', scope: 'env=dev' }, scoped);
+  assert.equal(veto.out_of_scope, true, `a scope-less fallback must not bless foreign premises: ${veto.note}`);
+  assert.ok(
+    veto.scope_conflicts.some((c) => c.scope === 'env=prod'),
+    `the vetoing row must be named: ${JSON.stringify(veto.scope_conflicts)}`
+  );
+});
+
 /* ------------------------- maintain: stats/list/history ------------------------- */
 
 test('maintain stats and list reflect stored memories', async () => {
@@ -619,6 +638,77 @@ test('cue extraction skips repeated template prefixes (R29 second defense)', () 
   assert.ok(latestUserCue(only).includes('turn 2'), 'last resort keeps availability');
 });
 
+// Field shape, measured 2026-10-05 against the installed host (@deepseek-ai/dsh
+// 0.1.7-rc.2) by .hippo/probe-session-api.mjs, which replays the user's own durable
+// logs through the host's own foldSurface()/deriveEventMessage(). Corpus: the whole
+// session registry — 366 log files, 1,046,504 events, 9,580 `user/message` nodes,
+// 331 folds taken, 284 of them with a non-empty surface (mirrors:
+// .hippo/cue-fix-round16-api.txt, -source.txt, -digest.txt).
+//   * session.surface.nodes holds SessionSeq NUMBERS in 284/284 sessions
+//     (dsh-session/lib/index.js:1516 reads them, surface.js:439 pushes plan.seq),
+//     so iterating it for .type/.content finds nothing: latestUserCue returned
+//     len=0 in 284/284 sessions.
+//   * the Message objects live behind deriveMessages() (dsh-session/lib/index.js:1514),
+//     where the cue walk has to run. Same sessions gave a usable cue in 282/284; the
+//     other 2 contain no human turn at all.
+//   * user ROLE is not the human: the projection returns role:'user' for tool
+//     results too (14,469 of them vs 3,387 with source.kind === 'user'), distinguished
+//     only by source.kind — dsh-llm/lib/types/message.d.ts:110 MessageSourceMap.
+//   * our own digest is attributed, not just marked: source
+//     {kind:'plugin', plugin:'@deepseek-ai/dsh-system-prompt', form:'snapshot',
+//     sections:[{name:'hippo-memory:digest', …}]}; 3,152 logged nodes carry the
+//     marker (2,345 kind 'plugin', 798 kind 'runtime-context', 5 quoted inside a
+//     human turn — those last 5 are why stripDigest stays next to this filter).
+//   * harness correction owed: the first selection check reported 43/284 "cue
+//     differs", all of them the probe's own normalization — it joined content blocks
+//     keeping the empty ones and skipped stripDigest's `[ \t]{2,}` collapse, so the
+//     800-char slice landed at a different offset. Reproducing textOf + stripDigest
+//     in the probe took it to 282/284 equal, 2 legitimately without a human turn.
+const msg = (text, source) => ({ role: 'user', content: [{ type: 'text', text }], source });
+const hostSession = (messages) => ({
+  surface: { nodes: messages.map((_, i) => i + 1) },
+  deriveMessages: () => messages
+});
+
+test('cue reads the host projection because surface.nodes are seq numbers', () => {
+  const cue = latestUserCue(hostSession([
+    { role: 'assistant', content: [{ type: 'text', text: 'assistant prose' }], source: { kind: 'model', provider: 'p', model: 'm' } },
+    msg('why does the citation gate report bad refs?', { kind: 'user' })
+  ]));
+  assert.equal(cue, 'why does the citation gate report bad refs?');
+  // Degradation guard: a session that exposes neither the projection nor object
+  // nodes must yield '' rather than throwing (the caller then takes the recency path).
+  assert.equal(latestUserCue({ surface: { nodes: [7, 8, 9] } }), '');
+});
+
+test('cue ignores user-role messages the host attributes to something other than the human', () => {
+  const session = hostSession([
+    msg('the real question from the human', { kind: 'user' }),
+    msg('{"ok":true,"hits":[]}', { kind: 'tool', callId: 'c1' }),
+    msg('available skills: a, b, c', { kind: 'skill-catalog', form: 'catalog' })
+  ]);
+  assert.equal(latestUserCue(session), 'the real question from the human', 'tool output and catalogs are not cues');
+  // Nothing human at all: no cue, rather than a tool result posing as one.
+  assert.equal(latestUserCue(hostSession([msg('tool payload', { kind: 'tool', callId: 'c2' })])), '');
+});
+
+test('cue excludes our own digest by its host attribution, not only by its marker', () => {
+  const digestNode = {
+    role: 'user',
+    content: [{ type: 'text', text: '[hippo-memory digest]\n1. [semantic] old note\n[/memory data]' }],
+    source: {
+      kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt', form: 'snapshot',
+      sections: [{ name: 'sandbox:policy', text: 'p' }, { name: 'hippo-memory:digest', text: '1. [semantic] old note' }]
+    }
+  };
+  const session = hostSession([msg('human turn before the digest', { kind: 'user' }), digestNode]);
+  assert.equal(latestUserCue(session), 'human turn before the digest');
+  // The same snapshot published under a kind with no plugin field (measured: 4
+  // runtime-context nodes carry our section) is still not a cue.
+  const untagged = { ...digestNode, source: { kind: 'runtime-context', form: 'snapshot', sections: digestNode.source.sections } };
+  assert.equal(latestUserCue(hostSession([untagged])), '', 'digest-only nodes never seed recall');
+});
+
 test('compress previews groups, folds on plan, expands and restores', async () => {
   const agent = { agent: { id: 'compress-agent' } };
   const ids = [];
@@ -718,4 +808,108 @@ test('status names the store split: empty here, full next door', async () => {
     'the engine rule reaches the model through status');
   assert.match(String(st.health), /split|another store|sibling/i, `health says it plainly: ${st.health}`);
   assert.match(String(st.path_rule), /agent/i, 'and names the rule this host applies');
+});
+
+/* ------------------------- F5: undeclared arguments ------------------------- */
+// Black-box report #6. The host's parameter-object schema carries no
+// `additionalProperties` (dsh-tools calls it "implicit open parameter object"),
+// so an invented key reaches `execute` and is dropped in silence — while the tool
+// card echoes `rawInput` back, which reads as though the argument had landed.
+
+test('F5: memory_remember refuses an undeclared argument and names the declared ones', async () => {
+  const res = await toolExec('memory_remember', {
+    kind: 'semantic',
+    summary: 'ZZF5 the deploy gate runs the smoke suite first',
+    detail2: 'typo of detail',
+    not_a_field: true
+  });
+  assert.equal(res.ok, false, `the call must fail: ${JSON.stringify(res)}`);
+  assert.match(res.error, /unknown argument/i);
+  assert.match(res.error, /detail2/);
+  assert.match(res.error, /not_a_field/);
+  assert.match(res.error, /summary/, 'the caller must see what it could have written');
+
+  const back = await toolExec('memory_recall', { query: 'ZZF5 the deploy gate runs the smoke suite first', limit: 5 });
+  assert.equal(back.hits.length, 0, 'a refused write stores nothing');
+});
+
+test('F5: every memory tool guards its own boundary', async () => {
+  for (const [name, args] of [
+    ['memory_recall', { query: 'zzf5 anything', max_hops: 3 }],
+    ['memory_verify', { claim: 'zzf5 anything', strictness: 'hard' }],
+    ['memory_maintain', { action: 'stats', wee: 1 }]
+  ]) {
+    const res = await toolExec(name, args);
+    assert.equal(res.ok, false, `${name} must refuse: ${JSON.stringify(res)}`);
+    assert.match(res.error, /unknown argument/i, `${name} names the problem: ${res.error}`);
+    assert.match(res.error, /declared/i, `${name} lists what is declared: ${res.error}`);
+  }
+});
+
+test('F5 guard: declared arguments still pass every boundary', async () => {
+  const written = await toolExec('memory_remember', {
+    kind: 'semantic',
+    summary: 'ZZF5b the deploy gate runs the smoke suite first',
+    detail: 'after the build',
+    scope: 'env=staging'
+  });
+  assert.notEqual(written.ok, false, JSON.stringify(written));
+  const verified = await toolExec('memory_verify', { claim: 'ZZF5b the deploy gate runs the smoke suite first', scope: 'env=staging' });
+  assert.notEqual(verified.ok, false, JSON.stringify(verified));
+  const stats = await toolExec('memory_maintain', { action: 'stats' });
+  assert.notEqual(stats.ok, false, JSON.stringify(stats));
+});
+
+// F4b: the host must see WHY a hit matched, not only how close it is. The
+// engine suite (test/recall-anchors.test.mjs) pins the anchor semantics; this
+// pins that the adapter does not drop the fields on the way out — the hit map
+// lists fields explicitly, so an unlisted one silently never arrives.
+
+test('F4b: memory_recall carries the anchor fields on every hit', async () => {
+  await toolExec('memory_remember', {
+    kind: 'semantic',
+    summary: 'ZZF4b the canary window is one hour before the rollback gate'
+  });
+  const res = await toolExec('memory_recall', { query: 'ZZF4b canary window', limit: 5 });
+  assert.equal(res.hits.length, 1, 'the fixture row is a hit');
+  const hit = res.hits[0];
+  assert.equal(typeof hit.anchored, 'boolean', `anchored must arrive: ${JSON.stringify(hit)}`);
+  assert.equal(hit.anchored, true, 'a cue naming the claim subject is anchored');
+  assert.ok(Array.isArray(hit.anchors), 'anchors is a list, not a bare flag');
+  assert.ok(hit.anchors.includes('subject'), `tiers: ${JSON.stringify(hit.anchors)}`);
+});
+
+// The instruction surface for the F batch. The engine fixes change what the host
+// *receives*; the model only benefits if the tool description and the injected
+// handbook *name* it — a field no prompt mentions is a field nobody reads, and
+// report #2's root cause was precisely that the handbook taught one ritual
+// (`key=value`) that real agents do not write.
+
+test('instruction surface: memory_recall tells the model about the anchor fields', () => {
+  const d = tools.get('memory_recall').description;
+  assert.match(d, /anchored/i, `the hit field must be named where the model decides how to use a hit: ${d}`);
+  assert.match(d, /anchors/, 'the tier list is the readable part');
+  assert.match(d, /relativeScore/, 'the ranking value must be told apart from evidence');
+});
+
+test('instruction surface: duplicates is described as two channels', () => {
+  const t = tools.get('memory_maintain');
+  const d = `${t.description} ${t.parameters.properties.action.description}`;
+  assert.match(d, /\btext\b/, 'the verbatim-restatement channel');
+  assert.match(d, /vector/i, 'a paraphrase of one statement is a duplicate too (report #1)');
+});
+
+test('instruction surface: every scope argument accepts a plain premise', () => {
+  for (const name of ['memory_remember', 'memory_recall', 'memory_verify']) {
+    const p = tools.get(name).parameters.properties.scope;
+    assert.ok(p, `${name} takes scope`);
+    assert.match(p.description, /plain condition/i, `${name}: ${p.description}`);
+  }
+});
+
+test('instruction surface: the injected guidance names anchors, both channels, plain premises', () => {
+  const text = sections.find((s) => s.name === 'plugin:hippo-memory').text;
+  assert.match(text, /anchored/, 'RECALL must say what anchored:false means');
+  assert.match(text, /vector/i, 'MAINTAIN must say the report also catches paraphrases');
+  assert.match(text, /plain condition/i, 'WRITE must not teach a ritual agents do not write');
 });

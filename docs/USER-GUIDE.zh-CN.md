@@ -1,7 +1,7 @@
 # 🧠 HippoMemory 使用说明（完整版）
 
-> 适用插件：**dsh-hippo-memory 0.3.0** ｜ 核心引擎：**hippo-memory-core 0.3.0** ｜ opencode 用户见 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md)（0.3.0） ｜ 更新：2026-09-20
-> 本文覆盖 **0.3.0** 的五组改动（前提作用域 `scope` + recall 硬过滤、重复合并 `merge`、门槛未过的兜底提示、库分裂可见、fuzzy 归档误报订正 + 适配层透传补齐），相关小节标有"0.3.0"。**0.3.0 已发布到 npm**；此前 npm 上的 0.2.x 装上没有这些接口，读到标了"0.3.0"的小节时请对照 [CHANGELOG](../CHANGELOG.md)。
+> 适用插件：**dsh-hippo-memory 0.3.2** ｜ 核心引擎：**hippo-memory-core 0.3.2** ｜ opencode 用户见 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md)（0.3.2） ｜ 更新：2026-09-25
+> 本文覆盖 **0.3.0** 的五组改动（前提作用域 `scope` + recall 硬过滤、重复合并 `merge`、门槛未过的兜底提示、库分裂可见、fuzzy 归档误报订正 + 适配层透传补齐），相关小节标有"0.3.0"；另覆盖 **0.3.2** 的 `memory_verify` 契约订正（**yes 与矛盾两条出口都要锚**、中文值冲突不再被盖章、前提冲突的行可跨支持位否决），相关小节标有"0.3.2"，见 [7.3](#73-memory_verify--断言前查证) 与 [9.13](#913-verify-的-yes-需要什么032)。**0.3.2 本批在本地全绿、npm 尚未发布**（上一发布线：引擎与 opencode 0.3.0、DSH 适配层 0.3.1）；对照 [CHANGELOG](../CHANGELOG.md)。
 > 本文写给使用的人：不写代码也能照做。想了解设计原理请看 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 目录
@@ -13,7 +13,7 @@
 5. [四条使用纪律](#5-四条使用纪律)
 6. [对话模板（可直接复制）](#6-对话模板可直接复制)
 7. [工具速查](#7-工具速查)
-8. [十三种典型场景的实操话术](#8-十三种典型场景的实操话术)
+8. [十四种典型场景的实操话术](#8-十四种典型场景的实操话术)
 9. [读懂记忆系统（进阶）](#9-读懂记忆系统进阶)
 10. [数据、备份与迁移](#10-数据备份与迁移)
 11. [故障排查 FAQ](#11-故障排查-faq)
@@ -253,7 +253,7 @@ hippo-memory:
 |---|---|---|
 | **WRITE 写** | 学到持久结论、做完决策 → 立刻 `memory_remember` | 这轮结束时结论随上下文一起消失 |
 | **RECALL 查** | 被问到旧事实、旧决策 → 先 `memory_recall` | 凭印象答 → 记混、记旧 |
-| **VERIFY 验** | 断言记忆里的东西之前 → `memory_verify` | 记忆没把握却说得像真的 → 幻觉 |
+| **VERIFY 验** | 断言记忆里的东西之前 → `memory_verify`；只有 `substantiated: true` 算数（0.3.2 起 `weak_match: true` 也是"没记过"） | 记忆没把握却说得像真的 → 幻觉 |
 | **MAINTAIN 理** | 长会话里定期 `status` / `duplicates`（确认后 `merge` 折叠，0.3.0）/ `consolidate` / `forget` | 库越堆越乱、重复条目互相干扰 |
 
 写记忆时的三条额外建议：
@@ -272,7 +272,7 @@ hippo-memory:
 【启用长期记忆】从现在起：
 1. 学到持久结论、做完决策、查明事实，调用 memory_remember 存下来（summary 用 <主体> -> <结论> 格式）；
 2. 涉及旧事实、旧决策，先 memory_recall 查记忆库，不要只凭当前对话猜；
-3. 要引用"我记得……"之前，先用 memory_verify 核对；没依据就直说记忆里没有，不要编；
+3. 要引用"我记得……"之前，先用 memory_verify 核对；没依据就直说记忆里没有，不要编。返回 weak_match 也算"没依据"（那是话题相近但没锚住的痕迹，别读它的 support 反推出一个 yes）；
 4. 长会话定期 memory_maintain 整理（先看 status 和 duplicates，重复组先报给我再动手）；清理重复用 merge 折叠（没有 merge 动作的旧版本就停在报告，不要用 delete，那会连版本历史一起删）。
 每轮收尾自检一句：这轮有没有值得长期保留的结论？
 ```
@@ -370,16 +370,20 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 
 | 返回字段 | 含义 |
 |---|---|
-| `substantiated` | 记忆支持这句话 |
-| `contradicted` | 记忆里有反证（或有更新的版本） |
-| `out_of_scope` | 最接近的那条是在**别的前提下**说的，记忆既不赞成也不反对当前说法 |
+| `substantiated` | 记忆支持这句话（**0.3.2 起还要求"有锚"**，见 [9.13](#913-verify-的-yes-需要什么032)） |
+| `contradicted` | 记忆里有反证（或有更新的版本）。**0.3.2 起同样要求"有锚"**：值被绑成另一个（含中文系动词的问法，见 [9.13](#913-verify-的-yes-需要什么032)）或同主体极性翻转才算；只是"邻近某条含否定字"不再判矛盾——那会在 `note` 里以 `NOTE: a nearby trace asserts the OPPOSITE polarity …` 出现，而 `contradicted` 仍为 false |
+| `out_of_scope` | 有痕迹是在**别的前提下**说的，与你的 `scope` 冲突，记忆既不赞成也不反对当前说法。**"冲突"要两边点到同一个 key**（或两边都裸写、或一侧裸写对上另一侧的条件）；一条写在 `release=v2` 下的痕迹对你问的 `region` 既不构成支持也不构成否决，0.3.2 起它也不能再替支持行背书（以前"没有可比的 key"被读成"前提一致"，那条行会抢到支持位并让裁决盖章 yes）。**第九批（G3）补上后半**：这种行**自己当上支持行**时同样不盖章——零差异在 affirm 那一处不再被读成"没有 blocker"，而是直接转 `OUT_OF_SCOPE`（`scopeCanSupport` `src/memory.ts:4124`）；只有"没写前提"的通说行仍然可以支持带前提的提问 |
+| `weak_match`（0.3.2） | 有痕迹越过了召回线，但没有任何东西把它**锚**到你这句话上——或者锚被更具体的证据压过（共有措辞撑住的锚，两边却点名了不同的工单号 / sha，见 R3）——**"只是同话题"，不是 yes**。`support` 仍带出，身份是复查线索 |
+| `scope_conflicts[]`（0.3.2） | 与你的 `scope` 前提冲突、且**够得着否决**的那几行——它们是让裁决变成 `OUT_OF_SCOPE` 的行。够得着有两条并列路线：**分数**不低于所选支持，或**跟你的问句说的是同一件事**（带着同一个标识符、或同一个主张主体；只是同一个实体如 `api` 不算，那是话题不是断言）。支持行自己就冲突时此表为空，否决者即 support，id 在 `note` 里。**第九批（G3）添了第二条同样为空的出口**：支持行自己写在**你没点名的那条轴**上时（`tenant=acme` 对 `cluster=blue`），它不是"冲突"而是"没法比"，因此不列进这张表——`out_of_scope: true` 照给，note 用"两侧各自的轴"那条理由（实测 `the trace keys only tenant and the caller states only cluster, with no condition named by both`） |
 | `closest` | 最接近的候选（判断是没记过，还是差一点） |
-| `contradicting[]` | 同主题**反着说**的行 |
+| `contradicting[]` | 与支持行**实体相交**、且文本上真反着的行（极性相反，或同一主体绑到别的值）。实体不相交的行不会进来——0.2.x 的"相关行里极性不同就算反证"是 BUG-1/BUG-C 的成因 |
 | `newer_related[]` | 同主题**更新的结论**（换词改写时余弦可能只有 0.6，旧版本以前完全看不见） |
 | `superseded_matches[]` | 被显式纠正退役的行 |
-| `stale_support` | 本次的支持依据**不是该主题最新的结论** |
+| `stale_support` | 本次的支持依据**不是该主题最新的结论**。成因有两张表：`newer_related[]` 里有更新的行，或 `superseded_matches[]` 里站着支持行的**归档旧版本**（覆盖写入的正常后果）。**第十一批（RR3）修的是注的归因，不是旗标**：两种成因过去都写同一句 `Review newer_related`，于是 `newer_related: []` 被指过去、读的人以为旗标打错了；现在按成因各写一句——只有"有更新行"那一形才提 `newer_related`，归档那一形说"支持行背后站着一条已归档的修订"，而 `CONTESTED` 那句只列**非空**的清单。`stale_support` 的判定一行未动（两种成因都该置真）|
 
-`note` 里可能出现三种前提注记：`OUT_OF_SCOPE`（你给的 scope 与支持行的 scope 冲突）、`CONDITIONAL SCOPE`（支持行带前提而你的提问没给 scope，该前提**没被核对**）、以及"支持行没带前提"的提示。四种结局的机制见 [9.10](#910-前提作用域-scope同一句话换个条件就不成立)。
+`note` 开头是哪种结局就去哪种分支：**SUBSTANTIATED / CONTRADICTED / OUT_OF_SCOPE / WEAK_MATCH / UNSUBSTANTIATED**。`note` 里还可能出现前提注记：`OUT_OF_SCOPE`（你给的 scope 与某行的 scope 冲突）、`CONDITIONAL SCOPE`（支持行带前提而你的提问没给 scope，该前提**没被核对**）、以及"支持行没带前提"的提示。前提部分的机制见 [9.10](#910-前提作用域-scope同一句话换个条件就不成立)，锚的部分见 [9.13](#913-verify-的-yes-需要什么032)。
+
+**一句话用法**：只有 `substantiated: true` 可以当"我记住过这件事"说出口。`weak_match` / `out_of_scope` / `unsubstantiated` 三种都是同一句话——"记忆里没有（或核对不上），我去查原处"。
 
 ### 7.4 memory_maintain —— 维护（13 个动作）
 
@@ -394,7 +398,7 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 | `history` | 某条记忆的版本演变（传 `id`），含各版本的 `scope` | 只读 |
 | `delete` | **永久删除**某条（含版本历史） | ⚠️ 不可恢复 |
 | `prune` | 清理空库文件（历史版本遗留的 0 行文件） | 只删空文件 |
-| `duplicates` | 近似重复报告（跨 kind，自动忽略 `FACT: ` 前缀）。每组带每行的 `scope` 和一个组级标记 `mixedPremises` | 只读 |
+| `duplicates` | 近似重复报告（跨 kind，自动忽略 `FACT: ` 前缀）。**0.3.2 起有两条通道**：`by: 'text'`（逐字重述）与 `by: 'vector'`（换了下法、余弦 ≥ 0.92），组里打印的 `similarity` 取该簇**最弱**的那条边；每组带每行的 `scope` 和一个组级标记 `mixedPremises`（0.3.2 起放宽：组内**只有一侧**写了前提也算混，通说与条件行不互为复述） | 只读 |
 | `merge`（0.3.0） | 对**一组** `duplicates` 报告动手：`ids:[该组 id]`，默认**预览**谁留下、谁被折、带哪些 `carried`；`dry_run:false` 才落地。可选 `into` 点名要保留的 id | 折叠而非删除：仍在库里、默认召回不出现、`undemote` 可恢复 |
 | `override-audit` | 覆盖事故审计：筛出被覆盖的两条内容几乎无关的可疑记录 | 只读 |
 | `status` | 嵌入器状态 + 深度诊断（含 `sibling_stores` / `coverage` / `scope_rule`）+ 本宿主的 `path_rule` + 一句话 `health` | 只读 |
@@ -405,7 +409,7 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 
 ```
 第 1 步 看：memory_maintain { action: "duplicates" }
-        → groups: [ { key: "…", mixedPremises: false, memories: [ { id: "4960eafe", … }, { id: "480afcbd", … } ] } ]
+        → groups: [ { key: "…", by: "text" | "vector", similarity: 0.93, mixedPremises: false, memories: [ { id: "4960eafe", … }, { id: "480afcbd", … } ] } ]
 第 2 步 预览：memory_maintain { action: "merge", ids: ["4960eafe", "480afcbd"] }
         → survivor / retired / carried / blocked，dry_run: true，什么都没改
 第 3 步 落地：同上 + dry_run: false
@@ -413,18 +417,20 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 反悔：memory_maintain { action: "undemote", ids: ["480afcbd"] }
 ```
 
-`mixedPremises: true` 的组**第 1 步就该跳过**：同一句话写在两种互斥口径下不是重复，`merge` 对这样的组一条都不会折，并把冲突的 key 报在 `blocked[]` 里。
+`mixedPremises: true` 的组**第 1 步就该跳过**：同一句话写在两种互斥口径下不是重复，`merge` 对这样的组一条都不会折，并把冲突的 key 报在 `blocked[]` 里。**0.3.2 同轮（G2/G4）把这个标记放宽了**：一侧写了前提、另一侧**什么都没写**也算混——通说与条件行不是互为复述，`blocked[].reason` 会点名是哪个方向（`states a premise where the survivor states none` / `states no premise, while the survivor states one`）。两边都不写前提的常规重复组照旧折叠。
 
 ### 7.5 返回值里的字段词表
 
 | 标记 | 含义 |
 |---|---|
-| `override` | 同主体换值 → 旧版进历史、版本 +1 |
+| `override` | 同主体换值 → 旧版进历史、版本 +1。**0.3.2 第十一批（RR1）之后这一格少一种进入方式**：存量行**没写前提**而这次写了前提时，换值不再退役它（那等于把一条通说静默窄化成条件行），改判 `new` 并回 `premise-narrowing:`，见 [9.10](#910-前提作用域-scope同一句话换个条件就不成立) |
 | `none` | 复述同一条 → 只强化（重要度/访问计数），**不多行** |
 | `merge` | 跨类型零新信息复述（episode 复述 semantic 规则）→ 并入 |
 | `supersede` | 显式传了 `supersedes` → 旧行退役、新行接管 |
 | `new` | 全新一条 |
-| `OUT_OF_SCOPE` | verify：最接近的那条属于别的前提，记忆对当前说法**既不赞成也不反对** |
+| `OUT_OF_SCOPE` | verify：有痕迹属于别的前提，记忆对当前说法**既不赞成也不反对**（0.3.2 起冲突行即使没抢到支持位也能否决，且否决有两条并列路线——分数不低于所选支持，或与问句说的是同一件事；它们列在 `scope_conflicts[]`）。**第九批（G3）**：支持行自己写在**你没点名的轴**上时也转这里——那时否决者就是支持行，`scope_conflicts[]` 为空，两侧各自的轴印在 note 里 |
+| `WEAK_MATCH` / `weak_match` | verify（0.3.2）：有痕迹越过召回线、但没有锚把它绑到你这句话上（0.3.2 起还包括四种"锚是真的、却不相关"：锚只有共有措辞而两边点名的标识符不同；分歧落在**主语位**而不是值位；两句只差一个词而那个词是**值**；两侧值字串不同、其中一侧没有可比词元——虚词作值，如库里 `flag is on` 问 `flag is off`，第 100 项钉住；#65b 再加组合值那一格：两侧都有可比词元、但完整序列只差一个虚词对值词的槽位，如 `currently on/off`、`on/off duty`、`with/without telemetry`，第 101–108 项钉住，细化（`on` vs `on duty`）与连词交替（`red and/or blue`）仍放行） → **只是同话题**。与"没记过"同样是"别断言"，只是它还给你一条值得去复查的线索 |
+| `NOTE: a nearby trace asserts the OPPOSITE polarity` | verify（0.3.2）：旁边有条极性相反的痕，但**没有任何东西把两者绑到同一主体**上 → 不定矛盾，只当作线索点名给你（"是否定字撞上了"，不是"记忆里有反证"）。`contradicted` 仍为 false，处置同"没记过" |
 | `CONDITIONAL SCOPE` | verify：支持行带前提、提问没给 scope，该前提**没被核对** |
 | `[VERIFIED]` / `[ASSERTED]` | 有 passing 证据且在保鲜期内 / 只有断言 |
 | `[GUARD]` | 前瞻提醒（未来情形 → 该做什么） |
@@ -432,7 +438,10 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 | `[retracted: …]` | 这条被某条撤回针对 |
 | `[scope: …]` | 这条只在写出的前提下成立（digest 与召回都透出） |
 | `[low-confidence sim … < floor …]` | digest 的第 1 行可能是**最接近的痕迹、不是记忆**（0.3.0）：它没过召回门槛，不配 `[VERIFIED]` / `[ASSERTED]`，断言前必须 verify |
-| `mixedPremises` | `duplicates` 的组级标记（0.3.0）：组内各行写在互斥前提下，**不算重复** |
+| `mixedPremises` | `duplicates` 的组级标记（0.3.0）：组内各行写在互斥前提下，**不算重复**。0.3.2（G2/G4 同轮）起，"互斥"包含**一侧写了前提、另一侧完全没写** |
+| `by: 'text'` / `'vector'` | `duplicates` 的组是从哪条通道认出来的（0.3.2）：逐字重述 / 余弦 ≥ 0.92 的换写法。组上打印的 `similarity` 是该簇**最弱**的一条边，不是最高的那条 |
+| `anchored` / `anchors` | `recall` 每条命中（0.3.2）：这一行与 cue 之间**有没有**可指认的词法依据、是哪一档（`identifier` / `entity` / `subject` / `vocabulary`，无 cue 时为 `recency`）。**它不是分数**，而 `relativeScore` 是"除以本组最高"——组里最好那条永远 1.000，它表达排序不表达置信度 |
+| `unknown argument(s) …` | 适配层边界（0.3.2）：传了工具**没声明**的参数名 → 整次调用失败并点名它，同时回显声明过的键。以前是"返回 ok、而那一个字都没写进去" |
 | `carried` / `blocked` | `merge` 预览里（0.3.0）：结转到幸存行的信息 / 因前提冲突而没被折进去的行 |
 | `sibling_stores` / `path_rule` | `status`（0.3.0）：同目录还有哪些 `.db` 各装了多少 / 本宿主按什么规则分库 |
 | `[sanitized-*]` | 渲染时清洗了可疑的指令类文本（存储原文不动） |
@@ -440,7 +449,7 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 
 ---
 
-## 8. 十三种典型场景的实操话术
+## 8. 十四种典型场景的实操话术
 
 **① 记住用户偏好**
 > 记住我的偏好：PR 描述用中文、提交信息用英文（importance 0.95，长期有效）。
@@ -482,6 +491,9 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 **⑬ digest 里那行 `[low-confidence …]`（0.3.0）**
 > 这行是**门槛以下的猜测**，不是记忆。不要直接引用它的内容；先 `memory_verify` 复核，或者告诉我"库里只有一条不像的，我去查工具"。也不要因为出现了这行就认为记忆系统记住了这件事。
 
+**⑭ 拿 `weak_match` 当"没记过"处理（0.3.2）**
+> 以后 `memory_verify` 返回 `weak_match: true` 时，按"记忆里没有"回答，不要去读它的 `support` 反推一个 yes。把 note 里那两个余弦、以及 `support` 的 id 与摘要一起报给我，我拿它当**复查线索**（去读码 / 重跑命令），不是结论。若确实是我让你记过的内容，就照原样带 `subject -> value` 的结构重写一条，让它下次能被锚住。
+
 ---
 
 ## 9. 读懂记忆系统（进阶）
@@ -494,7 +506,8 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 |---|---|---|
 | `similarity` | **原始余弦**，与召回阈值、与 `memory_verify` **同口径** | 判断像不像，以它为准 |
 | `score` | 排序分 = `similarity × (0.6 + 0.4 × importance)`，再叠加标识符加成，上限 1.0 | 只看排序，不要当相似度读 |
-| `relativeScore` | `similarity ÷ 本次最高 similarity`（1.0 = 本次最佳） | 判断这条算不算本次最相关 |
+| `relativeScore` | `similarity ÷ 本次最高 similarity`（1.0 = 本次最佳） | 判断这条算不算本次最相关。**别看成置信度**：它永远把组里第一名读成 1.000，不管那一名是被工单号锚住的还是只靠余弦坐上去的 |
+| `anchored` / `anchors` | **不是分数**（0.3.2）：这一行与 cue 之间有没有可指认的词法依据，`anchors` 说是哪一档（`identifier` / `entity` / `subject` / `vocabulary`） | 用来把"本次最佳"与"最接近的向量邻居"分开。`anchored: false` 的排序照样有效，但它不是证据 |
 
 出现过 verify 说 0.604、recall 却只给 0.449 这种困惑，就是**口径不同**：verify 报原始余弦，recall 报含重要性乘数的 `score`。要对比就用 `similarity`。
 
@@ -512,6 +525,7 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 **`memory_recall` 早就给理由，digest 现在也给（0.3.0）**。以前自动注入那块只会说"这条线索没命中相关记忆"，与"这个库是空的"在形状上完全一样，而两者的处置办法相反（前者是问法/门槛问题，后者可能是**记在别的库里**，见 [9.12](#912-库分裂没记住-vs-记在另一个文件里030)）。现在：
 
 - 端出来的那一行**当场标明身份**：`[low-confidence sim 0.31 < floor 0.32: the closest trace, not a memory — verify before asserting]`。它不带原行的 `[VERIFIED]` / `[ASSERTED]`（没过门槛就没有资格声称证据等级），程序侧用 `items[0].lowConfidence === true` 判断；
+- **注里那个分数是向下截断到门槛自身的位数，不是四舍五入**（0.3.2）。上一版把相似度按小数位格式化后再写进"`X < floor Y`"，四舍五入会把分数抬到它没越过的那条线上，于是引擎印出 `sim 0.54 < floor 0.54` 这种自己反驳自己的句子（真分 0.538413）；同一条线写成三位小数（0.724、真分 0.723822）时印的是 `sim 0.72 < floor 0.72`——那一处连门槛都被一起抹到了同一位。其余三个出口（`UNSUBSTANTIATED: … best similarity X < Y`、`WEAK_MATCH: … claim-to-summary similarity X is below the claim bar Y`、`memory_recall` 的 `no hit cleared the similarity floor Y; closest was X`）门槛一侧打的是配置原值，只有分数一侧被舍入。现在四处统一为：分数向下截断、门槛按原值印，`X < Y` 因此恒真（实测印出 `0.53 < 0.54`、`0.72 < 0.724`、`0.74 is below the claim bar 0.75`）。digest 这一行还要多降一位：它读的是 `nearMisses[0].similarity`（该字段构造时已按三位小数舍入），门槛写成三位小数时送来的值本身就等于门槛，渲染器会一位一位往下试直到句子为真。**没修的同类**：`≥` 一侧与 JSON 里的数字字段（`bestSimilarity` / `nearMisses[].similarity` 实测仍会等于门槛），拿它们自己比 `≥` 之前记住这点；
 - 词面毫无重叠（相似度 0）、库里 0 条、或调用方关了 `lowConfidenceTop1` 时**仍然不给猜**——宁缺毋滥，猜出来的东西被复述一遍就是幻觉加固；
 - 零命中时不再回填 `[recent]` 装样子；
 - `memory_maintain` → `status` 里的 `diagnostics().coverage` 会告诉你这道门这个进程里到底在不在工作：`turns`（digest 渲染了几次）、`misses`（其中几次一条都没过门槛）、`guesses`（其中几次端出了猜测）。`misses / turns` 高说明问法或门槛有问题；`guesses` 接近 `misses` 说明端出来的多半是猜的。
@@ -550,6 +564,7 @@ status 里若报"本库空、隔壁库有货"，那是分库问题，不是记�
 | `shielded:` | remember | 想覆盖一条新鲜 VERIFIED 的行被挡下（除非带 passing 证据） |
 | `not-overridden:` | remember | 同主体多行且没指明退役哪条 → 再加一行并提示 |
 | `different-scope:` | remember | 新写的**前提**与库里更接近的那条对不上 → 不覆盖、不合并，各存各的（见 [9.10](#910-前提作用域-scope同一句话换个条件就不成立)） |
+| `premise-narrowing:` | remember | 库里那条**没写前提**、这次带前提的重述会让它从通说变成条件行 → **不补上去**，另起一行两条并存（0.3.2 G4，见 [9.10](#910-前提作用域-scope同一句话换个条件就不成立)）。**第十一批（RR1）补的是同一规则漏掉的第四道门**：同主体、值不同、且存量行没写前提的写法过去走 `override` 把通说退役掉（`outcome: override` 而不回任何警告），现在也改判 `new` + 这条警告——值不同时更该并存，不是更该覆盖 |
 | `scope_only_matches` | remember | 只撞了主体键、没撞实体 → 这些行被保护，没被覆盖 |
 | `conflict:` | recall | 同主题存在不同说法，需要判断 |
 | `low-confidence:` | recall | 命中的是低置信度且无证据的行（我以为不等于我知道） |
@@ -599,22 +614,27 @@ agent 会读网页，网页里可能有 ignore all previous instructions 这类�
 scope: "population=前 4096 条记录; comparator=指令起始"
 ```
 
-key 起名建议用**稳定英文词**（`population` / `comparator` / `release` / `config` / `dataset`），value 随怎么写都行。判定只看**双方都点名了的 key**：
+key 起名建议用**稳定英文词**（`population` / `comparator` / `release` / `config` / `dataset`），value 随怎么写都行。判定只看**双方都点名了的 key**——而 0.3.2 起"点名"也包括**没写 `key=` 的裸段**（`@ us-east` 这种）：它们收进一个内部键，并且**跨形式可比**——一侧只有裸段时，拿它去比另一侧"自己的裸段（若有）或全部键值内容词的并集"。于是裸写 `us-east` 复述 `region=us-east` 算一致，而库里 `region=us-east`、问成 `eu-west` 是**前提冲突**（以前这两种形状都读成"谁都没表态"，一条结论能盖章答另一种条件下的问题）：
 
 | 情况 | 判定 |
 |---|---|
 | 共有 key 的 value 兼容 | 前提一致（可复述 / 可覆盖） |
 | 共有 key 的 value 不兼容 | **前提冲突** |
 | 某个 key 只有一方写了 | 不算冲突（多写一个条件不是反对） |
-| 任意一方根本没写 scope | 不算冲突，转为"前提未核对"提示 |
+| 双方点名的 key **一个都不重叠**（`region=us-east` vs `release=v2`） | 不算冲突，也**不算一致**——是**没法比**。0.3.2 起读取端把这一格单独立出来：以前它和"前提一致"共用同一个判据（交集为空 ⇒ 零差异 ⇒ "就是你要的那个前提"），于是一条别的轴上的行既能抢到支持位、又顺手短路了整轮冲突扫描 |
+| 双方各有裸段且内容不同（`@ us-east` vs `@ eu-west`） | **前提冲突**（0.3.2：以前读成"谁都没表态"） |
+| 一侧裸写、另一侧键值写（`eu-west` vs `region=us-east`） | 按同一套词集规则比：兼容=一致，不兼容=**冲突** |
+| 任意一方根本没写 scope | 不算冲突，转为"前提未核对"提示。**0.3.2 第十批（G4）补一句**：没写也**不等于可以替他写**——无前提的那条是**通说**（对所有调用方说话），给它补上前提就把它变成了一条只对某个条件说话的行，所以写侧与合并侧都不再原地补前提（见 [9.10](#910-前提作用域-scope同一句话换个条件就不成立)） |
 
 value 兼容性是**词集合**比较：去掉英文停用词后，latin / 数字整段成词、中文逐字成词；一方完全包含另一方（`instruction start` vs `instruction start of the lea-rsp site`）算兼容，交集占并集一半以上也算兼容——**小幅改写的前提不会被读成新前提**（改写掉一半以上就会）。这里**不新增相似度阈值**（设置项与 `diagnostics().thresholds` 一个数都没变），判定靠的是 key 对齐 + 词集合重叠，不是余弦。
 
 **写入端**（`memory_remember`）：
 
 - 前提冲突 → **不覆盖、不合并**，各存各的痕迹，`outcome: new` 且带 `different-scope:` 警告，点名被顶住的行和冲突的 key。同一句话换个条件不是复述；
-- 前提一致（或一方没写）→ 走原有判定：逐字重述强化、同主体换值版本化覆盖；
-- 旧行没写前提、新写带前提且是重述 → **把前提补到旧行上**，不额外起一行（否则补注条件反而制造重复）；
+- 前提一致（或一方没写）→ 走原有判定：逐字重述强化、同主体换值版本化覆盖（"没写"这一侧**不会被补上前提**，见下一条；而"换值"这一侧**也不会再把没写前提的旧行退役掉**，见再下一条 RR1）；
+- 旧行没写前提、新写带前提且是重述 → **0.3.2 第十批（G4）改掉了这条**：以前会把前提**补到旧行**上（不额外起一行），但那一步既不升版本也不进 `history`，而 `scope` 决定的正是这一行为谁说话——通说行被原地改成条件行，覆盖就静默没了。现在**两条并存**：通说行保持没前提，带前提的重述另起一行，回显 `premise-narrowing:` 警告说明这里为什么多了一条；确实要窄化请显式 `supersedes: [id]` 或 `update()`，那两条会升版本并把旧前提归档进 `history`；
+- **第十一批（RR1）把同一规则接到漏掉的第四道门**：旧行**没写前提**、这次带前提而**值不同**的写法，过去走 `outcome: override`——旧行被归档、且不回任何警告，等于一句话把通说从库里取走（G4 那一轮堵的是"重述"那一支，"换值"这一支是四处退役站点里唯一没接上的）。现在**四处**（三个彩排分支 + 那条按相似度退役的 `brink` 臂）一律拒绝，改判 `outcome: new` 并回上面那条 `premise-narrowing:` 警告——**值不同时更该并存，不是更该覆盖**。要真的替换旧行仍然走显式 `supersedes: [id]` 或 `update()`，那两条会升版本并归档旧前提；
+- 混前提的组也别去 `merge`：通说行与键化行不是一句话的两次复述，`duplicates()` 会标 `mixedPremises: true`，`mergeDuplicates` 两个方向都拒绝折叠（同轮落地的 G2 半格）；
 - scope 会进嵌入文本，所以它同时影响召回排序（前提写清楚的行更容易在同类问题里被排上来）。
 
 **查询端**（`memory_verify`）：
@@ -624,7 +644,12 @@ value 兼容性是**词集合**比较：去掉英文停用词后，latin / 数�
 | `claim` + 匹配的 `scope` | 在过门槛的候选里**优先选前提一致的那条**当支持（哪怕别行的字面更接近） |
 | `claim` + 冲突的 `scope` | `out_of_scope: true`、`substantiated: false`、`contradicted: false`，note 以 `OUT_OF_SCOPE` 开头：记忆既不赞成也不反对这个前提下的说法 |
 | 只给 `claim`，支持行带前提 | 仍然 `substantiated`，但 note 补 `CONDITIONAL SCOPE`：**这条支持只在某前提下成立，而你没说要核对哪个前提** |
-| 给了 `scope`，支持行没带 | note 说明支持行无前提、无法与之核对 |
+| 给了 `scope`，支持行没带 | note 说明支持行无前提、无法与之核对。**0.3.2**：此时如果库里另有"前提冲突且**够得着否决**（分数不低于这条支持，或跟你的问句说的是同一件事）"的行，它照样否决裁决（`out_of_scope: true`）并列进 `scope_conflicts[]`——以前只看抢到支持位的那一行有没有前提，这种情形会直接答 `substantiated: true`。**G4 在这里留了一个逐字豁免**：如果这条无前提的支持行**逐字**复述了你问的那句话（`isVerbatimRestatement` `src/memory.ts:4143`），它照样能背书——它说的就是这句话，只是没加条件，而库里那条带前提的孪生行会进 `scope_conflicts[]` 并在 note 里点名（判据与写侧"拒绝窄化"同一把尺子）。**换了一句说的（D2 那格的 fixture）不受豁免**，照旧否决 |
+| 给了 `scope`，支持行带的是**另一条轴**上的前提（你问 `region`，它写 `release=v2`） | **0.3.2**：这既不是一致也不是冲突，是**没法比**。这种行不再抢到支持位（以前"没有可比的 key"被算成零差异 = 前提一致，于是它上台、盖章，而真正的冲突行被同一次排序压到最底档、再也够不到分数门槛）。**第九批（G3）补上同一句话的后半**：如果顶上来的**就是**这条没法比的行，裁决转 `OUT_OF_SCOPE`，**不是**"没有冲突可列就盖章 yes"（判据 `scopeCanSupport()` `src/memory.ts:4124`，用在 affirm 门 `src/memory.ts:2980`），note 走"两侧各自的轴"那条理由分支；它在排序里也被压到**最低档**（低于"没写前提"的通说行，`src/memory.ts:2875`）——第八批让它与通说同档，第 24 轮量出那个并列档实际在做的事是让别人轴的行**压过**通说行 |
+| 给了 `scope`，库里有一条**没写前提**的行、而它说的**不是**你问的这件事 | **0.3.2 第十一批（RR2）**：这条通说行不再自动占支持位。"没写前提"只说明它不反对你，不说明它在说这句话——要占席位得先证明自己说的就是这件事（与问句同一标识符、同一主张主体，或逐字复述）。它因此降到与"没法比"同一档，把位置让给那条**逐字就是你这句话**的带前提行，哪怕后者写在另一条轴上、哪怕无前提那行的余弦更高（实测 bge：0.622 的无关通说曾顶掉 0.862 的逐字复述，被顶掉那行从 support / `newer_related[]` / `contradicting[]` / `superseded_matches[]` 四张清单同时消失，一句真话被降成 `WEAK_MATCH`）。**反过来，无前提行自己就是这句话的证据时照旧赢席位**，这一改不是"通说行一律输" |
+| 给了 `scope`，库里**只有**一条写在别轴前提下的行 | 同一格，实测形状：库里只有一行 `… @ tenant=acme`，按 `cluster=blue` 问同一句话 → `out_of_scope: true`（复测者的 D5，bge 余弦 0.9094 也照样不盖章）。**反过来"没写前提的行是通说"**，它照常能支持一个带 `scope` 的提问——把通说一起挡掉就等于否决每一个带前提的提问，库里通常根本没有同轴的行 |
+
+**残留一处，是设计而不是漏网**：上面那条判据接在"盖章"这一侧，**没有**接到邻域证据（`contradicting[]` / `newer_related[]` / `stale_support` / `contested`）上。方向不对称——把"零差异"读成同意用在 affirm 上会制造假 yes，用在旁证上最多多一句"可能过期 / 有反方"，而那一处若一并接上，会把"通说支持 + 别轴更新行"这一形里**可能真实**的警告一起删掉（那正是 F2 那轮要保住的方向）。所以这种形状你会看到 `substantiated: true` 旁边挂着 `stale_support: true` / `contested: true`，而那两条来自一条你没点名的轴——面板 P9 形把它钉住了（通说支持哈希 0.933 / bge 0.979 + 一条别轴的更新行，两空间逐行未动），用例 #G3-125 明钉。反过来，支持行自己不可比时**不需要**这条旁证规则：`out_of_scope` 的返回发生在关联扫描之前，四个标记一起消失。**第十一批又留下两格，都记在 [ROADMAP](ROADMAP.md)，都不是危险侧**：`RR1e` 是方向反过来那一格——存量行**带**前提、这次写**不带**前提且值不同，装机字节两空间都照旧 `override` 并保留存量的前提（按原条件问只得到 `weak_match`）；`RR2e` 是席位归因的整洁度——无前提行若与问句**同主体、只是不同值**，它本来就"锚得住"，于是新判据放它过去，席位仍归它，而裁决照旧 `out_of_scope`（坏的不是结论，是"谁被点名"的干净程度）。**逐字豁免要不要收回**（上面 G4 那一格的读侧 carve-out）已在 2026-10-06 由使用者裁决：**保留**（按已发）。它既不是本轮漏修，也不再是悬着的口径——裁决记录见 ROADMAP 的 pass-8 那一格。
 
 `memory_recall` 与 `[hippo-memory digest]` 都会把每条自己的前提透出来（命中里的 `scope` 字段、注入行里的 `[scope: …]`），所以 agent 能看到"这两行说的是两件事"，而不是只看到一个数字。
 
@@ -643,13 +668,18 @@ value 兼容性是**词集合**比较：去掉英文停用词后，latin / 数�
 
 **重复从哪来**：主要来源是**整合本身**——`consolidate()` 把 episode 抽象成规则时，规则正文可能与原事件逐字相同、只多一个 `FACT: ` 前缀，于是两条并存（该前缀在跨类型比对时已被统一剥离，所以只会报历史遗留的）。同主体反复写入、以及"换口径重测"故意留下的两条，也都长得像重复，但**只有第一种是该合的**。
 
-`duplicates` 是只读报告，每组现在带每行自己的 `scope` 和一个组级判据：
+`duplicates` 是只读报告，每组带 `by`（这条重复是从哪条通道认出来的）、`similarity`、每行自己的 `scope`，和一个组级判据：
 
 ```
-{ groups: [ { key: 'modbus timeout -> 1500 ms on the gateway', mixedPremises: false,
+{ groups: [ { key: 'modbus timeout -> 1500 ms on the gateway', by: 'text', similarity: null, mixedPremises: false,
               memories: [ { id: '4960eafe', kind: 'episode',  version: 1, summary: 'modbus timeout -> 1500 ms on the gateway', scope: null },
-                          { id: '480afcbd', kind: 'semantic', version: 1, summary: 'FACT: modbus timeout -> 1500 ms on the gateway', scope: null } ] } ] }
+                          { id: '480afcbd', kind: 'semantic', version: 1, summary: 'FACT: modbus timeout -> 1500 ms on the gateway', scope: null } ] },
+            { key: 'vector:7c1d0a2b', by: 'vector', similarity: 0.9187, mixedPremises: false,
+              memories: [ { id: '7c1d0a2b', kind: 'semantic', version: 1, summary: 'modbus 超时设为 1500 毫秒', scope: null },
+                          { id: 'e55b9f10', kind: 'semantic', version: 1, summary: 'the modbus timeout was set to 1500 ms', scope: null } ] } ] }
 ```
+
+`by: 'text'` 是**换个壳的同一句话**（`FACT: ` 前缀、大小写、空白），它不主张任何测量，所以 `similarity` 是 `null`；`by: 'vector'`（0.3.2）是**换了措辞说同一件事**，此时 `key` 是簇代表行的 id（`vector:7c1d0a2b`）而不是那句归一化文本。组上的 `similarity` 是**该簇里过线的那些两两比对中最弱的一条边**：0.9187 说的是"这一簇最低也像到 0.9187"，不是最高那条，也不等于"每一对都这么像"——链式合并可以把一条没过线的配对进同一簇，那条边不进这个最小值。
 
 引擎报告带 `scanned`（扫了多少活行）；DSH 侧另加两个汇总数 `groupCount`（几组）与 `duplicateMemories`（多余条目的总条数），opencode 侧原样透出并在末尾附一句处置建议。
 
@@ -703,6 +733,49 @@ per DSH every agent id has its own store, so the write went to another agent (se
 
 ---
 
+### 9.13 `verify` 的 yes 需要什么（0.3.2）
+
+以前 `memory_verify` 的 yes 只问一件事：**有没有痕迹越过了召回线**（默认 0.32）。那条线是"话题相邻吗"，不是"这句话被记住了吗"，于是实测里出现过 `verify("Python 是用来煮咖啡的") → substantiated: true, score 0.47`——库里那条只是"后端用 Python"。一个盖了章的幻觉比查不到更危险：模型拿到 `substantiated` 就不回去读码了。
+
+现在 yes 需要**锚**（任一即可，全都不成立就返回 `weak_match: true`）：
+
+| 锚 | 直观解释 | 例子 |
+|---|---|---|
+| 同主体且值不冲突 | 两边解析出同一个"X -> Y"（或 `X is/uses/runs on Y`），值也对得上。**0.3.2 起还有两条兜法**：只有一边解析成功时，另一边**以该主体开头**、其后跟着的就是值；两边都解析不了时，用"逐字前缀之后第一个数"比较（`…设定为 30 秒` vs `…设定为 90 秒`；那个数在**完整文本**的背离处读，所以标识符的尾巴 `KAPPA-1` 不会被当成值，见下文 R3 那段） | 问 `the billing database runs on postgres`，库里 `the billing database is postgres`；中文同理：问 `gto 内存上限 -> 4GB 以内`，库里 `gto 内存上限 -> 4GB` → SUBSTANTIATED（召回 sim 0.86，措辞并非逐字相同）；**问 `gto 最大并发连接数是 512`（中文系动词 + 错值）→ CONTRADICTED**（bge sim 0.89，修复前这里是 `substantiated: true`），note 印的是 `memory binds "<主体>" to "<库里的值>", not "<你问的值>"`。**第八轮 R9**：值比较先做屈折归一——`run`/`runs`、`lane`/`lanes` 算同一个值（前者不再经 belt 落 WEAK，后者不再误判 CONTRADICTED）；只碰 `s` 屈折，`ed` 语音改写与缩写不在内。**第九轮 R10 证伪了"只合并同值"这一句**：去尾 `s` 同样合并 `https`/`http` 等七对（每一对都是两个值），修法是只恢复 clash 的 pair 键抑制表——命中只能降级或反证，永不盖章；两个不同的值（除这七对）照旧分得开 |
+| 共同标识符 | 工单号 / sha / 版本号这类精确串在两边都出现。**反方向也管**：两边各自点名的标识符若**互不相同**，这一枚锚（以及靠共有措辞撑起的那一枚）会被压下——`KAPPA-1` 与 `KAPPA-2` 是两件事，不是同一件事的两个值 | 问 `OPS-417 的 cache backend 定下来了`，库里 `工单 OPS-417 决定 cache backend -> redis`；反过来库里 `KAPPA-1 record` 问 `KAPPA-2 record` → `WEAK_MATCH`，note 点名两边各自的标识符 |
+| 痕迹逐字带着这句话 | 剥掉 `FACT: ` 前缀、忽略大小写与标点后相等，或被 `summary + detail` 包含 | 复述自己存过的那条 |
+| 痕迹承载了特征词 | 这句话里较长的词（≥6 字符）有 ≥75% 出现在痕迹的 `summary + detail` 里。**这一枚有个盲区（0.3.2 的 V1 量出来的）**：短于 6 字符的词元不参与统计，所以值槽里是一个短数或一段连字符串时，被检查的那个值压根不在覆盖集里，撑住锚的是纯上下文措辞 | 事实在 `detail` 里、summary 只有标识符的那种写法；反面例子：库里 `gto deploys to staging cluster`，问 `… 9999 …` 或 `… eu-west …` 曾被这一枚盖章 |
+| 余弦过主张线 | 以上都不成立时，claim 与 summary 的余弦要 ≥ **0.75**（`diagnostics().thresholds.claim`，与写入端同一把尺） | 英文改写 `uses github actions caches node_modules` vs `… to cache node_modules` → 0.775 过线 |
+
+**锚命中了还不算**（0.3.2）：上面任何一枚锚都可以被三道 belt 撤销，任一成立就把 yes 降成 `WEAK_MATCH`——① 极性反证（同一主体的肯定/否定翻转，R2）；② 标识符不一致（两边各自点出对方没有的 label，R3/R4b）；③ **那一个位置对不上（V1，判据在 V2 换成"是哪一位"）**：两段文本词数相同、只在一个位置上不同、而这个位置两侧都是能承载值的词，那就说明它们共享的是**句子的形状**而不是那个值。第 ③ 条读的是**位置**，不是词表，所以把 `production` 换成一个不存在的词 `zzzqqq` 结果一样。它还要问一句"变的是哪一位"：把分歧之前的连接词与冠词剥掉后若什么都不剩，动的是**主语**（`the primary handles writes` 对 `the standby handles writes`），同样不是证据——note 因此分两种说法，值位说"这条痕迹把这个主体绑到 X"，主体位说"这个句子形状讲的是另一件东西"，两者都不谎称存在一个共同主体。**两侧在分歧处陈述同一个数则不降级**（`… configured 30 seconds` 问 `… capped 30 seconds` 仍 `SUBSTANTIATED`）：那时被比较的值是那个数，而它没动。**三种结局都是 `WEAK_MATCH` 而非 `CONTRADICTED`**，第 ③ 条刻意不给矛盾：一个谓词可以对多个值同时为真（`deploy to staging` 与 `deploy to production` 可以并存），只有系动词句式自己声明了那一位是单值的，才走反证那条路。实测七组（哈希兜底空间，note 全文取自 `.hippo/guide-notes-hash.txt`，另见 `.hippo/probe-v1-note-hash.txt` 与 `.hippo/exemption-window-hash.txt`；库里只有一行）：
+
+| 库里的行 | 你的问句 | 结局 |
+|---|---|---|
+| `gto deploys to staging cluster` | `gto deploys to production cluster` | `WEAK_MATCH`，note 印 `the trace binds this subject to "staging" where this claim binds it to "production" — the wording matches up to that one word, so what it shares is the shape of the sentence, not the value`（sim 0.75） |
+| 同上 | `gto deploys to zzzqqq cluster`（一个不存在的词） | 同一枚 `WEAK_MATCH`（sim 0.77），同一条 note 点名 `"zzzqqq"` |
+| `a primary replica never accepts client traffic` | `a standby replica never accepts client traffic` | 也 `WEAK_MATCH`（sim 0.82），但**换了一句话说的是另一回事**：note 印 `what this claim puts first — "standby" — the trace puts first "primary", and nothing but connectives stands before that slot: … it is the same sentence shape about a different thing, not because it agrees on a value`。分歧前面只剩冠词，所以动的不是值而是**主语**，而这条 note 不会假装存在一个共同主体（`nginx proxies every inbound request over tls` 问 `haproxy …` 同形，sim 0.85） |
+| `probe gateway timeout configured 30 seconds` | `probe gateway timeout capped 30 seconds` | **`SUBSTANTIATED`**（sim 0.79）：谓语措辞换了，但两侧在分歧处陈述的是**同一个数**，被比较的值没有动。（同一形状的中文写法 `probe 网关超时设定为 30 秒` 问 `probe 网关超时最多 30 秒` 在 bge 下也是 `SUBSTANTIATED`（sim 0.94）——那是本轮放宽的主要对象，此前它落 `WEAK_MATCH`；中文四形在哈希空间连召回线都不过，所以这条只在拉丁文上钉测试，两空间读数都在 `.hippo/v2fix-reporter-shapes-final.txt`。）**边界也是量的**：那道"两侧够到同一个数"的窗口只有 12 个非数字字符、且从被换掉的词自己起算，所以 `… configured at 30 …` 问 `… capped at 30 …` 落 `WEAK_MATCH`（过阻，已知，见 ROADMAP），`… capped since 30 …` 同形。**第七轮 R7a**：同数豁免若跨过连接词（`and/or/，/和` 等，`src/memory.ts:309` / `src/memory.ts:314`）就不再放行——`node zone alpha and 30 slots` 问 `bravo` 照旧 `WEAK_MATCH`（哈希 0.793 / bge 0.894），只有 `at`/`to`/`with` 不断开它（61/63 钉住 `set at/to 30` 的动词改写仍 yes，`with` 是已声明的两可）；其余 13 个介词（`for`/`in`/`on`/`by`/`from`/`near`/`per`/`under`/`over`/`of`/`upon`/`via`/`since`，#64）跨过即失效——`pins blue for 30 replicas` 问 `green` 落 `WEAK_MATCH`，`capped near 30` 那对文档例也从盖章落 WEAK（安全侧）；逗号 `bravo,` 会被分词粘住，只剩全跨度检查能看到它。**R7b**：值词下限拉丁从 4 字母降到 3（`src/memory.ts:345`），`deploy runs aws today` 问 `gcp` 两空间同为 `WEAK_MATCH`（0.684 / 0.840）；仍开着：`30→31` 同词干对落 `WEAK_MATCH` 而非矛盾（标识符 belt 接住，安全侧）。 |
+| 同上 | `probe gateway timeout configured 90 seconds` | 换数字仍是 `CONTRADICTED`（`memory binds "probe gateway timeout configured" to "30" (v1), not "90"`）——上面那条豁免只放过"两侧同一个数"，不放过反证 |
+| 同上（`gto deploys to staging cluster`） | `gto 部署环境 -> staging` → 问 `-> production` | 这一对走的是**另一条路**：两边都被 `主体 -> 值` 解析成功，所以照旧 `CONTRADICTED`（`memory binds "gto 部署环境" to "staging", not "production"`）——belt 没有把已有的反证降级 |
+| `gto lane uses blue theme` | `gto lane uses green theme` | 系动词在表内 → 声明了单值，`CONTRADICTED` |
+| `service speaks https today` | `service speaks http today` | **`WEAK_MATCH`**（第九轮 R10）：去尾 `s` 会把 `https` 读成 `http` 的复数，pair 键抑制表把这一对恢复成 clash。`ftps`/`ftp`、`smtps`/`smtp`、`imaps`/`imap`、`amqps`/`amqp`、`ldaps`/`ldap`、`news`/`new` 同理——每一对都是两个值。处置同 `weak_match`：别断言，去原处核对 |
+
+**为什么不是把门槛从 0.32 抬到 0.75**：实测哈希空间里那句幻觉的 claim-to-summary 余弦是 **0.444**，而同一事实的**中文合法改写也是 0.444**——一个数分不开两者，抬门槛只会把合法答案一起压掉。能分开的是上面那些"锚"。
+
+**拿到 `weak_match: true` 怎么办**：与"没记过"**同一处置**——别断言，去原处复查（读代码 / 重跑命令 / 问用户）。区别是它同时把最接近的那条痕迹给你（`support`，note 里印着两个余弦），那是一条值得看的线索，不是证据。也别把它读成"记忆系统在坏"：它正是系统在起作用——拒绝给同话题盖章。
+
+**`CONTRADICTED` 现在也要锚（0.3.2，装机复测 R2）**：上面那张表管的是"什么才算支持"，同一把尺现在也量"什么才算反证"。以前只要**极性**不一致就判矛盾，而中文的否定字只要出现一次（`不`/`没`/`未`/`非` 单字即算）整条就被读成否定极性——于是库里存过一条含"不"的中文记忆，就能反驳任何一句英文否定断言（实测 `python is not a compiled language` 与 `the moon is made of cheese` 都被判 `contradicted: true`，点名的是那条毫不相干的行）。现在这一类要有结构证据才定案：共同标识符、双方逐字前缀够长、一方的主体出现在另一方文本里、或支持行自己的实体标签出现在你的断言里。**都不成立时不再判矛盾**，但也不会装作没看见：note 追加 `NOTE: a nearby trace asserts the OPPOSITE polarity (…) a coincidence of negation, not a proven conflict.`，那条痕迹照旧随结果带回（实测这种形状它在 `support` 位上，`contradicting[]` 是空的——那个数组按定义要求与支持行**实体相交**）。**对你的处置不变**：看到这条 NOTE 就当"没依据"处理，别把它读成"记忆里有反证"。真正的同主体翻转照旧定案（`the gateway runs nginx` vs 库里 `the gateway does not run nginx`，以及中文 `支持`/`不支持` 那种写法，各有测试钉住）。
+
+**落在两者之间的那一格**（同一批补的，别误读成 bug）：措辞几乎一样、主体却锚不住反证——库里 `cache warmup -> warmed during startup`，问 `during startup the cache is not warmed`。这句话的特征词全在痕迹里（足以锚住 yes），但你没有拿出"同一件事"的结构证据来判矛盾，于是两头都不成立：结局是 `WEAK_MATCH`，note 里印着 `they assert OPPOSITE polarities, so this trace refutes the claim rather than supporting it`（实测哈希 0.60 / bge 0.86 同为该结局）。**处置与上面 `weak_match` 一行相同**：当"没依据"，去原处核对。同一行改问 `the cache is warmed during startup`（极性一致）照常 SUBSTANTIATED（0.68 / 0.90），所以这一格不是"锚不上"，是极性拦下来的。
+
+**换了号就不是同一件事（0.3.2，装机复测 R3）**：库里存 `KAPPA-1 record`，问 `KAPPA-2 record` ——这一对现在落 `WEAK_MATCH`，note 直接点名两边各自的标识符（`the trace names kappa-1 while this claim names kappa-2 — different identifiers, so the shared wording is about another thing`）。**它既不是 `CONTRADICTED`，也不是 `SUBSTANTIATED`**：前者会把"两个工单"错报成"这个值被改过"，后者更糟——同一对形状在只有字面修复的构建里会被盖章 yes，bge 下最高一条余弦 0.982（`gto 工单 OPS-417 定下 cache backend` 被问成 `OPS-418`），也就是说一个高置信度的错答案。你侧的处置不变：`weak_match` 当"没记过"，去原处核对；`sha` / 版本号 / 工单号同理，只有两边**同一个**标识符才算证据。反过来，真正的数值翻转照旧会被指认（`probeR3d-gateway 超时设定为 30 秒` vs `…90 秒` → `CONTRADICTED`），这一条是四臂差分控制（有/无护栏 × 哈希/bge）里始终不变绿的那一项。
+
+**对中文用户的实际影响（这一版订正过一次，如实说）**：四条词面锚各有各的失效点——特征词那条走 `tokenize`，而它把整段中文当成一个词（改写后不剩共同词元）；主体/值那条要 `主体 -> 值` 写法或英文系动词；逐字那条要求措辞一致。只有"共同标识符"与语言无关（认 `0x…` / 工单号 / sha / 版本号），但前提是句子里真有这么一个。合起来：**中文的散文式改写只剩余弦 0.75 这一条窄门**，实测常常过不了：`gto 内存上限是 4GB` 对 `gto 内存上限 -> 4GB` 只有 0.571 → `weak_match`，而带 `->` 的复述照常 `substantiated`。
+
+这一版要订正的是紧接着的那句结论。它原来写的是"**不会假阳，代价只是中文 yes 变少**"——**这句是错的**："主体/值那条要英文系动词"不只让中文的 yes 变少，它还让**值冲突检测整体失效**（那个分支要求两边都解析成功），于是错误值直接被盖章。装机复测当场抓到：真值 `gto 最大并发连接数 -> 128`，问 `是 512` 得 `substantiated: true`（bge sim 0.81），而写成 `-> 512` 或英文 `is …` 都正常报矛盾。现在这条路补了两道兜法（单边解析 + 前缀数字翻转，见上表），中文的错误值也会被判 `CONTRADICTED`（实测 0.89 / 0.83），真值与合法细化仍照常 `substantiated`（0.91 / 0.81）。**剩下的才是那句"安全方向"**：中文散文式改写常常降级成 `weak_match`，代价是 yes 变少、agent 更多地回答"我去查原处"。想提高中文命中率：写入时用 `主体 -> 值` 的结构化 summary（这本来就是纪律要求的写法），提问时保持同一结构——那条锚走的是解析出来的主体与值，不是英文词形，实测 `gto 内存上限 -> 4GB 以内` 对 `gto 内存上限 -> 4GB` 就照常 SUBSTANTIATED。换句话说，**中文侧的 yes 数量取决于你有多按纪律写 summary**。
+
+---
+
 ## 10. 数据、备份与迁移
 
 | 内容 | 位置 |
@@ -740,6 +813,7 @@ Windows 上 `~` 是 `C:\Users\<你>`。opencode 侧没有 GUI 配置页，设置
 
 **Q5 明明记过，`memory_verify` 却说查无实据？**
 最常见原因是哈希嵌入只认字面词。**首选解法：设置里把嵌入模型改成 `auto`**。其它办法：看 `closest`（最接近的候选是谁）、查询里带上实体名、用更接近原 summary 的措辞再查一次。
+**0.3.2 起多了一种情况**：痕迹确实被召回了（越过 0.32）但拿不到 yes，而是 `weak_match: true`——因为 yes 现在需要**锚**。这不是丢数据：库里那条一行没动，`support` 也照样给你。想让它重新算"支持"，按 [9.13](#913-verify-的-yes-需要什么032) 那张表对着做：**写入用 `<主体> -> <结论>` 的结构化 summary**（同主体同值本身就是锚，中文也因此受益）、标识符写进 summary（工单号 / sha / 版本号）、或干脆用同一条的原文去问（逐字包含是第三种锚）。中文问句尤其要注意：`tokenize` 把整段中文当一个词，改写后的中文只能靠余弦过 0.75，实测常常过不了。
 
 **Q6 recall 只给 0.45，是不是没记住？**
 先看 `reason` 和 `relativeScore`。余弦本身被压缩且依赖查询，**0.45 也可能是全库最佳**。若 `reason` 是 `below-threshold`，看 `nearMisses` 判断是真没有还是阈值偏高（可调低阈值）。
@@ -779,7 +853,7 @@ node -e "const s=require('fs').readFileSync(process.argv[1],'utf8');console.log(
 在引导语里加一句：只记**跨轮次仍然有用**的结论（决策、事实、偏好、坑），不要记寒暄和过程。
 
 **Q17 同一句话换个条件测出不同数字，会被当成冲突吗？**
-带 `scope` 就不会。两边前提对不上时引擎**不覆盖、不合并**，各存各的，写入回显 `different-scope:` 警告；`memory_verify` 带上 `scope` 会挑前提一致的那条当支持，对不上则答 `OUT_OF_SCOPE`。不带 `scope` 才会被读成换值覆盖——这正是它要修的误判。详见 [9.10](#910-前提作用域-scope同一句话换个条件就不成立)。
+带 `scope` 就不会。两边前提对不上时引擎**不覆盖、不合并**，各存各的，写入回显 `different-scope:` 警告；`memory_verify` 带上 `scope` 会挑前提一致的那条当支持，对不上则答 `OUT_OF_SCOPE`。不带 `scope` 才会被读成换值覆盖——这正是它要修的误判。**反过来也不会被"补上"**：库里那条没写前提、这次带前提的重述，0.3.2（G4）起不会把前提原地写进旧行，而是两条并存并回 `premise-narrowing:` 警告——因为没写前提的那条是通说，补上前提等于把它能对谁说话窄掉了。详见 [9.10](#910-前提作用域-scope同一句话换个条件就不成立)。
 
 **Q18 旧记忆库升级后要看前提，条数是错乱的吧？**
 不是。`scope` 是新加的一列，旧库首次打开时自动 `ALTER TABLE` 补上（存量行读作"没写前提"），不需要重建、不会丢数据。之前存的两条同主体结论仍按老规则判；只有新写入声明了前提才会走上面那套判定。
@@ -787,7 +861,10 @@ node -e "const s=require('fs').readFileSync(process.argv[1],'utf8');console.log(
 **Q19 明明让它记过，换个会话（或换个 agent）却查不到？**
 先分清是"没记住"还是"记在另一个库里"——这两种在以前输出一模一样。跑 `memory_maintain` → `status`：本批（0.3.0）里 `health` 第一件事就是判这个，命中时会说 `this store is empty while a sibling file in the same directory holds memories`；`diagnostics().sibling_stores` 列出同目录每个 `.db` 各有多少条、哪一个是**现在应答你的**（`current: true`），`path_rule` 说明本宿主的命名规则（DSH 按 agent id、opencode 按项目目录）。是分裂就**不是记忆问题**：写到共享库、或者回到当初写入的那个 agent / 项目里问。详见 [9.12](#912-库分裂没记住-vs-记在另一个文件里030)。
 
-**Q20 digest 里那行 `[low-confidence …]` 是什么？能信吗？**
+**Q20 verify 返回 `weak_match: true`，是记忆坏了吗？**
+恰恰相反，这是它在起作用（0.3.2）。含义是：**库里有一条话题相邻的痕迹，但没有任何东西把它锚到你这句话上**——同话题不等于记住。处置与"没记过"完全一样：别断言、去原处复查。区别只是它还附带 `support`（最接近那条）和 note 里的两个余弦，那是一条值得看的线索；note 里 `claim-to-summary similarity X is below the claim bar 0.75` 说的就是"差在锚上"。以前这种情形会直接答 `substantiated: true`（实测 0.47 就盖章了），那才是危险的地方。中文问句更容易见到它：特征词锚的分词把整段中文当一个词，主体/值锚要 `主体 -> 值` 写法或英文系动词，于是中文改写多半得靠余弦过 0.75，过不了就降级——见 [9.13](#913-verify-的-yes-需要什么032)。
+
+**Q21 digest 里那行 `[low-confidence …]` 是什么？能信吗？**
 （0.3.0）它是"最接近的痕迹、不是记忆"：这条线索下一条都没过召回门槛时，引擎把余弦最高的那条端出来，免得整块空白看起来像"库里没东西"。它**不带**原行的 `[VERIFIED]` / `[ASSERTED]` 标记，附带的 warning 也说明这块里有一行是猜的。用法：拿它当**复查线索**（去 verify、去问用户），不要当存过的事实复述。相似度为 0、库里根本没东西时连这行都不给。见 [9.2](#92-空结果一定给得出理由)。
 
 ---
@@ -830,9 +907,10 @@ await mem.remember({
 
 // ③ 断言前查证（给 scope 才会核对前提；对不上答 out_of_scope）
 const v = await mem.sourceMonitor('billing service database is postgres');
-if (!v.substantiated) { /* 回答记忆里没有，不要编 */ }
+if (!v.substantiated) { /* 回答记忆里没有，不要编（weak_match 也走这里） */ }
+if (v.weak_match) { /* 0.3.2：有相邻痕迹但没有锚 → 同"没记过"处置；v.support 是复查线索，不是证据 */ }
 const w = await mem.sourceMonitor('miss rate is 1.35%', { scope: 'population=all rows' });
-if (w.out_of_scope) { /* 记忆里那条说的是别的条件，别套用 */ }
+if (w.out_of_scope) { /* 记忆里那条说的是别的条件，别套用；w.scope_conflicts 点名否决它的行。两种情形下这张表是空的，理由都在 note 里：支持行自己就是冲突行；或支持行写在你没点名的那条轴上（G3）——那是"没法比"不是"冲突"，所以不列进冲突表 */ }
 
 // ④ 离线整理
 await mem.consolidate();
