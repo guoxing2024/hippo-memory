@@ -1,6 +1,6 @@
 {
   "name": "dsh-hippo-memory",
-  "version": "0.3.2.1",
+  "version": "0.3.3",
   "description": "DSH profile bundle: hippocampus-inspired long-term memory for DeepSeek runtime agents (tools + dynamic context + guidance + GUI settings page).",
   "type": "module",
   "main": "lib/index.js",
