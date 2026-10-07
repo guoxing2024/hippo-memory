@@ -8,6 +8,8 @@
 ```
 
 > 引擎是框架无关的 [**`hippo-memory-core`**](https://www.npmjs.com/package/hippo-memory-core)（自带 Bun 支持，本包需要 `^0.3.2`）；本包是 **opencode 适配层**（当前 **0.3.3**：0.3.2 三枚已于 **2026-10-06 发布 npm**，本枚仅重发文档，代码成员与 0.3.2 逐字节相同；上一发布线 0.3.0）。引擎侧的契约订正在这里透传：话题相近不再算证据（`weak_match`），矛盾一侧同样要锚（含中文的值冲突），前提冲突的行即使没抢到支持位也能否决（`scope_conflicts[]`），召回命中带上 `anchored` / `anchors`。本包另有两条自家缺陷修复：**没声明的参数不再被静默丢掉**（F5）与 **`hitView` 白名单点名新字段**（引擎多出的键不在这里列出就到不了模型，F4b）——所以"无代码改动"那句旧说法已订正。
+>
+> **⚠️ 宿主版本：本包 **0.4.0** 起是 opencode V2 插件面。** opencode 官方口径是 *"V1 plugin implementations do not run in V2"*，而 V1 面按用户裁决是**删掉**而不是并存——所以 **opencode 2.x 用户要 0.4.0 或更新**，装 0.3.3 及更早的发布件**什么都不会加载**（本机 `opencode plugin list` → `No plugins found` 是这一形的旁证，不是证明）；opencode 1.x 用户自此**不再受支持**，请停在 0.3.3。V2 构建本地 433 项全绿（本包那 34 项在 `test/v2-plugin.test.mjs`），但**没有一台活的 V2 宿主加载过它**；下面"安装"一节写的是 V2 构建的形状，并逐条标注了哪些取自本机 `opencode --help` 实测、哪些仍未在真宿主上验过。
 > 本仓库里的 DSH 版是 [`dsh-hippo-memory`](https://www.npmjs.com/package/dsh-hippo-memory) —— **两个宿主不通用**，别装错。
 
 ---
@@ -28,72 +30,115 @@
 
 ---
 
-## 📦 安装
+## 🔌 它占用的是 opencode V2 的哪几枚钩子
+
+移植后的六个面，逐个指到本包 `lib/index.js` 的行（行号是本文件的引用表，改了代码要一起改，
+`.hippo/check-adapter-anchors.mjs` 会钉住它们）：
+
+| 面 | V2 API | 本项目位置 |
+|---|---|---|
+| 入口 | `export default { id, setup(ctx) }`；`Plugin.define` 实测是恒等函数，所以运行期不 import 宿主 SDK | `lib/index.js:630` |
+| 4 个工具 | `ctx.tool.transform(editor => editor.add(Tool.Info))`，参数表用**裸 JSON Schema**（`ValueSchema` 的第三支），因此不需要 zod/SDK | `lib/index.js:651` |
+| 每轮摘要 | `ctx.session.hook("context", ev => …)`：把 `DISCIPLINE` + `[hippo-memory digest]` push 进 `ev.system`（`SystemPart` 对象，不再是 V1 的字符串数组） | `lib/index.js:741` |
+| 压缩保留 | `ctx.session.hook("compaction", ev => …)`，只附 `ev.system`，不写 `ev.result` | `lib/index.js:742` |
+| 工具观测 | `ctx.tool.hook("execute.after", ev => …)`，只对本包的四枚工具打一行 greppable 日志（V2 的 `ctx.app` 没有 log 面，官方 migrate 示例就是换 `console.log`） | `lib/index.js:743` |
+| 空闲巡检 | `ctx.event.subscribe({ signal })` 返回 **AsyncIterable**（V2 没有回调形态），自己起 `for await` 循环，Cleanup 里 abort | `lib/index.js:749` |
+
+cue 取自 `ev.messages`（V2 形状 `{role, content:[{type:"text", text}]}`，V1 的 `info.parts` 已删），
+见 `lib/index.js:665`。库的键只取 `ctx.location.directory` 一次（`lib/index.js:637`）——V2 的
+`ToolContext` 里**没有** directory 字段，按调用重键会让 A 项目的记忆回答 B 项目的问题。
+
+**注入的幂等性和 V1 是反的**，这一条值得单独讲：V2 文档明写钩子的改动"只影响这次发给模型的请求，
+不写回会话历史"，所以每一次模型调用（含工具续轮的第二次请求）都要重新放一遍摘要；反过来，如果宿主
+把同一个数组再交回来（重试会看到先前钩子的覆盖），我们按 `SystemPart.metadata` 标记**替换**而不是
+再追加一份。V1 那套"同一轮只注入一次"的双钩子互斥标志在这个面上没有对应物了，所以它和它的测试
+一起被删除，不是被移植。
+
+---
+
+## 📦 安装（V2 构建）
 
 ```bash
-# 全局（推荐）：所有项目都能用
-opencode plugin -g opencode-hippo-memory
+# 安装并发布到全局配置（本机 `opencode plugin add --help` 实测：
+# "Install a plugin and add it to the global configuration"，参数是 npm 或 Git 规范）
+opencode plugin add opencode-hippo-memory
 
-# 或者只装在当前项目
-opencode plugin opencode-hippo-memory
+# 其余子命令（同一份 --help 读出来的完整清单）：list / check / update / remove
+opencode plugin list
 ```
 
-装完**重启 opencode** 生效（配置只在启动时读一次）。
+装完**重启 opencode** 生效（配置只在启动时读一次）。老的 `opencode plugin -g <包名>` /
+`opencode plugin <本地目录>` 两枚写法是 V1 时代的命令面，v2 的 `plugin` 只剩上面那五个子命令。
 
 ### 确认装上了
 
 ```bash
-opencode debug info        # plugins: 一行里应出现 opencode-hippo-memory
+opencode plugin list       # 应出现 opencode-hippo-memory
 ```
 
-然后随便开一个会话问模型：`"列出你有哪些 memory_ 工具"` —— 能看到 4 个就通了。
+然后随便开一个会话问模型：`列出你有哪些 memory_ 工具` —— 能看到 4 个才算通了。
+**v2 已经没有 `opencode debug info` 这枚子命令**（本机实测 `opencode debug` 只有
+`agents` / `config` / `paths`），旧 README 让你跑它的那句是错的，本轮已改掉。
+`opencode debug config` 会把整份解析后的配置打出来，噪音大且含你其它设置，不建议当健康检查用。
 
 ### 手动安装（等价做法）
 
-在 `~/.config/opencode/opencode.json`（或项目的 `.opencode/opencode.json`）里写：
+写进 `opencode.json(c)` 的 **`plugins`** 数组（V2 的键名，V1 叫 `plugin`；官方 migrate 页与
+文档镜像 `.hippo/opencode-v2-spec-round35.md` §8）。元素可以是纯包名、带版本的规范、
+作用域包名、相对/绝对路径或 `file://`，也可以是带选项的对象形态：
 
 ```json
-{ "plugin": ["opencode-hippo-memory"] }
+{ "plugins": ["opencode-hippo-memory"] }
 ```
+
+本地开发还可以把文件放进 `.opencode/plugins/`（注意是复数）——V2 同时发现
+`.opencode/plugin/` 与 `.opencode/plugins/`，但发布文档只对**目录里的本地文件**说
+"automatically"，对一个发布件是否同样自动加载**本轮未测**。
 
 ### ⚠️ 一个很容易踩的坑
 
-`plugin` 里写**纯包名**时，opencode 会把它当 registry 规范，去 npm 现装到
-`~/.cache/opencode/packages/<spec>/node_modules/opencode-hippo-memory` —— **它不读 `~/.config/opencode/node_modules`**。
-所以"在配置目录里手工 `npm install` 一个 tgz"是不会生效的，而且：
+V1 时代实测过的一条：`plugin` 里写**纯包名**时，opencode 把它当 registry 规范，去 npm
+现装到 `~/.cache/opencode/packages/<spec>/node_modules/opencode-hippo-memory`，**不读
+`~/.config/opencode/node_modules`**，所以"在配置目录里手工 `npm install` 一个 tgz"不会生效；
+而且装失败**不写日志**（服务端加载器的 `missing` 回调是空函数，install 错误只发一条一次性
+TUI 提示）。**这几条是 V1 加载器的读数**；V2 的下载位置与失败面本轮没读过源码，
+所以只按"仍未验证"处理，别当成 V2 的 promise。要拿路径可以先跑 `opencode debug paths`
+（本机读数：`cache` 指向 `~/.cache/opencode`，与 V1 那批目录同源）。
 
-- 装失败**不写日志**（服务端加载器的 `missing` 回调是空函数，install 错误只发一条一次性 TUI 提示）；
-- `opencode debug info` 里**照样会列出包名**（那只是配置回显，不代表加载成功）。
-
-因此本地开发请用 `opencode plugin <本地目录>`（会解析成 `file://` 规范），或者直接写路径：
+因此本地开发最稳的两条：`opencode plugin add <本地目录>`，或者直接在 `plugins` 里写路径 /
+`file://` 规范：
 
 ```json
-{ "plugin": ["file:///absolute/path/to/opencode-hippo-memory"] }
+{ "plugins": ["file:///absolute/path/to/opencode-hippo-memory"] }
 ```
 
-排查是否真的加载了，别看 debug info，看**副作用**：跑一轮会话后应出现
+判断是否真的加载了，别看配置回显，看**副作用**：跑一轮会话后应出现
 `<store 目录>/<项目名>.db`（见下文"数据位置"），或问模型要 `memory_` 工具列表。
 
-升级后版本没变也是这个原因：opencode 的缓存目录按**规范原文**命名
-（`~/.cache/opencode/packages/opencode-hippo-memory@latest`），命中就完全不查 registry。
-更新要么用 `opencode plugin -g -f opencode-hippo-memory`，要么删掉那个目录再启动。
+升级后版本没变也是同一类问题：缓存按**规范原文**命名
+（`~/.cache/opencode/packages/opencode-hippo-memory@latest`），命中就完全不查 registry
+（V1 读数）。v2 有专门的两枚子命令，不必再手工删目录：`opencode plugin check`
+（"Check package plugins for updates"）与 `opencode plugin update`。
 
 ---
 
 ## ⚙️ 设置
 
-插件选项通过 opencode 配置的 `plugin` 二元组传入：
+插件选项通过 `plugins` 的**对象形态**传入（V2；V1 用的是两元组 `["包名", {…}]`）：
 
 ```json
 {
-  "plugin": [
-    ["opencode-hippo-memory", {
-      "enabled": true,
-      "contextLimit": 5,
-      "sharedStore": false,
-      "discipline": true,
-      "similarityThreshold": null
-    }]
+  "plugins": [
+    {
+      "package": "opencode-hippo-memory",
+      "options": {
+        "enabled": true,
+        "contextLimit": 5,
+        "sharedStore": false,
+        "discipline": true,
+        "similarityThreshold": null
+      }
+    }
   ]
 }
 ```
@@ -174,12 +219,13 @@ Windows 用 `%LOCALAPPDATA%\opencode\hippo-memory`；其余平台用 `~/.cache/o
 同一个引擎的两个宿主适配层，**互不通用**：DSH 用前者，opencode 用本包。数据也不通用——DSH 按 agent id 分库（`~/.dsh/storages/hippo-memory/`），opencode 按项目目录分库（`<缓存根>/opencode/hippo-memory/`）。在 DSH 里记下的结论，到 opencode 查就是"没记过"；反之同理。
 
 **Q：换个项目 / 换个会话就查不到了？**
-先分清两种"查不到"。本包默认**每个项目目录一个库**：A 项目的结论在 B 项目里本来就读不到（不是没记住）。想全项目共用一个库，把 `sharedStore: true` 写进 `plugin` 的设置项。判据在 `memory_maintain { action: "status" }` 里（0.3.0）：`path_rule` 说明这个文件名怎么来的，`sibling_stores` 列出同目录每个 `.db` 各有多少行，本库 0 行而隔壁有货时 `health` 直接说"记在另一个文件里"。
+先分清两种"查不到"。本包默认**每个项目目录一个库**：A 项目的结论在 B 项目里本来就读不到（不是没记住）。想全项目共用一个库，把 `sharedStore: true` 写进 `plugins` 里本包那项的 `options`。判据在 `memory_maintain { action: "status" }` 里（0.3.0）：`path_rule` 说明这个文件名怎么来的，`sibling_stores` 列出同目录每个 `.db` 各有多少行，本库 0 行而隔壁有货时 `health` 直接说"记在另一个文件里"。
 
 **Q：装完没反应？**
-先看上面"⚠️ 一个很容易踩的坑"——`opencode debug info` 列出包名**不代表加载成功**。按顺序查：
+先看上面"⚠️ 一个很容易踩的坑"——`opencode plugin list` 里有包名**不代表加载成功**，配置回显更不代表。按顺序查：
 重启 opencode（配置只在启动时读）→ 跑一轮会话，看 store 目录里有没有生成 `.db` → 没有就确认包已发布到 npm
-（`npm view opencode-hippo-memory version`）且 `plugin` 里是纯包名或有效的 `file://` 路径。
+（`npm view opencode-hippo-memory version`）且 `plugins` 里是纯包名或有效的 `file://` 路径 → 再确认你的
+opencode 是 2.x：本包的 V2 面在 1.x 上不加载（V1 面已删），而 0.3.3 及以前的发布件在 2.x 上也不加载。
 
 **Q：会多花很多 token 吗？**
 自动注入**命中才发生**（每条约 20–40 token），没命中就是 0；条数用 `contextLimit` 控。工具调用只在模型主动用时发生。
@@ -200,7 +246,7 @@ Windows 用 `%LOCALAPPDATA%\opencode\hippo-memory`；其余平台用 `~/.cache/o
 会——除非写入时带 `scope`（`key=value; key=value`，如 `population=all rows; comparator=instruction start`，0.3.0）。带上之后：前提对不上的两条结论各自留存、互不覆盖（写入回显 `different-scope:` 警告）；`memory_verify` 也要带 `scope` 问，库里那条属于别的前提时它答 `out_of_scope`（`substantiated`、`contradicted` 都为 `false`），而不是把旧口径的结论盖到新口径的问题上。**0.3.2 起这个否决不再只看抢到支持位的那一行**：此前一条没写前提的行顶上来时，库里那条 `env=prod` 的冲突痕迹会被降进 `newer_related[]`、`out_of_scope` 仍是 `false`（反馈实测）；现在整个过线候选集都参与比较，落选的否决者点名在 `scope_conflicts[]`。**第九批（G3）补上另一半**：顶上支持位的那条行如果自己就写在**你没点名的那条轴**上（你问 `cluster=blue`，库里那条写 `tenant=acme`），它同样不能换来 `substantiated: true`——转 `out_of_scope`，`scope_conflicts[]` 为空（那不是冲突而是没法比），两侧的轴印在 note 里。
 
 **Q：压缩之后记忆还在吗？**
-在。数据在 SQLite 里，与上下文无关；本插件还会在压缩前把持久记忆塞进压缩上下文 (`experimental.session.compacting`)，减少"压缩后忘事"。
+在。数据在 SQLite 里，与上下文无关；本插件还会在压缩前把持久记忆附进压缩上下文（V2 的 `ctx.session.hook("compaction")`，写进 `event.system`；V1 那枚 `experimental.session.compacting` 已随移植删除），减少"压缩后忘事"。**注意本包只附不替**：V2 的 `compaction` 事件允许用 `event.result` 整份顶掉宿主自己生成的会话摘要，我们刻意不碰它——那等于用一份只看到部分历史的生成物替掉用户的会话摘要，属于新能力而不是等价改写。
 
 ---
 

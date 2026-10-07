@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0] — 2026-10-07 移植到 opencode **V2** 插件面（用户裁决路线 B：只做 V2，V1 面删除）／**破坏性：opencode 1.x 不再支持**
+
+> 触发的是宿主而不是我们：opencode 官方页写 *"V1 plugin implementations do not run in V2"*（2026-10-07 用户报告，取证档案 `.hippo/opencode-v2-port-round34.md`，类型读的是本机解包的已发布 **2.0.24**）。裁决 B = 不在同一个包里养第二个入口，V1 那套 hooks 字典连同它的测试一起**删掉**。所以这一节记的不是"新增一枚能力"，而是**六个面各自换了一次宿主 API**。
+
+- **六个面的落点**（行号是本包 `lib/index.js` 的引用表，`.hippo/check-adapter-anchors.mjs` 钉着）：入口 `packages/opencode-hippo-memory/lib/index.js:630`（`async setup(context)`，挂在 `packages/opencode-hippo-memory/lib/index.js:627` 那个对象上）；4 个工具 `packages/opencode-hippo-memory/lib/index.js:651`（`ctx.tool.transform(editor => editor.add(…))`）；每轮注入 `packages/opencode-hippo-memory/lib/index.js:741`；压缩保留 `packages/opencode-hippo-memory/lib/index.js:742`；工具观测 `packages/opencode-hippo-memory/lib/index.js:743`；空闲巡检 `packages/opencode-hippo-memory/lib/index.js:749`（`ctx.event.subscribe({ signal })` 返回 **AsyncIterable**，V2 没有回调形态，自己起 `for await` 并在 Cleanup 里 abort，`packages/opencode-hippo-memory/lib/index.js:754`）。
+- **运行期不 import 宿主 SDK**：`Plugin.define` 在已发布的包里实测是 **54 字节的恒等函数**，所以入口直接写 `export default { id, setup(ctx) }`（这条纪律在本文件留在 `packages/opencode-hippo-memory/lib/index.js:801` 的注释里——V1 那条"只允许一个 export 且必须是函数"是 V1 loader 的约束，随 V1 面一起删除）。
+- **参数表换成裸 JSON Schema**：V2 的 `Tool.Info.input` 走 `@opencode/schema` 的 `ValueSchema` **第三支**（收原生 JSON Schema），因此 zod 与 `tool()` 都退场；`package.json` 的可选 peer 也从 0.3.3 那版第 43 行的 `@opencode-ai/plugin: ^1.18.31` 换成 `@opencode/plugin: ^2.0.24`。
+- **注入语义是反的**：V2 明写钩子的改动**只影响这次发给模型的请求、不写回会话历史**，所以每一次模型调用（含工具续轮的第二次请求）都要重新放一遍摘要；反过来宿主若把同一个数组再交回来（重试会看到先前钩子的覆盖），我们按 `SystemPart.metadata` 标记**替换**而不是再追加一份——先按标记匹配，再按 header **前缀**，用 substring 会连 `DISCIPLINE` 一起删掉，因为它的正文引用了 digest 的标记词。
+- **库的键只取一次**（`packages/opencode-hippo-memory/lib/index.js:637`）：V2 的 `ToolContext` 里**没有** `directory` 字段，按调用重键的结果是 A 项目的记忆回答 B 项目的问题，所以 store 从 `ctx.location.directory` 键一次。
+- **F5 边界照搬、形状换了**：V1 读 `definition.args`，V2 读 `definition.input.properties`（`packages/opencode-hippo-memory/lib/index.js:327`，注释起点 `packages/opencode-hippo-memory/lib/index.js:320`）；声明表取不到时仍**直接透传**（`packages/opencode-hippo-memory/lib/index.js:329`，那既是给"宿主换形状"留的退路也是它的缺口，见下面 0.3.2 一节的"未收"），未声明的参数名一律**拒**并回显声明表（`packages/opencode-hippo-memory/lib/index.js:333`）。四个工具（`packages/opencode-hippo-memory/lib/index.js:364` 起）各自过这道边界。
+- **cue 的来源换了**（`packages/opencode-hippo-memory/lib/index.js:665`）：V2 的 `context` 钩子直接给 `ev.messages`，"plugin 输入对象里没有 session 字段，所以 `lastUserCue` 恒取不到"这一形在新面上**结构上不存在**了——0.3.2 那节 A1 半格里的 opencode 那一半随移植一起换掉了口径；留下的半边是"真宿主在 `ev.messages` 里到底放什么"，仍**未在宿主验过**。
+- **测试**：V1 套件 `test/adapter.test.mjs` **删除**，新增 `test/v2-plugin.test.mjs` **34 项**（工具注册与 JSON Schema、注入幂等/替换、压缩、观测、错误兜底、F5 边界、store 键）。仓库套件 424 → **433**（引擎 334 ＋ DSH 65 ＋ 本包 34）；镜像 `.hippo/repo-suite-round36.txt`（**433 / 433 / 0**，全文 `not ok` 计数 0，头两行回声 `> tsc -p tsconfig.json`）与三份分包镜像 `.hippo/suite-engine-round36.txt` 334/334/0、`.hippo/suite-dsh-round36.txt` 65/65/0、`.hippo/suite-oc-round36.txt` 34/34/0，每份末尾 `EXIT=0`。**引擎字节一字未动**：`dist/memory.js` 仍是 225,879 / sha256-12 `963693feee3b`，所以 334 与 65 两包只是复跑，没被本移植改过。
+- **发布**：本枚 **0.4.0**，`npm publish` 只发这一份——三枚包自此**不再同号**（引擎 `hippo-memory-core` 与 `dsh-hippo-memory` 停在 0.3.3，两者的字节本批一字未动）。`files` 白名单仍是 `lib` / `README.md` / `CHANGELOG.md`，所以库内跟踪的 `package-lock.json` 不进 tarball；依赖下限 `hippo-memory-core@^0.3.2` 未动，因为移植不需要任何新引擎能力。本仓库的 tag 是**仓库级**而不是包级，所以 `v0.4.0` 指的是这一枚提交，它的内容只有本包与文档面变了。
+- **一条死路**：第一版 belt 断言拿 `contextLimit` 当被检对象，红在 `0 !== 1`。原因在引擎侧且是对的：cue 低于召回线时 `composeContext` **在任何 limit 下都给 0 条**，digest 只剩一句 194 字符的"没有过线记忆"桩，所以那条断言改成具名主体的 cue——**门槛之下的 limit 不是可测的旋钮**，这一句写在这里是为了下一批不再试一遍。
+- **未证（写在这里而不是藏起来）**：① **活的 opencode V2 宿主从没加载过本插件**——本机 `opencode plugin list` 回 `No plugins found`，而只有 V1 时代的 cache 目录里存着 `opencode-hippo-memory@0.3.0`；② **0.3.3 及更早是 V1 面**，装上它在 opencode 2.x 上什么都不加载，V2 面从 0.4.0 起——所以 opencode 1.x 用户只能停在 0.3.3，2.x 用户必须升到 0.4.0，这一条是路线 B 的代价而不是笔误；③ **本枚同步到本机 `~/.npmrc` 所指镜像要多久，没量过**——历史上 0.3.0 那次真装撞过一次 `ERR_PNPM_NO_MATCHING_VERSION`，所以"发完立刻在真宿主上装"拿不到包属镜像延迟而不是包坏，这一条发布前后都不为已证；定号的判据与只跳本包的理由写在上面那格「发布」里。④ `opencode plugin add` 把配置写在哪、V2 还吃不吃的 `.opencode/plugins/` 目录，本机都没量过——本包 README 安装一节里每条命令都标了它是 `--help` 实测还是按类型推的。
+- **一条自家工具的后果**：`.hippo/check-adapter-anchors.mjs` 一律按**工作树**解析行号，所以 0.3.2 那几节里指向 V1 行号的引用，在工作树换面之后**不可能同时为真**——按本仓库既有的做法（把纯历史指针改成不带这套记法的叙述，而不是把号改到今天的行），本包 0.3.2 一节的四枚、根 CHANGELOG 的两枚、DSH 包的一枚已改成叙述；锚点表 opencode 段整段重登记到 V2 行（本文件现 814 行 / md5 `6e155787c012e424d9c847ebfb5bccd3`），门在本站读到 **0 bad**、退出码 0，镜像见 ROADMAP 的引用门那几格。
+
 ## [0.3.2] — 2026-09-25（批次日期）／ **2026-10-06 发布 npm**（同日 **0.3.3** 仅重发本包文档，代码成员与 0.3.2 逐字节相同）— `memory_verify` 的返回值补上两种"不是 yes"（需要引擎 `hippo-memory-core@^0.3.2`）
 
 与 DSH 适配层同构的一版：把引擎侧 `verify` 的契约订正透传给模型。**yes 现在需要锚**，`OUT_OF_SCOPE` 现在会点名否决它的那条前提；缺陷本体、根因与修都在引擎，见根 [CHANGELOG.md](../../CHANGELOG.md) 的 `[0.3.2]`。
@@ -12,10 +29,10 @@
 
 ### Fixed — F5（黑盒报告 #6，本包自家缺陷）：没声明的参数被丢掉，而调用方收到成功
 
-- **症状**：本包宿主把模型写出的 JSON **原样**交给工具，`@deepseek-ai/dsh-tools` 的参数对象 schema 又不带 `additionalProperties`（隐式开放参数对象），于是 `memory_remember({ ..., detail2: 'typo', not_a_field: true })` 这一形**返回成功**——多余键被引擎直接扔掉、哪一列都不携带它，而工具卡片回显的 `rawInput` 里它们还在，看起来像写进去了。写的人以为写进去了。（与 DSH 那一条同源：`lib/index.js:270` 起的注释与 DSH 的 `defineClosedTool` 读的是同一件事，两条缺陷分别落在两个边界上。）
-- **根因**：`buildTools` 里的 `define` 只按 `definition.args` **取已知键**（`packages/opencode-hippo-memory/lib/index.js:277`），从不检查**多余的**键。边界是唯一知道自己声明了什么的地方，所以这句话只能在这儿说。
-- **修法**：未声明的参数名一律**拒**（`packages/opencode-hippo-memory/lib/index.js:283`），回显 `unknown argument(s) … — not declared, so nothing was read or written. Declared: …`，让一次拼写错误在第一次调用后就终止；被拒的写入**不落盘**（用例断言 recall 之后 `hits.length === 0`）。
-- **未收（写在这里而不是藏在根目录）**：① 这道守卫在 `definition.args` 为空时**直接透传**（`packages/opencode-hippo-memory/lib/index.js:279`）——那是给"宿主换了形状、声明表取不到"留的退路，但它同时意味着一个**不声明任何参数的工具**不受这条保护；② 直接用引擎 API 的调用方不受约束；③ 参数的**值类型**照旧不校验，这一轮只管名字。三条都在 [ROADMAP](../../ROADMAP.md) 在册。
+- **症状**：本包宿主把模型写出的 JSON **原样**交给工具，`@deepseek-ai/dsh-tools` 的参数对象 schema 又不带 `additionalProperties`（隐式开放参数对象），于是 `memory_remember({ ..., detail2: 'typo', not_a_field: true })` 这一形**返回成功**——多余键被引擎直接扔掉、哪一列都不携带它，而工具卡片回显的 `rawInput` 里它们还在，看起来像写进去了。写的人以为写进去了。（与 DSH 那一条同源：0.3.2 那份文件从第 270 行起的注释与 DSH 的 `defineClosedTool` 读的是同一件事，两条缺陷分别落在两个边界上。）
+- **根因**：`buildTools` 里的 `define` 只按 `definition.args` **取已知键**（0.3.2 那份文件的第 277 行），从不检查**多余的**键。边界是唯一知道自己声明了什么的地方，所以这句话只能在这儿说。
+- **修法**：未声明的参数名一律**拒**（0.3.2 那份文件的第 283 行），回显 `unknown argument(s) … — not declared, so nothing was read or written. Declared: …`，让一次拼写错误在第一次调用后就终止；被拒的写入**不落盘**（用例断言 recall 之后 `hits.length === 0`）。
+- **未收（写在这里而不是藏在根目录）**：① 这道守卫在 `definition.args` 为空时**直接透传**（0.3.2 那份文件的第 279 行）——那是给"宿主换了形状、声明表取不到"留的退路，但它同时意味着一个**不声明任何参数的工具**不受这条保护；② 直接用引擎 API 的调用方不受约束；③ 参数的**值类型**照旧不校验，这一轮只管名字。三条都在 [ROADMAP](../../ROADMAP.md) 在册。
 
 ### Changed — `memory_recall` 的返回补上 `anchored` / `anchors`（引擎 F4b 的透传）
 

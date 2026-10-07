@@ -5,20 +5,31 @@
  * plugin API, so this package re-implements the adapter half against it while
  * reusing the framework-agnostic engine (`hippo-memory-core`).
  *
+ * This module speaks the opencode **V2** plugin API and only V2 (route B, ruled
+ * 2026-10-07): the default export is `{ id, setup(context) }`, the V1 hook-object
+ * factory is gone. opencode 1.x users therefore lose this plugin rather than get a
+ * degraded one — see the ROADMAP cell and the CHANGELOG entry. The port spec, with
+ * a line reference for every shape used below, is `.hippo/opencode-v2-spec-round35.md`.
+ *
  * What it adds to an opencode session:
  *
  *   1. tools        memory_remember / memory_recall / memory_verify / memory_maintain
- *   2. digest       relevant memories injected per turn through
- *                   experimental.chat.system.transform (with a messages.transform
- *                   fallback, since that hook is experimental and may disappear)
- *   3. compaction   memories that must survive a session compaction, injected via
- *                   experimental.session.compacting
+ *                   (ctx.tool.transform + editor.add; `input` is inline JSON Schema,
+ *                   so no SDK import is needed at runtime)
+ *   2. digest       relevant memories injected through ctx.session.hook('context').
+ *                   The host does not persist hook edits, so every outgoing model
+ *                   call re-injects; if an already-injected array comes back, the
+ *                   block is replaced rather than stacked (marker first, text second)
+ *   3. compaction   memories that must survive a session compaction, through
+ *                   ctx.session.hook('compaction') — carried into `system`, never by
+ *                   setting `result` (that would replace the host's own summary)
  *   4. discipline   a short usage section appended to the system prompt
  *
  * Storage: one SQLite file per project directory under
  * `$XDG_CACHE_HOME/opencode/hippo-memory/` (falls back to `~/.cache/opencode/...`).
  * Engines are cached per directory, so a long-lived opencode server does not
- * reopen the database on every turn.
+ * reopen the database on every turn. The directory comes from `ctx.location`, not
+ * from the tool call context — V2 does not put one there.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -115,31 +126,70 @@ function storeFile(directory, shared = false) {
   return join(cacheRoot(), slug + '.db');
 }
 
-/** Flatten an opencode message list into a short cue string. */
+/**
+ * Flatten a V2 message list into a short cue string.
+ *
+ * `SessionContext.messages` is `Array<Message>` where a message is
+ * `{role, content: [{type:'text', text}, …]}` (ai/package/dist/schema/messages.d.ts:428-431)
+ * — the V1 shape was `{info: {role}, parts: [...]}` and is not accepted here: a route-B
+ * adapter must not read a shape the current host no longer sends. A string `content`
+ * is tolerated because the schema allows the tagged union to be built either way.
+ */
 function cueFromMessages(messages, maxChars = 1200) {
   const texts = [];
   for (const entry of messages || []) {
-    const parts = entry?.parts ?? entry?.info?.parts ?? [];
-    for (const part of Array.isArray(parts) ? parts : []) {
-      if (typeof part?.text === 'string' && part.text.trim()) texts.push(part.text.trim());
+    const content = entry?.content;
+    if (typeof content === 'string') {
+      if (content.trim()) texts.push(content.trim());
+      continue;
+    }
+    for (const part of Array.isArray(content) ? content : []) {
+      if (part?.type === 'text' && typeof part.text === 'string' && part.text.trim()) texts.push(part.text.trim());
     }
   }
   const joined = texts.join(' ').replace(/\s+/g, ' ').trim();
   return joined.length > maxChars ? joined.slice(-maxChars) : joined;
 }
 
-/** Normalize the various shapes a message list can take. */
-function messageList(output) {
-  if (Array.isArray(output?.messages)) return output.messages;
-  if (Array.isArray(output)) return output;
-  return [];
+/** Text of a system entry, tolerating a raw string if a host ever hands one. */
+function partText(part) {
+  return typeof part === 'string' ? part : String(part?.text ?? '');
 }
 
-/** True once the host has called experimental.chat.system.transform at least
- *  once. That hook is the preferred injection point; the messages.transform
- *  fallback must then stay out of the way, otherwise every turn carries the
- *  digest twice. */
-let systemHookSupported = false;
+/** The two blocks this plugin injects, and how each is recognised again. */
+const INJECT_TAG = 'hippo-memory';
+const DIGEST_HEADER = '[hippo-memory digest]';
+const DISCIPLINE_HEADER = '## Long-term memory';
+const CARRYOVER_HEADER = '## Durable memory';
+
+/**
+ * Which injected block a system entry is, or null. The metadata tag is the primary
+ * key (SystemPart.metadata is a legal field, spec §4) and the header text is the
+ * fallback for entries that reached us through a path which dropped metadata.
+ * Matching is by prefix, never "contains": the discipline block quotes the digest
+ * marker in its own body, so a substring test would delete the discipline too.
+ */
+function injectedKind(part) {
+  const tag = part?.metadata?.[INJECT_TAG];
+  if (tag === 'digest' || tag === 'discipline' || tag === 'carryover') return tag;
+  const text = partText(part);
+  if (text.startsWith(DIGEST_HEADER)) return 'digest';
+  if (text.startsWith(DISCIPLINE_HEADER)) return 'discipline';
+  if (text.startsWith(CARRYOVER_HEADER)) return 'carryover';
+  return null;
+}
+
+/** Build one system part the plugin can find again on the next outgoing call. */
+function injectedPart(text, kind) {
+  return { type: 'text', text, metadata: { [INJECT_TAG]: kind } };
+}
+
+/** Remove our own blocks from a system array in place, and hand back nothing. */
+function removeInjected(target, kind) {
+  for (let i = target.length - 1; i >= 0; i -= 1) {
+    if (injectedKind(target[i]) === kind) target.splice(i, 1);
+  }
+}
 
 /** @type {Map<string, import('hippo-memory-core').HippoMemory>} */
 const stores = new Map();
@@ -196,7 +246,6 @@ async function storeFor(directory, config) {
 
 /** Test seam: drop cached stores (used by the test suite). */
 function resetStores() {
-  systemHookSupported = false;
   for (const store of stores.values()) {
     try { store.close(); } catch { /* already closed */ }
   }
@@ -216,16 +265,11 @@ function digestLine(hit) {
 }
 
 /** Build the injected block (or '' when nothing is relevant). */
-/** Remove any digest block a previous turn already appended. */
-function withoutDigest(parts) {
-  return parts.filter((part) => !String(part).includes('[hippo-memory digest]'));
-}
-
 async function buildDigest(store, cue, limit) {
   const bundle = await store.composeContext(cue || ' ', { limit, includeRecent: true });
   const context = bundle?.context ?? '';
   if (!context.trim()) return '';
-  return [`[hippo-memory digest]`, context, ''].join('\n');
+  return [DIGEST_HEADER, context, ''].join('\n');
 }
 
 /** Render one recall hit for a tool result. */
@@ -257,15 +301,21 @@ function hitView(hit) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Build the four memory tools. The `tool` helper comes from
- * `@opencode-ai/plugin`, but this package stays usable (and testable) without
- * it: when the helper is absent we fall back to a plain object of the same
- * shape, which is exactly what opencode accepts.
+ * Build the four memory tools as V2 `Tool.Info` objects.
+ *
+ * `input` is inline JSON Schema, which `Tool.ValueSchema` accepts as one of three
+ * branches (schema/package/dist/tool.d.ts:32 — Schema.Codec | StandardSchemaV1 |
+ * JsonSchema). That is what keeps this module free of any host SDK import at
+ * runtime: the V1 half needed `@opencode-ai/plugin` only for its zod helper, and
+ * `Plugin.define` turned out to be an identity function (spec §1). The cost is that
+ * `InputValue` of the JsonSchema branch types as `unknown`, so validating arguments
+ * stays our job — which it already was.
+ *
+ * Bodies below return a JSON string; `closed` turns that into the documented
+ * `Tool.Result` shape (`{content}`) at the boundary, so the host contract lives in
+ * exactly one place.
  */
-function buildTools({ tool, getStore, config }) {
-  const rawDefine = typeof tool === 'function'
-    ? tool
-    : (definition) => definition;
+function buildTools({ getStore, config, directory }) {
   /**
    * Close the argument list at the boundary (F5, black-box report #6): the host
    * passes the model's JSON through as an open object, so an invented key used
@@ -273,63 +323,67 @@ function buildTools({ tool, getStore, config }) {
    * the tool card's `rawInput` as if it had landed. Refuse it instead, name it,
    * and list what this tool actually declares so the next call can be written.
    */
-  const define = (definition) => {
-    const declared = Object.keys(definition?.args ?? {});
+  const closed = (definition) => {
+    const declared = Object.keys(definition?.input?.properties ?? {});
     const inner = definition?.execute;
-    if (!declared.length || typeof inner !== 'function') return rawDefine(definition);
-    return rawDefine({
+    if (!declared.length || typeof inner !== 'function') return definition;
+    return {
       ...definition,
       async execute(args, context) {
         const unknown = Object.keys(args ?? {}).filter((k) => !declared.includes(k));
         if (unknown.length) {
-          return json({
-            ok: false,
-            error:
-              `unknown argument(s) ${unknown.join(', ')} — not declared, so nothing was read or written. ` +
-              `Declared: ${declared.join(', ')}.`
-          });
+          return {
+            content: json({
+              ok: false,
+              error:
+                `unknown argument(s) ${unknown.join(', ')} — not declared, so nothing was read or written. ` +
+                `Declared: ${declared.join(', ')}.`
+            }),
+          };
         }
-        return inner(args, context);
+        return { content: await inner(args, context) };
       }
-    });
-  };
-  const schema = tool?.schema ?? null;
-  /** Use the host schema builder when present, else a permissive stub. */
-  const s = schema ?? {
-    string: () => ({}),
-    number: () => ({}),
-    boolean: () => ({}),
-    array: () => ({}),
-    enum: () => ({}),
-    object: () => ({}),
-    optional: () => ({}),
+    };
   };
 
-  return {
-    memory_remember: define({
+  /* Inline JSON Schema builders — the whole point is that these are host-free. */
+  const str = (description) => (description ? { type: 'string', description } : { type: 'string' });
+  const num = () => ({ type: 'number' });
+  const bool = () => ({ type: 'boolean' });
+  const oneOf = (values, description) => (
+    description ? { type: 'string', enum: values, description } : { type: 'string', enum: values });
+  const strings = () => ({ type: 'array', items: { type: 'string' } });
+  const shape = (properties, required) => ({
+    type: 'object',
+    properties,
+    ...(required?.length ? { required } : {}),
+  });
+
+  return [
+    closed({
+      name: 'memory_remember',
       description:
         'Write a durable fact/event into long-term memory (separate from this transcript). ' +
         'Re-stating the same fact strengthens it; changing the value of the same subject versions it ' +
         '(the old revision is archived, never silently dropped). Prefer summary "<subject> -> <value>" for facts.',
-      args: {
-        kind: s.enum(['episode', 'semantic', 'procedure']).describe?.(
-          'episode = one event, semantic = durable rule/fact, procedure = skill/workflow',
-        ) ?? s.enum(['episode', 'semantic', 'procedure']),
-        summary: s.string().describe?.('One-sentence memory. Facts: "<subject> -> <value>".') ?? s.string(),
-        detail: s.string().optional?.() ?? s.string(),
-        entities: (s.array(s.string()).optional?.() ?? s.array(s.string())),
-        tags: (s.array(s.string()).optional?.() ?? s.array(s.string())),
-        importance: s.number().optional?.() ?? s.number(),
-        confidence: (s.enum(['high', 'medium', 'low', 'speculative']).optional?.() ?? s.enum(['high', 'medium', 'low', 'speculative'])),
-        verify_cmd: s.string().optional?.() ?? s.string(),
-        verify_result: (s.enum(['pass', 'fail']).optional?.() ?? s.enum(['pass', 'fail'])),
-        supersedes: (s.array(s.string()).optional?.() ?? s.array(s.string())),
-        scope: (s.string().optional?.().describe?.(
+      input: shape({
+        kind: oneOf(['episode', 'semantic', 'procedure'],
+          'episode = one event, semantic = durable rule/fact, procedure = skill/workflow'),
+        summary: str('One-sentence memory. Facts: "<subject> -> <value>".'),
+        detail: str(),
+        entities: strings(),
+        tags: strings(),
+        importance: num(),
+        confidence: oneOf(['high', 'medium', 'low', 'speculative']),
+        verify_cmd: str(),
+        verify_result: oneOf(['pass', 'fail']),
+        supersedes: strings(),
+        scope: str(
           'The conditions this fact holds under — "key=value; key=value" or a plain condition phrase such as "the production cluster"; both forms are compared the same way, so do not drop a premise you can name just because it does not look like key=value. Only state premises you actually know; a fact with no real condition takes none.',
-        ) ?? s.string()),
-      },
-      async execute(args, context) {
-        const store = await getStore(context?.directory);
+        ),
+      }, ['kind', 'summary']),
+      async execute(args) {
+        const store = await getStore();
         const res = await store.remember({
           kind: args.kind,
           summary: args.summary,
@@ -361,7 +415,8 @@ function buildTools({ tool, getStore, config }) {
       },
     }),
 
-    memory_recall: define({
+    closed({
+      name: 'memory_recall',
       description:
         'Retrieve memories matching a question. Call this before answering anything that depends on ' +
         'facts from earlier in this session or from a previous one. Every hit carries similarity (raw cosine), ' +
@@ -373,15 +428,15 @@ function buildTools({ tool, getStore, config }) {
         'evidence to assert from. An empty result carries a reason. If your question is premise-bound ' +
         '(a specific env/region/release/dataset), pass that same scope so a fact stored under another ' +
         'premise is filtered out instead of misread as the answer.',
-      args: {
-        query: s.string().describe?.('The question / retrieval cue.') ?? s.string(),
-        limit: s.number().optional?.() ?? s.number(),
-        scope: (s.string().optional?.().describe?.(
+      input: shape({
+        query: str('The question / retrieval cue.'),
+        limit: num(),
+        scope: str(
           'The premise your question is bound to — "key=value; key=value" or a plain condition phrase such as "the production cluster"; both forms are compared the same way. Rows whose stated scope disagrees are excluded entirely, so a fact stored under a different premise (another env/region/release) is filtered out instead of misread as the answer.',
-        ) ?? s.string()),
-      },
-      async execute(args, context) {
-        const store = await getStore(context?.directory);
+        ),
+      }, ['query']),
+      async execute(args) {
+        const store = await getStore();
         const res = await store.recall(
           { query: args.query, scope: typeof args.scope === 'string' ? args.scope : undefined },
           Math.min(args.limit ?? 8, 20),
@@ -401,20 +456,21 @@ function buildTools({ tool, getStore, config }) {
       },
     }),
 
-    memory_verify: define({
+    closed({
+      name: 'memory_verify',
       description:
         'Source-monitoring check for a factual claim: SUBSTANTIATED / CONTRADICTED / OUT_OF_SCOPE / WEAK_MATCH / UNSUBSTANTIATED, ' +
         'plus evidence groups (contradicting, newer_related, superseded_matches, scope_conflicts). Call this BEFORE ' +
         'asserting a remembered fact; only substantiated:true is evidence — WEAK_MATCH (weak_match:true) means memory is ' +
         'merely on the same topic, so answer "not in my memory / I have not verified it" instead.',
-      args: {
-        claim: s.string().describe?.('The claim you intend to assert.') ?? s.string(),
-        scope: (s.string().optional?.().describe?.(
+      input: shape({
+        claim: str('The claim you intend to assert.'),
+        scope: str(
           'The premise you are asserting under — "key=value; key=value" or a plain condition phrase such as "the production cluster"; both forms are compared the same way. Pass one whenever you can name it: without it a fact stored under other premises can be read as support, and verify answers OUT_OF_SCOPE instead. Do not fabricate a scope you are not actually asking about.',
-        ) ?? s.string()),
-      },
-      async execute(args, context) {
-        const store = await getStore(context?.directory);
+        ),
+      }, ['claim']),
+      async execute(args) {
+        const store = await getStore();
         const v = await store.sourceMonitor(args.claim, { scope: args.scope });
         return json({
           substantiated: v.substantiated,
@@ -435,7 +491,8 @@ function buildTools({ tool, getStore, config }) {
       },
     }),
 
-    memory_maintain: define({
+    closed({
+      name: 'memory_maintain',
       description:
         'Memory housekeeping. status = engine + store health (start here when recall looks broken); ' +
         'stats / list / history / duplicates / override-audit are read-only reports (duplicates reads two ' +
@@ -443,17 +500,18 @@ function buildTools({ tool, getStore, config }) {
         'consolidate, merge and ' +
         'forget mutate (merge and forget preview with dry_run, undemote restores what merge folded away); ' +
         'delete is permanent.',
-      args: {
-        action: (s.enum(['status', 'stats', 'list', 'history', 'duplicates', 'merge', 'undemote', 'override-audit', 'consolidate', 'forget', 'delete']).describe?.(
+      input: shape({
+        action: oneOf(
+          ['status', 'stats', 'list', 'history', 'duplicates', 'merge', 'undemote', 'override-audit', 'consolidate', 'forget', 'delete'],
           'Which maintenance action to run. "duplicates" is a read-only report over two channels: by "text" for the same sentence restated, by "vector" for one statement worded differently (a vector group carries the weakest edge that still cleared the near-duplicate floor, 0.92 by default; a text group carries no such number). A group is tagged mixedPremises:true when any two rows in it state incompatible conditions. "merge" acts on ONE such group: ids:[group ids] previews by default, dry_run:false retires the extras into the survivor (they stay live but hidden; reversible with "undemote"). Those flagged rows are not restatements of each other: merge leaves them in blocked[] and still folds the rest.',
-        ) ?? s.enum(['status', 'stats', 'list', 'history', 'duplicates', 'merge', 'undemote', 'override-audit', 'consolidate', 'forget', 'delete'])),
-        id: s.string().optional?.() ?? s.string(),
-        ids: (s.array(s.string()).optional?.() ?? s.array(s.string())),
-        into: s.string().optional?.() ?? s.string(),
-        dry_run: s.boolean().optional?.() ?? s.boolean(),
-      },
-      async execute(args, context) {
-        const store = await getStore(context?.directory);
+        ),
+        id: str(),
+        ids: strings(),
+        into: str(),
+        dry_run: bool(),
+      }, ['action']),
+      async execute(args) {
+        const store = await getStore();
         const mod = await engine();
         // Tool results carry stored text to the model like the digest does, so
         // they get the same sanitizer (the digest itself is sanitized by the
@@ -465,7 +523,7 @@ function buildTools({ tool, getStore, config }) {
             return json({
               driver: mod?.sqliteDriver,
               version: mod?.DEFAULT_OPTIONS ? 'hippo-memory-core' : 'unknown',
-              storeFile: storeFile(context?.directory, config().sharedStore),
+              storeFile: storeFile(directory, config().sharedStore),
               path_rule: config().sharedStore
                 ? 'sharedStore is on: every project reads and writes this one store file.'
                 : 'one store file per project directory, named after it under the hippo-memory cache root; ' +
@@ -549,7 +607,7 @@ function buildTools({ tool, getStore, config }) {
         }
       },
     }),
-  };
+  ];
 }
 
 /* ------------------------------------------------------------------ */
@@ -557,172 +615,200 @@ function buildTools({ tool, getStore, config }) {
 /* ------------------------------------------------------------------ */
 
 /**
- * opencode plugin entry point.
+ * opencode V2 plugin entry: the default export is `{id, setup(context)}`
+ * (plugin/package/dist/promise/plugin.d.ts:55-59). `Plugin.define` turned out to be
+ * an identity function (spec §1), so the object is written directly and this module
+ * needs no host import at runtime. `setup` returns a Cleanup that disposes every
+ * registration and aborts the event subscription.
  *
- * @param {object} input   host context ({ directory, workspace, client, ... })
- * @param {object} options plugin options from opencode.json ("plugin": [[name, {...}]])
+ * @param {object} context  the V2 plugin context ({app, location, options, session,
+ *                          tool, event, storage, …})
  */
-const HippoMemoryPlugin = async (input = {}, options = {}) => {
-  const directory = input.directory ?? process.cwd();
-  const config = () => settings(options);
-  const getStore = (dir) => storeFor(dir ?? directory, config());
+const HippoPlugin = {
+  id: 'opencode-hippo-memory',
 
-  // The tool helper ships with @opencode-ai/plugin; import it lazily so the
-  // package also loads in a plain Node process (tests, CLI smoke checks).
-  let tool = null;
-  try {
-    ({ tool } = await import('@opencode-ai/plugin'));
-  } catch {
-    tool = null;
-    // Without the SDK the arg builders fall back to permissive stubs, so the four
-    // tools reach the model with empty parameter schemas. Say so — a silent
-    // degrade is indistinguishable from a working install.
-    log(input, 'WARN @opencode-ai/plugin is not resolvable from this plugin install; '
-      + 'memory_* argument schemas are degraded. Check that the plugin package declares it as a dependency.');
-  }
+  async setup(context) {
+    const directory = context?.location?.directory ?? process.cwd();
+    const options = context?.options ?? {};
+    const config = () => settings(options);
+    // V2's ToolContext carries session/agent/message ids and a signal, but no
+    // directory, so the store is keyed once here from ctx.location. Re-keying it per
+    // call would let a memory written in one project answer a question in another.
+    const getStore = () => storeFor(directory, config());
 
-  const current = config();
-  const hooks = {};
-  if (!current.enabled) {
-    // Disabled: no tools, no injection. Data on disk is untouched.
-    return hooks;
-  }
+    const controller = new AbortController();
+    const release = [];
 
-  hooks.tool = buildTools({ tool, getStore, config });
-
-  /* --- 1. digest injection ---------------------------------------- */
-  // Preferred: the system prompt transform. Every hook here is wrapped so a
-  // broken engine can never break the user's session.
-  hooks['experimental.chat.system.transform'] = async (_hookInput, output) => {
-    systemHookSupported = true;
-    try {
-      if (!output || !Array.isArray(output.system)) return;
-      const cfg = config();
-      // Keep the block idempotent across turns: replace, never accumulate.
-      output.system = withoutDigest(output.system);
-      if (cfg.discipline && !output.system.some((part) => part.includes('## Long-term memory'))) {
-        output.system.push(DISCIPLINE);
-      }
-      const cue = lastUserCue(input);
-      const digest = await buildDigest(await getStore(directory), cue, cfg.contextLimit);
-      if (digest) output.system.push(digest);
-    } catch (err) {
-      log(input, 'digest injection failed: ' + (err?.message ?? String(err)));
+    if (!config().enabled) {
+      // Disabled: no tools, no injection. Data on disk is untouched.
+      return async () => { controller.abort(); };
     }
-  };
 
-  // Fallback path: prepend a system message to the model input. Only runs when
-  // the host does not provide it (opencode < 1.18 or a future removal).
-  hooks['experimental.chat.messages.transform'] = async (_hookInput, output) => {
-    try {
-      // Avoid double injection: when the host supports the system-prompt hook,
-      // that path already carried the digest for this turn.
-      if (systemHookSupported) return;
-      const messages = messageList(output);
-      if (!messages.length) return;
-      // Drop a digest injected by an earlier turn before adding this turn\'s.
-      for (let i = messages.length - 1; i >= 0; i -= 1) {
-        const parts = messages[i]?.parts ?? [];
-        if (Array.isArray(parts) && parts.some((part) => String(part?.text ?? '').includes('[hippo-memory digest]'))) {
-          messages.splice(i, 1);
+    /* --- 0. tools ---------------------------------------------------- */
+    if (typeof context?.tool?.transform === 'function') {
+      // The transform callback is synchronous in the promise flavour, and the four
+      // tools are added there; nothing else in this plugin may assume it ran.
+      const registration = await context.tool.transform((editor) => {
+        for (const info of buildTools({ getStore, config, directory })) editor.add(info);
+      });
+      if (registration?.dispose) release.push(() => registration.dispose());
+    } else {
+      log('WARN this host has no ctx.tool.transform; memory_* tools are inactive');
+    }
+
+    /* --- 1. digest injection ----------------------------------------- */
+    // Every hook is wrapped so a broken engine can never break the user's session.
+    const inject = async (event) => {
+      try {
+        if (!event) return;
+        const cfg = config();
+        const cue = cueFromMessages(Array.isArray(event.messages) ? event.messages : []);
+        const digest = await buildDigest(await getStore(), cue, cfg.contextLimit);
+
+        if (Array.isArray(event.system)) {
+          // Replace, never stack: hook edits are not persisted into the session, so
+          // this runs again for the next outgoing model call, and a retry can hand
+          // back the very array an earlier hook filled (spec §4).
+          removeInjected(event.system, 'digest');
+          removeInjected(event.system, 'discipline');
+          if (cfg.discipline) event.system.push(injectedPart(DISCIPLINE, 'discipline'));
+          if (digest) event.system.push(injectedPart(digest, 'digest'));
+          return;
+        }
+
+        // Fallback for a host that hands no system array. Retrieved memory rides an
+        // ordinary user message here, which is also where the official guidance puts
+        // it: keep raw retrieved content out of privileged system updates
+        // (ai/package/dist/schema/messages.d.ts:587-593, spec §5).
+        const messages = Array.isArray(event.messages) ? event.messages : null;
+        if (!messages || !digest) return;
+        for (let i = messages.length - 1; i >= 0; i -= 1) {
+          const first = messages[i]?.content?.[0];
+          if (first?.metadata?.[INJECT_TAG] === 'digest' || partText(first).startsWith(DIGEST_HEADER)) {
+            messages.splice(i, 1);
+          }
+        }
+        messages.unshift({ role: 'user', content: [injectedPart(digest, 'digest')] });
+      } catch (err) {
+        log('digest injection failed: ' + (err?.message ?? String(err)));
+      }
+    };
+
+    /* --- 2. compaction carry-over ------------------------------------ */
+    const carryOver = async (event) => {
+      try {
+        if (!event || !Array.isArray(event.system)) return;
+        const cfg = config();
+        const digest = await buildDigest(await getStore(), 'session summary', Math.max(8, cfg.contextLimit));
+        if (!digest) return;
+        removeInjected(event.system, 'carryover');
+        event.system.push(injectedPart(
+          [
+            '## Durable memory (survives this compaction)',
+            'These entries are stored in the long-term memory database and can be recalled later with ' +
+              'memory_recall. Keep them accurate; do not restate them as fresh observations.',
+            digest,
+          ].join('\n'),
+          'carryover',
+        ));
+        // `event.result` is deliberately left unset. Assigning it replaces the host's
+        // own summary with one we generated from partial history — a new capability,
+        // not an equivalent rewrite of the V1 carry-over (spec §6).
+      } catch (err) {
+        log('compaction carry-over failed: ' + (err?.message ?? String(err)));
+      }
+    };
+
+    /* --- 3. write-side assist ---------------------------------------- */
+    const observe = async (event) => {
+      try {
+        if (String(event?.tool ?? '').startsWith('memory_')) log(`tool ${event.tool} ran`);
+      } catch {
+        /* never throw from observability */
+      }
+    };
+
+    /** Register one hook, or say out loud that this host does not have the face. */
+    const hook = async (domain, name, callback) => {
+      const target = context?.[domain];
+      if (!target || typeof target.hook !== 'function') {
+        log(`WARN this host has no ctx.${domain}.hook; ${name} is inactive`);
+        return;
+      }
+      const registration = await target.hook(name, callback);
+      if (registration?.dispose) release.push(() => registration.dispose());
+    };
+    await hook('session', 'context', inject);
+    await hook('session', 'compaction', carryOver);
+    await hook('tool', 'execute.after', observe);
+
+    /* --- 4. idle-time housekeeping (cheap, guarded) ------------------ */
+    // V2 events are a stream, not a callback: subscribe({signal}) returns an
+    // AsyncIterable, so the loop is ours to start and to stop (spec §2).
+    if (typeof context?.event?.subscribe === 'function') {
+      const stream = context.event.subscribe({ signal: controller.signal });
+      const loop = (async () => {
+        try {
+          for await (const event of stream) {
+            try {
+              if (event?.type !== 'session.idle') continue;
+              const stats = (await getStore()).stats();
+              if (stats.active > 0 && stats.active % 50 === 0) {
+                log(`store has ${stats.active} memories; consider memory_maintain duplicates`);
+              }
+            } catch {
+              /* housekeeping only; one bad event must not end the stream */
+            }
+          }
+        } catch (err) {
+          log('event stream stopped: ' + (err?.message ?? String(err)));
+        }
+      })();
+      // The host does not await our loop; a rejection here must stay ours.
+      loop.catch(() => {});
+    } else {
+      log('WARN this host has no ctx.event.subscribe; idle housekeeping is inactive');
+    }
+
+    return async () => {
+      controller.abort();
+      for (const dispose of release) {
+        try {
+          await dispose();
+        } catch {
+          /* a face that will not dispose is not worth breaking a shutdown over */
         }
       }
-      const cfg = config();
-      const cue = cueFromMessages(messages);
-      const digest = await buildDigest(await getStore(directory), cue, cfg.contextLimit);
-      if (!digest) return;
-      messages.unshift({ info: { role: 'user' }, parts: [{ type: 'text', text: digest }] });
-    } catch (err) {
-      log(input, 'digest message injection failed: ' + (err?.message ?? String(err)));
-    }
-  };
-
-  /* --- 2. compaction carry-over ------------------------------------ */
-  hooks['experimental.session.compacting'] = async (_hookInput, output) => {
-    try {
-      if (!output || !Array.isArray(output.context)) return;
-      const cfg = config();
-      const digest = await buildDigest(await getStore(directory), 'session summary', Math.max(8, cfg.contextLimit));
-      if (!digest) return;
-      output.context.push(
-        [
-          '## Durable memory (survives this compaction)',
-          'These entries are stored in the long-term memory database and can be recalled later with ' +
-            'memory_recall. Keep them accurate; do not restate them as fresh observations.',
-          digest,
-        ].join('\n'),
-      );
-    } catch (err) {
-      log(input, 'compaction carry-over failed: ' + (err?.message ?? String(err)));
-    }
-  };
-
-  /* --- 3. write-side assist ---------------------------------------- */
-  // After a tool call, note what happened to memory_maintain usage in the log;
-  // this is the hook field reporters asked for (visibility without noise).
-  hooks['tool.execute.after'] = async (hookInput) => {
-    try {
-      if (hookInput?.tool?.startsWith('memory_')) {
-        log(input, `tool ${hookInput.tool} ran`);
-      }
-    } catch {
-      /* never throw from observability */
-    }
-  };
-
-  /* --- 4. idle-time housekeeping (cheap, guarded) ------------------ */
-  hooks.event = async ({ event }) => {
-    try {
-      if (event?.type !== 'session.idle') return;
-      const store = await getStore(directory);
-      const stats = store.stats();
-      if (stats.active > 0 && stats.active % 50 === 0) {
-        log(input, `store has ${stats.active} memories; consider memory_maintain duplicates`);
-      }
-    } catch {
-      /* housekeeping only */
-    }
-  };
-
-  return hooks;
+    };
+  },
 };
 
-/** Best-effort cue from the host input (some versions expose the session). */
-function lastUserCue(input) {
-  const session = input?.session;
-  if (!session) return '';
-  const messages = session.messages ?? session.lastMessages ?? [];
-  return cueFromMessages(messages, 800);
-}
-
-/** Structured log through the opencode client when available. */
-function log(input, message) {
+/**
+ * Structured log. V2 gives a plugin no logging face — `ctx.app` is only
+ * {name, version, channel} (plugin/package/dist/app.d.ts) — so the console.log the
+ * official migration example uses is what there is. The prefix is kept so the lines
+ * stay greppable in host output.
+ */
+function log(message) {
   try {
-    input?.client?.app?.log?.({
-      body: { service: 'hippo-memory', level: 'info', message },
-    })?.catch?.(() => {});
+    console.log('[hippo-memory] ' + message);
   } catch {
     /* logging must never break a session */
   }
 }
 
-/** Test seam: has the host used the system-prompt hook? */
-function hasSystemHook() {
-  return systemHookSupported;
-}
-
 /**
- * Only ONE export may exist in this module: opencode loads every export of a
- * plugin file and requires each one to be a plugin FUNCTION. Helpers therefore
- * hang off the entry function as properties (accessible to tests and advanced
- * callers, invisible to the loader's export scan).
+ * Keep to ONE export. V1's loader scanned the module and required every export to be
+ * a plugin function; for V2 that behaviour is unverified (spec §9), so the same
+ * discipline is kept rather than re-litigated: helpers hang off the entry object as
+ * properties, which tests and advanced callers can reach and a loader can ignore.
  */
-HippoMemoryPlugin.storeFile = storeFile;
-HippoMemoryPlugin.cueFromMessages = cueFromMessages;
-HippoMemoryPlugin.buildDigest = buildDigest;
-HippoMemoryPlugin.resetStores = resetStores;
-HippoMemoryPlugin.hasSystemHook = hasSystemHook;
-HippoMemoryPlugin.DISCIPLINE = DISCIPLINE;
+HippoPlugin.storeFile = storeFile;
+HippoPlugin.cueFromMessages = cueFromMessages;
+HippoPlugin.buildDigest = buildDigest;
+HippoPlugin.resetStores = resetStores;
+HippoPlugin.buildTools = buildTools;
+HippoPlugin.DISCIPLINE = DISCIPLINE;
 
-/** Guard: exactly one export is allowed in this module (opencode loader rule). */
-export default HippoMemoryPlugin;
+/** Guard: exactly one export is allowed in this module. */
+export default HippoPlugin;

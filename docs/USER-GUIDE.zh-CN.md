@@ -1,6 +1,6 @@
 # 🧠 HippoMemory 使用说明（完整版）
 
-> 适用插件：**dsh-hippo-memory 0.3.2** ｜ 核心引擎：**hippo-memory-core 0.3.2** ｜ opencode 用户见 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md)（0.3.2） ｜ 更新：2026-09-25
+> 适用插件：**dsh-hippo-memory 0.3.3** ｜ 核心引擎：**hippo-memory-core 0.3.3** ｜ opencode 用户见 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md)（**0.4.0，V2 插件面**） ｜ 更新：2026-10-07
 > 本文覆盖 **0.3.0** 的五组改动（前提作用域 `scope` + recall 硬过滤、重复合并 `merge`、门槛未过的兜底提示、库分裂可见、fuzzy 归档误报订正 + 适配层透传补齐），相关小节标有"0.3.0"；另覆盖 **0.3.2** 的 `memory_verify` 契约订正（**yes 与矛盾两条出口都要锚**、中文值冲突不再被盖章、前提冲突的行可跨支持位否决），相关小节标有"0.3.2"，见 [7.3](#73-memory_verify--断言前查证) 与 [9.13](#913-verify-的-yes-需要什么032)。**0.3.2 三枚包已于 2026-10-06 发布 npm**（引擎 + DSH 适配层 + opencode 适配层，同日各再发一枚 **0.3.3** 仅重发文档、代码成员与 0.3.2 逐字节相同，`latest` 现指 0.3.3；上一发布线：引擎与 opencode 0.3.0、DSH 适配层 0.3.1）；对照 [CHANGELOG](../CHANGELOG.md)。
 > 本文写给使用的人：不写代码也能照做。想了解设计原理请看 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -952,7 +952,7 @@ await mem.ensureEmbeddingMigration();   // 一次性重嵌入旧行（返回处�
 |---|---|---|
 | `dsh-hippo-memory`（DSH 插件） | ❌ 不能 | 它是 DSH profile bundle（`cordis.patch.yml` + `dsh-tools` + DSH 设置页），opencode 的插件 API 完全另一套 |
 | `hippo-memory-core`（引擎） | ✅ 能（0.2.1 起） | 引擎原先把 SQLite 驱动写死成 Node 的 `node:sqlite`，而 opencode 的 Bun（实测 1.3.14）还没有这个内置模块，连 `import` 都失败；现在改成运行时探测，Bun 上自动用 `bun:sqlite` |
-| 4 个记忆工具 / 自动注入 / 使用纪律 | ✅ 能 —— 装适配包 | `opencode plugin -g opencode-hippo-memory`（见 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md)） |
+| 4 个记忆工具 / 自动注入 / 使用纪律 | ✅ 能 —— 装适配包 | `opencode plugin add opencode-hippo-memory`（V2 命令面；旧的 `-g` 写法属于 V1。**V2 面从 0.4.0 起，0.3.3 及更早那几枚在 opencode 2.x 上什么都不加载；而 0.4.0 至今没有一台活的 V2 宿主加载过**，见 14.4/14.5 与 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md)） |
 
 ### 14.2 为什么之前不行（一个真实的坑）
 
@@ -981,53 +981,81 @@ verify   -> superseded_matches=[postgres]
 digest   -> [memory data …] 数据框架正常
 ```
 
-### 14.4 自己接一个（现在的做法）
+### 14.4 自己接一个（opencode V2 插件面）
 
-把引擎放进 opencode 的插件目录，用 `experimental.chat.messages.transform`（或 `system.transform`）注入记忆片段，用 `tool()` 暴露记忆工具：
+> **先说这一节的证据等级**：下面的形状取自本机解包读到的 **已发布 2.0.24 类型**（`@opencode-ai/plugin` / `@opencode/ai` / `@opencode/schema`），并且**与本包工作树同源**——本包的 `test/v2-plugin.test.mjs` 34 项跑的就是这套形状。**未在真宿主里跑过**：活的 opencode V2 从没加载过这个插件，所以这一段是"按类型写的"，不是"按实测写的"。V1 面（`experimental.chat.*`、返回 hooks 对象、`tool()`）在 V2 里**不运行**，官方口径是 *"V1 plugin implementations do not run in V2"*。
 
-```bash
-# 项目级：.opencode/plugins/，全局：~/.config/opencode/plugins/
-# .opencode/package.json 里声明依赖，opencode 启动时会 bun install：
-{ "dependencies": { "hippo-memory-core": "^0.3.0" } }
+V2 的入口不是"返回一个 hooks 字典"，而是 `{ id, setup(ctx) }`：面都挂在 `ctx` 上。
+
+```jsonc
+// .opencode/package.json —— ⚠️ 这一条是 V1 时代测得的写法，V2 未复测
+{ "dependencies": { "hippo-memory-core": "^0.3.3" } }
 ```
 
 ```ts
-// .opencode/plugins/hippo.ts
+// .opencode/plugins/hippo.ts —— V2 形状
 import { HippoMemory } from 'hippo-memory-core';
-import type { Plugin } from '@opencode-ai/plugin';
 
-const mem = new HippoMemory({ dbPath: `${process.env.HOME}/.cache/opencode/hippo/memory.db` });
+// 键只取一次：V2 的 ToolContext 里没有 directory 字段，按调用重键会让
+// A 项目的记忆回答 B 项目的问题。
+const store = new HippoMemory({ dbPath: `${process.env.HOME}/.cache/opencode/hippo/memory.db` });
 
-export const Hippo: Plugin = async () => ({
-  // 每轮把相关记忆注入上下文（⚠️ chat.message 没有 output，改不了消息）
-  "experimental.chat.messages.transform": async (_input, output) => {
-    const cue = JSON.stringify(output.messages ?? []).slice(-1200);
-    const { context } = await mem.composeContext(cue, { limit: 5 });
-    if (context) output.messages.unshift({ role: "system", content: context });
+export default {
+  id: 'hippo-memory',
+  async setup(ctx: any) {
+    // ① 4 个工具：editor.add(Tool.Info)，参数表用**裸 JSON Schema**
+    //    （ValueSchema 的第三支），所以不需要 zod、也不需要 import 宿主 SDK。
+    await ctx.tool.transform((editor: any) =>
+      editor.add({
+        name: 'memory_remember',
+        description: 'Persist a durable conclusion.',
+        input: { type: 'object', properties: { content: { type: 'string' } }, required: ['content'] },
+        async execute(args: any) {
+          return { content: JSON.stringify(await store.remember(args.content)) };
+        },
+      }));
+
+    // ② 每轮注入：session 的 context 钩子，改的是**这次请求**，不写回历史，
+    //    所以每次模型调用都要重新放一遍（含工具续轮的第二次请求）。
+    ctx.session.hook('context', async (ev: any) => {
+      const cue = (ev.messages ?? []).map((m: any) => m.content?.map?.((p: any) => p.text)?.join(' ')).join(' ');
+      const { context } = await store.composeContext(cue || ' ', { limit: 5 });
+      if (context) ev.system.push({ type: 'text', text: context, metadata: { 'hippo-memory': 'digest' } });
+    });
+
+    // ③ 压缩前保住结论：只附 ev.system，不写 ev.result。
+    ctx.session.hook('compaction', async (ev: any) => {
+      const { context } = await store.composeContext('session summary', { limit: 8 });
+      if (context) ev.system.push({ type: 'text', text: context, metadata: { 'hippo-memory': 'digest' } });
+    });
+
+    // ④ 空闲巡检：subscribe 返回 AsyncIterable（V2 没有回调形态），自己起循环、能 abort。
+    const stream = ctx.event.subscribe({});
+    (async () => { for await (const ev of stream) if (ev?.type === 'session.idle') { /* 收尾自检 */ } })();
   },
-  // 压缩前保住关键结论（官方文档支持 output.context.push）
-  "experimental.session.compacting": async (_input, output) => {
-    const { context } = await mem.composeContext('session summary', { limit: 8 });
-    if (context) output.context.push(context);
-  },
-  event: async ({ event }) => {
-    if (event?.type === "session.idle") { /* 可选：收尾自检、写入结论 */ }
-  },
-});
+};
 ```
 
-> 上面是**手写版**，能跑；更省事的是直接装适配包：`opencode plugin -g opencode-hippo-memory` —— 工具 + 每轮 digest + 压缩保留 + 使用纪律一步到位，不用自己写插件。
+三个和 V1 反直觉的地方，写在最小例子里就是为了别让人事后才发现：
+- **`Plugin.define` 实测是恒等函数**，所以运行期不必 import 宿主 SDK——上面的 `ctx: any` 不是偷懒，是因为不需要类型；
+- **钩子的改动不持久**，V1 那套"同一轮只注入一次"的双钩子互斥标志在这个面上没有对应物，改成按 `metadata` 标记**替换**而不是再追加一份；
+- **`ctx.app` 没有 log 面**，官方 migrate 示例就是换 `console.log`。
 
-### 14.5 opencode 的钩子速查（1.18.x 实测）
+> 上面是**手写版**，形状按已发布类型写；更省事的是直接装适配包：`opencode plugin add opencode-hippo-memory`（V2 命令面；旧的 `-g` 写法属于 V1）—— 工具 + 每轮 digest + 压缩保留 + 使用纪律一步到位，不用自己写插件。**但注意**：V2 面从 **0.4.0** 起（0.3.3 及更早那几枚是 V1 面，在 opencode 2.x 上什么都不加载），而 **0.4.0 至今没有一台活的 V2 宿主加载过**，两者对本节的影响见 [packages/opencode-hippo-memory](../packages/opencode-hippo-memory/README.md) 的安装一节。
 
-| 钩子 | 用途 | 能改内容吗 |
+### 14.5 opencode 的钩子速查（V1 → V2 对照）
+
+左列是 **1.18.x 实测**过的 V1 面（本节的历史读数，保留是因为它是量出来的）；右列是本包工作树实际用的 V2 面，按已发布 2.0.24 类型写、**未在真宿主复测**。
+
+| V1（1.18.x 实测） | 用途 | V2（本包工作树在用） |
 |---|---|---|
-| `experimental.chat.messages.transform` | 改发给模型的消息列表 | ✅ |
-| `experimental.chat.system.transform` | 改系统提示 | ✅ |
-| `experimental.session.compacting` | 压缩前补充/替换上下文 | ✅（`output.context.push` / `output.prompt`） |
-| `tool.execute.before` / `tool.execute.after` | 拦截/审计工具调用 | ✅（改 `output.args` 等） |
-| `chat.message` | 观察用户消息 | ❌ 只有 input，没有 output |
-| `event` | 订阅 `session.idle` / `session.compacted` 等 | — |
+| `experimental.chat.messages.transform` | 改发给模型的消息列表 | `session.hook("context")` —— 每轮改这次请求的 `messages` / `system`，不写回历史 |
+| `experimental.chat.system.transform` | 改系统提示 | 同上，一个钩子两件事：`ev.system` 与 `ev.messages` 都在 `context` 上 |
+| `experimental.session.compacting` | 压缩前补充/替换上下文 | `session.hook("compaction")` —— 只附 `ev.system`，`ev.result` 刻意不写 |
+| `tool.execute.before` / `tool.execute.after` | 拦截/审计工具调用 | `tool.hook("execute.before"/"execute.after")`；工具本身改由 `tool.transform` + `editor.add()` 注册 |
+| `chat.message` | 观察用户消息（只有 input） | 并入 `session.hook("context")` 的 `ev.messages`，V2 里没有独立这一枚 |
+| `event`（回调） | 订阅 `session.idle` / `session.compacted` 等 | `event.subscribe({ signal })` → **AsyncIterable**，`for await` 自己转 |
+| 返回 hooks 字典（`export const P: Plugin = async () => ({…})`） | 入口 | `export default { id, setup(ctx) }`；`tool()` 这层包装没了，参数表直接吃 JSON Schema |
 
 
 ---

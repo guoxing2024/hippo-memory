@@ -1,7 +1,7 @@
 # 🧠 HippoMemory —— 给 DSH Agent 装上"海马体"
 
 > 一句话：**让 DeepSeek Runtime 的 agent 拥有跨会话、跨重启的长期记忆，长会话不再忘事、不再幻觉。**
-> 当前版本：引擎 `hippo-memory-core` 0.3.2 ｜ DSH 插件 `dsh-hippo-memory` 0.3.2（**需宿主 DSH ≥ 0.1.7**）｜ opencode 插件 `opencode-hippo-memory` 0.3.2（批次 2026-09-25，**已于 2026-10-06 发布 npm**，同日各再发一枚 **0.3.3** 仅重发文档、代码成员与 0.3.2 逐字节相同；上一发布线为 0.3.0 / DSH 0.3.1）
+> 当前版本：引擎 `hippo-memory-core` 0.3.3 ｜ DSH 插件 `dsh-hippo-memory` 0.3.3（**需宿主 DSH ≥ 0.1.7**）｜ opencode 插件 `opencode-hippo-memory` **0.4.0**（批次 2026-10-07：插件面从 V1 移植到 **V2**，**破坏性**——只认 opencode 2.x；三枚号从这一批起不再齐步走，引擎与 DSH 的字节一字未动所以停在 0.3.3；上一发布线为 0.3.0 / DSH 0.3.1）
 
 ## 为什么你需要它？
 
@@ -54,10 +54,10 @@ dsh web
 **场景三：压低编造率**
 > 告诉 agent："引用旧事实前先用 `memory_verify` 核对，查无实据就明说，不要编。"编造率肉眼可见下降。0.3.2 起这句话有引擎兜底：**话题相近不再算"记住"**——没有锚的匹配返回 `weak_match`，模型拿到的仍是"不知道"。
 
-## 0.2.1（本版）—— 引擎支持 Bun
+## 0.2.1 —— 引擎支持 Bun（npm 当前 0.3.3，本节只讲这一枚能力是怎么来的）
 
-> `hippo-memory-core` 现在**运行时探测** SQLite 驱动：Node 用 `node:sqlite`、Bun 用 `bun:sqlite`。这意味着**引擎可以直接跑在 opencode 里**（实测 opencode 1.18.31 / Bun 1.3.14，无需打包无需垫片）。
-> ✅ opencode 用户装配套插件即可：`opencode plugin -g opencode-hippo-memory`（同样是 4 个工具 + 每轮注入 + 压缩保留 + 纪律）。
+> `hippo-memory-core` 现在**运行时探测** SQLite 驱动：Node 用 `node:sqlite`、Bun 用 `bun:sqlite`。这意味着**引擎可以直接跑在 opencode 里**（实测 opencode 1.18.31 / Bun 1.3.14，无需打包无需垫片；那一版宿主是 V1 面）。
+> ✅ opencode 用户装配套插件即可：`opencode plugin add opencode-hippo-memory`（V2 命令面；旧的 `-g` 写法属于 V1，照抄会失败）——同样是 4 个工具 + 每轮注入 + 压缩保留 + 纪律。**注意**：V2 面从 **0.4.0** 起，0.3.3 及更早那几枚在 opencode 2.x 上什么都不会加载；而 **0.4.0 至今没有一台活的 V2 宿主加载过**（34 枚用例走的是假宿主），见该包 README 的安装一节。
 
 ## 0.2.0 新东西（一句话版）
 
