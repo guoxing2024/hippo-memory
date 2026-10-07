@@ -9,7 +9,7 @@
 
 > 引擎是框架无关的 [**`hippo-memory-core`**](https://www.npmjs.com/package/hippo-memory-core)（自带 Bun 支持，本包需要 `^0.3.2`）；本包是 **opencode 适配层**（当前 **0.3.3**：0.3.2 三枚已于 **2026-10-06 发布 npm**，本枚仅重发文档，代码成员与 0.3.2 逐字节相同；上一发布线 0.3.0）。引擎侧的契约订正在这里透传：话题相近不再算证据（`weak_match`），矛盾一侧同样要锚（含中文的值冲突），前提冲突的行即使没抢到支持位也能否决（`scope_conflicts[]`），召回命中带上 `anchored` / `anchors`。本包另有两条自家缺陷修复：**没声明的参数不再被静默丢掉**（F5）与 **`hitView` 白名单点名新字段**（引擎多出的键不在这里列出就到不了模型，F4b）——所以"无代码改动"那句旧说法已订正。
 >
-> **⚠️ 宿主版本：本包 **0.4.0** 起是 opencode V2 插件面。** opencode 官方口径是 *"V1 plugin implementations do not run in V2"*，而 V1 面按用户裁决是**删掉**而不是并存——所以 **opencode 2.x 用户要 0.4.0 或更新**，装 0.3.3 及更早的发布件**什么都不会加载**（本机 `opencode plugin list` → `No plugins found` 是这一形的旁证，不是证明）；opencode 1.x 用户自此**不再受支持**，请停在 0.3.3。V2 构建本地 433 项全绿（本包那 34 项在 `test/v2-plugin.test.mjs`），但**没有一台活的 V2 宿主加载过它**；下面"安装"一节写的是 V2 构建的形状，并逐条标注了哪些取自本机 `opencode --help` 实测、哪些仍未在真宿主上验过。
+> **⚠️ 宿主版本：本包 **0.4.0** 起是 opencode V2 插件面。** opencode 官方口径是 *"V1 plugin implementations do not run in V2"*，而 V1 面按用户裁决是**删掉**而不是并存——所以 **opencode 2.x 用户要 0.4.0 或更新**，装 0.3.3 及更早的发布件**什么都不会加载**（本机 `opencode plugin list` → `No plugins found` 是这一形的旁证，不是证明）；opencode 1.x 用户自此**不再受支持**，请停在 0.3.3。V2 构建本地 433 项全绿（本包那 34 项在 `test/v2-plugin.test.mjs`），但**没有一台活的 V2 宿主加载过它**；**0.4.0 已于 2026-10-07 发到 npm**，registry `latest` 与 tarball 四枚成员都逐字回读过了——顺带一条实测：`npm publish` 返回 0 之后 npmjs 自己还要几分钟才供得出这枚版本（元数据约 3.5 分、tarball 约 6 分），所以"刚发就装、装不到"先等几分钟再下结论；下面"安装"一节写的是 V2 构建的形状，并逐条标注了哪些取自本机 `opencode --help` 实测、哪些仍未在真宿主上验过。
 > 本仓库里的 DSH 版是 [`dsh-hippo-memory`](https://www.npmjs.com/package/dsh-hippo-memory) —— **两个宿主不通用**，别装错。
 
 ---
